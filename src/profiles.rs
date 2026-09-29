@@ -327,7 +327,14 @@ pub async fn update(
 ) -> ApiResult<impl IntoResponse> {
     let existing = load_profile_row(&state, &id).await?;
 
-    let name = body.name.unwrap_or(existing.name);
+    // 与创建一致:去除首尾空白,空名拒绝。
+    let name = match body.name {
+        Some(n) if n.trim().is_empty() => {
+            return Err(ApiError::BadRequest("name is required".into()))
+        }
+        Some(n) => n.trim().to_string(),
+        None => existing.name,
+    };
     // 只写 URL:除非提供非空值,否则保持已存值。
     let source_url = match body.source_url {
         Some(u) if !u.trim().is_empty() => {

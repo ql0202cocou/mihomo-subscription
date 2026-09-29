@@ -101,7 +101,8 @@ GET  /api/auth/session -> 200 {username} | 401
 ```
 
 - 创建：`{name, source_url}`。创建成功后**同步触发一次生成/拉取**（尽力而为），故新订阅
-  立即带有真实 `last_fetch_status`，不存在「未拉取」中间态。
+  立即带有真实 `last_fetch_status`，不存在「未拉取」中间态。创建与更新的 `name` 均去除首尾空白，
+  空名 `400`。
 - `source_url` 写时静态校验（http/https、无内嵌凭据、非本地/私有地址），否则 `400`；真正 SSRF
   在拉取时按 DNS 解析 + IP 固定。
 - `last_fetch_status`：`success` / `http_error:<code>` / `ssrf_rejected` / `timeout` / `too_large` /
