@@ -45,10 +45,13 @@ import type {
   ProfileRuleSet,
   ProviderRulesResponse,
   ProxiesResponse,
+  Regenerate,
   RuleSet,
 } from "../../types";
 import { BUILTIN_POLICIES } from "./groupSchema";
 import { TypeChips } from "../../components/fields";
+import { useRegenerateNotice } from "../../components/regenerate";
+import { useSerialSave } from "../../components/useSerialSave";
 import {
   RULE_SET_BEHAVIORS as RS_BEHAVIORS,
   RULE_SET_MANUAL_FORMATS as RS_MANUAL_FORMATS,
@@ -64,6 +67,8 @@ interface Props {
   generatedAt: string | null;
   errors: string[];
   onSaved: () => void;
+  /** 保存带回的离线重生成结果,交给父组件展示校验错误。 */
+  onRegenerate: (r: Regenerate) => void;
 }
 
 // 全部 Mihomo 规则类型,按分类分组以便选择器可浏览;仍允许自由输入未列出的类型。
@@ -172,9 +177,20 @@ function serializeRule(r: RuleModel): string {
 // 编辑目标:null = 新增;数字 = 编辑该条非 MATCH 规则;"match" = 编辑钉底的 MATCH。
 type EditTarget = number | "match" | null;
 
-export default function RulesCard({ profileId, initial, nodes, groups, generatedAt, errors, onSaved }: Props) {
+export default function RulesCard({
+  profileId,
+  initial,
+  nodes,
+  groups,
+  generatedAt,
+  errors,
+  onSaved,
+  onRegenerate,
+}: Props) {
   const { t } = useTranslation();
   const { message } = AntdApp.useApp();
+  const saveInOrder = useSerialSave();
+  const notice = useRegenerateNotice();
   // MATCH 钉在底部(锁定)。`rules` 按序保存其余所有行;`matchLine` 保存唯一的 MATCH 兜底
   // (或 null)。
   const [rules, setRules] = useState<string[]>([]);
@@ -210,9 +226,13 @@ export default function RulesCard({ profileId, initial, nodes, groups, generated
       if (isMatchLine(line)) match = line;
       else rest.push(line);
     }
+    // 本组件保存后 reload 带回的正是刚保存的规则:列表未变、编辑下标仍有效,不打断正在编辑的弹窗。
+    const echoed =
+      match === saved.current.match && rest.join("\n") === saved.current.rules.join("\n");
     setRules(rest);
     setMatchLine(match);
     saved.current = { rules: rest, match };
+    if (echoed) return;
     setModalOpen(false);
     setEditing(null);
     setModel(DEFAULT_RULE);
@@ -257,28 +277,35 @@ export default function RulesCard({ profileId, initial, nodes, groups, generated
     void loadProfileRuleSets();
   }, [loadPolicies, loadProfileRuleSets, generatedAt]);
 
-  // 保存规则 + 钉底的 MATCH(始终在最后)。返回是否成功,供调用方决定后续提示。
+  // 保存规则 + 钉底的 MATCH(始终在最后)。返回是否成功,供调用方决定后续提示。`appliedText` 为
+  // 「已应用到订阅」的成功文案(见 useRegenerateNotice)。
   const persist = useCallback(
-    async (nextRules: string[], nextMatch: string | null): Promise<boolean> => {
+    async (nextRules: string[], nextMatch: string | null, appliedText?: string): Promise<boolean> => {
       setRules(nextRules);
       setMatchLine(nextMatch);
       const content = [...nextRules, ...(nextMatch ? [nextMatch] : [])].join("\n");
-      try {
-        await api(`/api/profiles/${profileId}/rules`, {
+      const res = await saveInOrder(() =>
+        api<{ regenerate: Regenerate }>(`/api/profiles/${profileId}/rules`, {
           method: "PUT",
           body: JSON.stringify({ content }),
-        });
-        saved.current = { rules: nextRules, match: nextMatch };
+        }),
+      );
+      // 保存串行生效,成功即服务端当前持有的规则。
+      if (res.ok) saved.current = { rules: nextRules, match: nextMatch };
+      // 之后又有保存:它提交的是完整规则,界面(提示、回滚、reload)交给最后一次决定。
+      if (!res.latest) return res.ok;
+      if (res.ok) {
+        notice(res.value.regenerate, appliedText);
+        onRegenerate(res.value.regenerate);
         onSaved();
-        return true;
-      } catch (e) {
+      } else {
         setRules(saved.current.rules);
         setMatchLine(saved.current.match);
-        message.error(errorMessage(e, t("common.saveFailed")));
-        return false;
+        message.error(errorMessage(res.error, t("common.saveFailed")));
       }
+      return res.ok;
     },
-    [profileId, onSaved, message, t],
+    [profileId, onSaved, onRegenerate, saveInOrder, notice, message, t],
   );
 
   // DnD id / React key 用内容派生的稳定 id(不用数组下标);重复行按出现次序加后缀保证唯一。
@@ -298,8 +325,8 @@ export default function RulesCard({ profileId, initial, nodes, groups, generated
     const newIndex = ruleIds.indexOf(String(over.id));
     if (oldIndex < 0 || newIndex < 0) return;
     const next = arrayMove(rules, oldIndex, newIndex);
-    // 成功提示只在持久化成功后给出(失败时 persist 已弹错误)。
-    if (await persist(next, matchLine)) message.success(t("rules.orderSaved"));
+    // 提示由 persist 按保存与离线重生成结果给出。
+    await persist(next, matchLine, t("rules.orderSaved"));
   }
 
   function openEdit(index: number) {
@@ -506,13 +533,15 @@ export default function RulesCard({ profileId, initial, nodes, groups, generated
     }
     try {
       // 后端把 ② 定义复制进本订阅 ③(含真实远程 URL)并追加 RULE-SET 规则行,随后离线重生成缓存。
-      const res = await api<{ imported: number }>(
+      const res = await api<{ imported: number; regenerate: Regenerate | null }>(
         `/api/profiles/${profileId}/rule-sets/import`,
         { method: "POST", body: JSON.stringify({ names, policy: importPolicy }) },
       );
       await loadProfileRuleSets();
       onSaved();
       message.success(t("rules.importHostedDone", { count: res.imported }));
+      notice(res.regenerate);
+      if (res.regenerate) onRegenerate(res.regenerate);
     } catch (e) {
       message.error(errorMessage(e, t("rules.importFailed")));
     }
@@ -755,6 +784,7 @@ function RuleComposer({ model, onChange, policyOptions }: ComposerProps) {
   // 当前类型所属分类(用于「规则类型」旁的徽标);自由输入的未知类型不显示徽标。
   const categoryKey = RULE_TYPE_GROUPS.find((g) => g.types.includes(upperType))?.key;
   const category = categoryKey ? t(`rules.typeGroups.${categoryKey}`) : "";
+  const policyValues = new Set(policyOptions.flatMap((g) => g.options.map((o) => o.value)));
 
   // 按规则类型选择「匹配内容」的输入控件:枚举型给选项,逻辑规则给多行文本,其余单行输入。
   function contentBlock() {
@@ -783,6 +813,8 @@ function RuleComposer({ model, onChange, policyOptions }: ComposerProps) {
             onChange={(payload) => onChange({ ...model, payload })}
             placeholder="HTTP / SOCKS5 / TUN ..."
             filterOption={(input, opt) =>
+              // 同「规则类型」:输入恰为完整选项时不收窄下拉。
+              IN_TYPE_OPTIONS.includes(input) ||
               String(opt?.value ?? "").toLowerCase().includes(input.toLowerCase())
             }
           />
@@ -888,7 +920,9 @@ function RuleComposer({ model, onChange, policyOptions }: ComposerProps) {
           onChange={(policy) => onChange({ ...model, policy })}
           placeholder={t("rules.policy")}
           filterOption={(input, opt) =>
-            // 分组选项:仅叶子项带 value,按子串过滤;分组标题无 value 不参与。
+            // 输入恰为某个完整策略(编辑时预填的原值)时不收窄下拉,同「规则类型」;否则按子串过滤。
+            // 分组选项:仅叶子项带 value;分组标题无 value 不参与。
+            policyValues.has(input) ||
             String((opt as { value?: string })?.value ?? "")
               .toLowerCase()
               .includes(input.toLowerCase())
@@ -963,6 +997,7 @@ function RuleSetDefBlock({
             <Typography.Text type="secondary">{t("rules.ruleSetInterval")}</Typography.Text>
             <InputNumber
               min={1}
+              precision={0}
               style={{ width: "100%" }}
               value={model.rsInterval}
               onChange={(v) => onChange({ ...model, rsInterval: v ?? 24 })}

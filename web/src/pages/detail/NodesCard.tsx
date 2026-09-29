@@ -18,8 +18,10 @@ import {
 import { CSS } from "@dnd-kit/utilities";
 import { useTranslation } from "react-i18next";
 import { api, errorMessage } from "../../api";
-import type { CustomNode, ProxiesResponse, ProxyPreview } from "../../types";
+import type { CustomNode, ProxiesResponse, ProxyPreview, Regenerate } from "../../types";
 import { NODE_TYPE_LABELS } from "../../components/nodeSchema";
+import { useRegenerateNotice } from "../../components/regenerate";
+import { useSerialSave } from "../../components/useSerialSave";
 
 interface Props {
   profileId: string;
@@ -29,13 +31,17 @@ interface Props {
   nodes: CustomNode[];
   /** 生成缓存的刷新信号:变化时重新拉取节点预览。 */
   generatedAt: string | null;
+  /** 保存带回的离线重生成结果,交给父组件展示校验错误。 */
+  onRegenerate: (r: Regenerate) => void;
 }
 
 const DEFAULT_SECTIONS = ["provider", "custom"];
 
-export default function NodesCard({ profileId, profileName, nodes, generatedAt }: Props) {
+export default function NodesCard({ profileId, profileName, nodes, generatedAt, onRegenerate }: Props) {
   const { t } = useTranslation();
   const { message } = AntdApp.useApp();
+  const saveInOrder = useSerialSave();
+  const notice = useRegenerateNotice();
   const [proxies, setProxies] = useState<ProxyPreview[]>([]);
   /** 是否已生成过:区分「尚未生成」与「机场无节点」,仅影响空态文案。 */
   const [generated, setGenerated] = useState(true);
@@ -77,18 +83,22 @@ export default function NodesCard({ profileId, profileName, nodes, generatedAt }
       sectionOrder.indexOf(String(over.id)),
     );
     setSectionOrder(next);
-    try {
-      await api(`/api/profiles/${profileId}/node-section-order`, {
+    const res = await saveInOrder(() =>
+      api<{ regenerate: Regenerate }>(`/api/profiles/${profileId}/node-section-order`, {
         method: "PUT",
         body: JSON.stringify({ order: next }),
-      });
-      message.success(t("nodes.orderSaved"));
-    } catch (e) {
-      setSectionOrder(sectionOrder);
-      message.error(errorMessage(e, t("nodes.orderSaveFailed")));
-    } finally {
-      void loadGeneratedPreview();
+      }),
+    );
+    // 之后又有拖拽:界面交给最后一次保存决定。
+    if (!res.latest) return;
+    if (res.ok) {
+      notice(res.value.regenerate, t("nodes.orderSaved"));
+      onRegenerate(res.value.regenerate);
+    } else {
+      message.error(errorMessage(res.error, t("nodes.orderSaveFailed")));
     }
+    // 以服务端为准重载;保存失败时即回到服务端实际持有的顺序。
+    void loadGeneratedPreview();
   }
 
   const total = providerNodes.length + nodes.length;

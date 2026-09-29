@@ -1,4 +1,4 @@
-//! 确定性的机场 URL 脱敏,见 `docs/security-design.md`。
+//! 确定性的机场 URL 脱敏,见 `docs/architecture.md`「安全设计」。
 //!
 //! 保留 scheme、host 与 path;把每个查询参数值替换为 `***`;丢弃任何 userinfo,使凭据从不被
 //! 回显。机场 URL 可能出现的任何地方(响应、日志、错误)都套用同一规则。

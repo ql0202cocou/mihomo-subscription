@@ -1,6 +1,6 @@
 //! 反向代理后的客户端 IP 推导。
 //!
-//! 服务跑在 1Panel 反向代理后,故 TCP 对端是代理而非客户端。按 `docs/security-design.md`:
+//! 服务跑在 1Panel 反向代理后,故 TCP 对端是代理而非客户端。按 `docs/architecture.md`「安全设计」:
 //! 只信任来自显式可信代理网段的 `X-Forwarded-For`,并从右往左数——有 `trusted_hops` 个代理时,
 //! 客户端是从末尾起第 `trusted_hops` 个条目,故攻击者在左侧拼接的伪造条目不会被误当成客户端。
 //! 头缺失、过短、或 TCP 对端不在可信代理网段时回退到 TCP 对端。

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { Link, useParams } from "react-router-dom";
 import {
   App as AntdApp,
@@ -19,7 +19,7 @@ import {
 } from "@ant-design/icons";
 import { useTranslation } from "react-i18next";
 import { api, ApiError, errorMessage } from "../api";
-import type { ProfileDetail as Detail } from "../types";
+import type { ProfileDetail as Detail, Regenerate } from "../types";
 import NodesCard from "./detail/NodesCard";
 import GroupsCard from "./detail/GroupsCard";
 import RulesCard from "./detail/RulesCard";
@@ -36,15 +36,25 @@ export default function ProfileDetail() {
   const [genErrors, setGenErrors] = useState<string[]>([]);
   const [genWarnings, setGenWarnings] = useState<string[]>([]);
 
+  // 并发 reload 可能乱序返回:只采用最后一次发起的结果,避免旧 detail 覆盖新的。
+  const reloadSeq = useRef(0);
   const reload = useCallback(async () => {
     if (!id) return;
+    const seq = ++reloadSeq.current;
     try {
-      setDetail(await api<Detail>(`/api/profiles/${id}`));
+      const next = await api<Detail>(`/api/profiles/${id}`);
+      if (seq === reloadSeq.current) setDetail(next);
     } catch {
       // 首屏失败给错误占位(而非白页);已有内容时保留当前页面。
-      setLoadFailed(true);
+      if (seq === reloadSeq.current) setLoadFailed(true);
     }
   }, [id]);
+
+  // 保存类接口带回的离线重生成结果:校验错误与「刷新」的错误同处展示;已应用则清掉过时的错误。
+  const onRegenerate = useCallback((r: Regenerate) => {
+    if (r.status === "invalid") setGenErrors(r.errors ?? []);
+    else if (r.status === "applied") setGenErrors([]);
+  }, []);
 
   useEffect(() => {
     void reload();
@@ -109,6 +119,7 @@ export default function ProfileDetail() {
           profileName={detail.name}
           nodes={detail.nodes}
           generatedAt={detail.last_generated_at}
+          onRegenerate={onRegenerate}
         />
       ),
     },
@@ -122,6 +133,7 @@ export default function ProfileDetail() {
           nodes={detail.nodes}
           generatedAt={detail.last_generated_at}
           onSaved={reload}
+          onRegenerate={onRegenerate}
         />
       ),
     },
@@ -137,6 +149,7 @@ export default function ProfileDetail() {
           generatedAt={detail.last_generated_at}
           errors={genErrors}
           onSaved={reload}
+          onRegenerate={onRegenerate}
         />
       ),
     },
@@ -162,7 +175,7 @@ export default function ProfileDetail() {
 
       {nonRuleErrors.length > 0 && (
         <div className="warn-banner error" style={{ marginBottom: 16 }}>
-          {t("detail.generateFailed")}:
+          {t("detail.invalidConfig")}:
           <ul style={{ margin: "4px 0 0", paddingLeft: 18 }}>
             {nonRuleErrors.map((e, i) => (
               <li key={i}>{e}</li>
@@ -332,14 +345,21 @@ function PreviewCard({ profileId }: { profileId: string }) {
   const { t } = useTranslation();
   const { message } = AntdApp.useApp();
   const [yaml, setYaml] = useState<string | null>(null);
+  const [errors, setErrors] = useState<string[]>([]);
   const [loading, setLoading] = useState(false);
 
   async function load() {
     // 预览是只读的「试生成」:后端不落缓存、不改拉取状态(对应 src/generate.rs 的 preview)。
     setLoading(true);
+    setErrors([]);
     try {
       setYaml(await api<string>(`/api/profiles/${profileId}/preview`));
     } catch (e) {
+      // 校验失败时逐条列出(details),不只显示笼统的「Validation failed」。
+      if (e instanceof ApiError && e.details?.length) {
+        setYaml(null);
+        setErrors(e.details);
+      }
       message.error(errorMessage(e, t("detail.generateFailed")));
     } finally {
       setLoading(false);
@@ -358,6 +378,15 @@ function PreviewCard({ profileId }: { profileId: string }) {
         <div className="preview-loading">
           <Spin />
           {t("preview.loading")}
+        </div>
+      ) : errors.length > 0 ? (
+        <div className="warn-banner error">
+          {t("detail.invalidConfig")}:
+          <ul style={{ margin: "4px 0 0", paddingLeft: 18 }}>
+            {errors.map((e, i) => (
+              <li key={i}>{e}</li>
+            ))}
+          </ul>
         </div>
       ) : yaml ? (
         <pre className="preview-pre">{yaml}</pre>

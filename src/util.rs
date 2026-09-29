@@ -24,12 +24,12 @@ pub fn is_fresh(at: &str, ttl: Duration) -> bool {
     age.to_std().map(|a| a < ttl).unwrap_or(false)
 }
 
-/// per-profile 的订阅 token:32 随机字节,URL-safe(≥256 位),见 `docs/security-design.md`。
+/// per-profile 的订阅 token:32 随机字节,URL-safe(≥256 位),见 `docs/architecture.md`「安全设计」。
 pub fn random_token() -> String {
     random_b64(32)
 }
 
-/// 随机公共路径前缀:16 随机字节,URL-safe(~22 字符,落在 `docs/security-design.md`
+/// 随机公共路径前缀:16 随机字节,URL-safe(~22 字符,落在 `docs/architecture.md`「安全设计」
 /// 推荐的 16-24 字符区间内)。
 pub fn random_path_prefix() -> String {
     random_b64(16)

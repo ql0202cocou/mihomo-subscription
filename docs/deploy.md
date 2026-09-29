@@ -73,6 +73,9 @@ compose 的 `environment:` 与代码必须一致。
   per-profile token。
 - 容器以 root 启动以便 `docker-entrypoint.sh` chown `${DATA_DIR}`（`./data` 挂载会覆盖构建期 chown，
   否则 SQLite `code 14 (CANTOPEN)`），随后用 `gosu` 降权到 `appuser` 再 exec。
+- 主机若运行 Mihomo/Clash 的 TUN + fake-ip 模式，域名会被解析到 `198.18.0.0/15`。该网段在 SSRF
+  阻止列表内，所有机场拉取都会失败（`last_fetch_status` 为 `ssrf_rejected`）。让面板容器使用真实
+  DNS，或把它排除在 TUN 之外；不要为此放宽 SSRF 规则。
 
 ---
 

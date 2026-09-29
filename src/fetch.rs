@@ -2,7 +2,7 @@
 //!
 //! 对每个 URL——以及每一跳重定向——都会校验 URL、解析主机、把解析出的 IP 对照阻止列表检查,
 //! 并把 reqwest 固定到那个已校验的确切 IP,使后来的 DNS 应答无法改向连接(DNS 重绑定安全)。
-//! 响应体按流式字节上限读取,而非信任 `Content-Length`。见 `docs/security-design.md`。
+//! 响应体按流式字节上限读取,而非信任 `Content-Length`。见 `docs/architecture.md`「安全设计」。
 
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
@@ -76,7 +76,7 @@ pub enum FetchError {
 }
 
 impl FetchError {
-    /// 映射为 `last_fetch_status` 标签(见 `docs/data-model.md`)。
+    /// 映射为 `last_fetch_status` 标签(见 `docs/architecture.md`「数据模型」)。
     pub fn status_label(&self) -> String {
         match self {
             FetchError::Ssrf(_) => "ssrf_rejected".to_string(),
@@ -278,7 +278,7 @@ async fn read_limited_bytes(
 }
 
 /// 仅当 `subscription-userinfo` 值是单行且不含控制字符(头注入安全)时才接受,
-/// 见 `docs/security-design.md`。
+/// 见 `docs/architecture.md`「安全设计」。
 fn validate_userinfo(value: &str) -> Option<String> {
     if value.is_empty() || value.chars().any(|c| c.is_control()) {
         None

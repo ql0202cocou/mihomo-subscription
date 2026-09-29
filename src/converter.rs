@@ -1,8 +1,8 @@
 //! `mihomo`/`clash` -> `mihomo` 转换。
 //!
-//! 解析机场 YAML,追加启用的自定义节点/分组,用用户的规则替换 `rules`,并按 `docs/api-design.md`
-//! 处理顶层键(rule-providers 与未知键透传,proxy-providers 剥离)。校验遵循 `docs/api-design.md`,
-//! 返回逐条错误列表供生成弹窗使用。
+//! 解析机场 YAML,追加启用的自定义节点/分组,用用户的规则替换 `rules`,并按
+//! `docs/architecture.md`「API 设计」处理顶层键(rule-providers 与未知键透传,proxy-providers 剥离)。
+//! 校验遵循同一节,返回逐条错误列表供生成弹窗使用。
 
 use serde_yaml::{Mapping, Value};
 
@@ -66,7 +66,7 @@ pub enum ConvertError {
     ProviderParse,
     /// 输出 YAML 序列化失败(内部错误,与机场输入和用户配置均无关)。
     OutputSerialize,
-    /// 逐条列举的校验失败,以 `400` 暴露(见 `api-design.md`)。
+    /// 逐条列举的校验失败,以 `400` 暴露(见 `docs/architecture.md`「API 设计」)。
     Validation(Vec<String>),
 }
 
@@ -301,8 +301,8 @@ fn names_in(value: Option<&Value>) -> Vec<String> {
 /// 按期望的名字顺序对具名项做稳定重排。
 ///
 /// 名字出现在 `order` 中的项按 `order` 的次序移到前面;其余保持原相对顺序在后。无法解析出名字
-/// 的项,以及 `order` 里不在 `items` 中的条目,均忽略。`order` 为空时是 no-op。由转换器(proxy
-/// 映射)与预览端点(`EntryPreview`)共用。
+/// 的项,以及 `order` 里不在 `items` 中的条目,均忽略。`order` 为空时是 no-op。由转换器(自定义
+/// 节点块、分组)与全局节点池、全局规则集库的排序端点共用。
 pub fn reorder_by_name<T, F>(items: &mut Vec<T>, name_of: F, order: &[String])
 where
     F: Fn(&T) -> Option<&str>,

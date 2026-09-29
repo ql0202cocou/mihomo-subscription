@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { App as AntdApp, Button, Form, Input, Modal, Popconfirm, Select } from "antd";
 import { DeleteOutlined, EditOutlined, HolderOutlined, PlusOutlined } from "@ant-design/icons";
 import {
@@ -18,8 +18,10 @@ import {
 import { CSS } from "@dnd-kit/utilities";
 import { useTranslation } from "react-i18next";
 import { api, errorMessage } from "../../api";
-import type { CustomGroup, CustomNode, GroupType, ProxiesResponse } from "../../types";
+import type { CustomGroup, CustomNode, GroupType, ProxiesResponse, Regenerate } from "../../types";
 import { AdvancedFields, FieldInput, TypeChips, advancedEntries } from "../../components/fields";
+import { useRegenerateNotice } from "../../components/regenerate";
+import { useSerialSave } from "../../components/useSerialSave";
 import { BUILTIN_POLICIES, GROUP_TYPES, groupOptionFields, groupOptionKeys } from "./groupSchema";
 
 interface Props {
@@ -30,6 +32,8 @@ interface Props {
   generatedAt: string | null;
   /** 任一分组变更持久化成功后回调(保存/删除/导入),父组件据此重新加载。 */
   onSaved: () => void;
+  /** 排序保存带回的离线重生成结果,交给父组件展示校验错误。 */
+  onRegenerate: (r: Regenerate) => void;
 }
 
 type Options = Record<string, unknown>;
@@ -82,9 +86,18 @@ function reconcileRows(prev: GroupRow[], derived: GroupRow[]): GroupRow[] {
   return result;
 }
 
-export default function GroupsCard({ profileId, groups, nodes, generatedAt, onSaved }: Props) {
+export default function GroupsCard({
+  profileId,
+  groups,
+  nodes,
+  generatedAt,
+  onSaved,
+  onRegenerate,
+}: Props) {
   const { t } = useTranslation();
   const { message } = AntdApp.useApp();
+  const saveInOrder = useSerialSave();
+  const notice = useRegenerateNotice();
   const [editing, setEditing] = useState<CustomGroup | null>(null);
   const [open, setOpen] = useState(false);
   const [name, setName] = useState("");
@@ -114,8 +127,15 @@ export default function GroupsCard({ profileId, groups, nodes, generatedAt, onSa
   }, [loadGeneratedPreview, generatedAt]);
 
   const derived = useMemo(() => buildRows(orderNames, groups), [orderNames, groups]);
+  // 排序保存失败后置位:下一次 reload 以服务端顺序整体重建,而非保留屏幕上的失败顺序。
+  const resync = useRef(false);
   useEffect(() => {
-    setRows((prev) => reconcileRows(prev, derived));
+    if (resync.current) {
+      resync.current = false;
+      setRows(derived);
+    } else {
+      setRows((prev) => reconcileRows(prev, derived));
+    }
   }, [derived]);
 
   async function onDragEnd(event: DragEndEvent) {
@@ -126,18 +146,22 @@ export default function GroupsCard({ profileId, groups, nodes, generatedAt, onSa
     if (oldIndex < 0 || newIndex < 0) return;
     const next = arrayMove(rows, oldIndex, newIndex);
     setRows(next);
-    try {
-      await api(`/api/profiles/${profileId}/group-order`, {
+    const res = await saveInOrder(() =>
+      api<{ regenerate: Regenerate }>(`/api/profiles/${profileId}/group-order`, {
         method: "PUT",
         body: JSON.stringify({ order: next.map((r) => r.name) }),
-      });
-      message.success(t("groups.orderSaved"));
-    } catch (e) {
-      setRows(rows); // 保存失败回滚到拖拽前顺序(与 NodesCard 一致)
-      message.error(errorMessage(e, t("groups.orderSaveFailed")));
-    } finally {
-      void loadGeneratedPreview();
+      }),
+    );
+    // 之后又有拖拽:界面交给最后一次保存决定。
+    if (!res.latest) return;
+    if (res.ok) {
+      notice(res.value.regenerate, t("groups.orderSaved"));
+      onRegenerate(res.value.regenerate);
+    } else {
+      resync.current = true; // 回滚到服务端实际持有的顺序(与 NodesCard 一致)
+      message.error(errorMessage(res.error, t("groups.orderSaveFailed")));
     }
+    void loadGeneratedPreview();
   }
 
   async function importProviderGroups() {

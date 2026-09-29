@@ -24,6 +24,13 @@ export interface ProfileRules {
   updated_at: string;
 }
 
+/** 规则/排序类保存接口带回的离线重生成结果(`src/generate.rs` 的 `Regenerated`)。 */
+export interface Regenerate {
+  status: "applied" | "pending" | "invalid";
+  /** 仅 `invalid`:与「生成」一致的逐条校验错误。 */
+  errors?: string[];
+}
+
 export interface ProviderRulesResponse {
   rules: string[];
 }

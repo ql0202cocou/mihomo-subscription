@@ -341,7 +341,9 @@ async fn import_from_global_copies_and_appends_rule() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
-    assert_eq!(json(resp).await["imported"].as_u64().unwrap(), 1);
+    let body = json(resp).await;
+    assert_eq!(body["imported"].as_u64().unwrap(), 1);
+    assert_eq!(body["regenerate"]["status"], "applied");
 
     // ③ 列表含 gads;profile 规则文本含 RULE-SET 行。
     let resp = app

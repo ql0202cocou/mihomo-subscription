@@ -23,7 +23,7 @@ use crate::keyed_lock::KeyedLock;
 use crate::rate_limit::{self, RateLimiter};
 use crate::{generate, global_nodes, profile_rule_sets, profiles, rule_sets, settings};
 
-/// 管理请求体大小上限(见 `docs/api-design.md`)。
+/// 管理请求体大小上限(见 `docs/architecture.md`「API 设计」)。
 const MAX_BODY_BYTES: usize = 1024 * 1024;
 
 #[derive(Clone)]
@@ -32,7 +32,7 @@ pub struct AppState {
     /// 外部可达的源,用于拼装托管链接。
     pub public_base_url: String,
     /// 全局公共路径前缀。用锁持有,因为 reset-public-path 会在运行时更新它
-    /// (见 `docs/security-design.md`)。
+    /// (见 `docs/architecture.md`「安全设计」)。
     pub public_path_prefix: Arc<RwLock<String>>,
     pub admin: AdminAuth,
     pub sessions: SessionStore,

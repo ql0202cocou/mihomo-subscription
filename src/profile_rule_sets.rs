@@ -22,6 +22,7 @@ use sqlx::FromRow;
 
 use crate::app::AppState;
 use crate::error::{ApiError, ApiResult};
+use crate::generate::Regenerated;
 use crate::mask;
 use crate::rulelib::{self, RuleSetBody};
 use crate::util::{is_fresh, now};
@@ -232,6 +233,8 @@ pub struct ImportBody {
 pub struct ImportResult {
     /// 实际复制进本订阅(③)的规则集定义数(已存在同名定义的不计)。
     imported: usize,
+    /// 追加了规则行时的离线重生成结果;规则文本未变(引用均已存在)时为 `null`。
+    regenerate: Option<Regenerated>,
 }
 
 /// 从全局 ② 库复制一行所需的字段(含 `rule_count`,直接沿用,免重算)。
@@ -323,6 +326,7 @@ pub async fn import(
             .await?
             .unwrap_or_default();
     let referenced = crate::converter::ruleset_refs(&content);
+    let mut regenerate = None;
     let lines: Vec<String> = names
         .iter()
         .filter(|n| !referenced.iter().any(|r| r == *n))
@@ -340,15 +344,13 @@ pub async fn import(
             .execute(&state.db)
             .await?;
         // 用缓存的机场原文离线重生成(含 rule-providers 注入),使导入立即反映到所服务的订阅。
-        if crate::generate::regenerate_from_cache(&state, &profile_id)
-            .await
-            .is_err()
-        {
-            tracing::warn!(profile = %profile_id, "failed to regenerate cache after rule-set import");
-        }
+        regenerate = Some(crate::generate::regenerate_from_cache(&state, &profile_id).await);
     }
 
-    Ok(Json(ImportResult { imported }))
+    Ok(Json(ImportResult {
+        imported,
+        regenerate,
+    }))
 }
 
 /// trim 每个名字、丢弃空串并保序去重。
@@ -386,7 +388,7 @@ const SERVE_COLS: &str =
 /// `GET /:public_path_prefix/api/sub/:token/r/:name/:file` —— 公开托管本订阅的规则集内容。无鉴权;
 /// 按 token→订阅、再按 `(profile_id, name)` 定位,统一 404(前缀错 / token 错 / 名不存在 / 未启用 /
 /// 文件名不符 / remote 未托管 一律 404)。`:file` 必须等于 `<behavior>.<format>`。规则集是规则清单、
-/// 非私密,按名可枚举可接受(见 `docs/security-design.md`),由 IP 限流抑制枚举。
+/// 非私密,按名可枚举可接受(见 `docs/architecture.md`「安全设计」),由 IP 限流抑制枚举。
 pub async fn public_serve(
     State(state): State<Arc<AppState>>,
     Path((prefix, token, name, file)): Path<(String, String, String, String)>,

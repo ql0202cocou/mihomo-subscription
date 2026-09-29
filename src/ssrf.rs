@@ -1,6 +1,6 @@
 //! SSRF 防护:纯粹的 URL 与 IP 校验。
 //!
-//! 实现 `docs/security-design.md` 的规则。本模块不涉网络、且用表驱动充分测试;真正的固定 IP
+//! 实现 `docs/architecture.md`「安全设计」的规则。本模块不涉网络、且用表驱动充分测试;真正的固定 IP
 //! 拉取在 `fetch.rs`,它对每个 URL、每一跳重定向都调用这里。
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
@@ -25,7 +25,7 @@ pub enum SsrfError {
     BlockedIp,
 }
 
-/// 绝不能作为连接目标的 IPv4 范围(见 security-design.md)。
+/// 绝不能作为连接目标的 IPv4 范围(见 `docs/architecture.md`「安全设计」)。
 const BLOCKED_V4: &[&str] = &[
     "0.0.0.0/8",
     "10.0.0.0/8",

@@ -1,6 +1,6 @@
 //! 管理员认证:恒定时间凭据校验、内存会话、会话 cookie 处理器,以及 auth / Origin 中间件。
 //!
-//! 行为遵循 `docs/security-design.md`(管理员认证、CORS 与 CSRF)与 `docs/api-design.md`(认证)。
+//! 行为遵循 `docs/architecture.md`「安全设计」(管理员认证、CORS 与 CSRF)与「API 设计」(认证)。
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -23,7 +23,7 @@ use url::Url;
 use crate::app::AppState;
 
 const SESSION_COOKIE: &str = "session";
-/// 会话空闲生命周期,见 `docs/security-design.md`(默认 7 天)。
+/// 会话空闲生命周期,见 `docs/architecture.md`「安全设计」(默认 7 天)。
 pub const SESSION_IDLE: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 
 // ─── 凭据 ──────────────────────────────────────────────────────────────────────

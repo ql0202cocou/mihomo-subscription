@@ -354,7 +354,8 @@ async fn node_order_reorders_preview_and_survives_regeneration() {
         ))
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(json(resp).await["regenerate"]["status"], "applied");
     assert_eq!(
         proxy_names(app.clone(), cookie.clone()).await,
         vec!["b", "a", "hk-1"],
@@ -508,7 +509,8 @@ async fn reorder_applies_to_the_cache_immediately_without_a_fetch() {
         ))
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(json(resp).await["regenerate"]["status"], "applied");
 
     // The cached output (admin preview) reflects the new order immediately via
     // regenerate_from_cache — no provider re-fetch.
@@ -635,7 +637,8 @@ async fn group_order_reorders_preview_and_survives_regeneration() {
         ))
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(json(resp).await["regenerate"]["status"], "applied");
 
     // Preview reflects the saved order immediately (before regeneration).
     assert_eq!(
@@ -1087,7 +1090,8 @@ async fn cached_app(temp: &TempDb) -> (Router, sqlx::SqlitePool) {
     (build_router(state), db)
 }
 
-async fn put_rules(app: &Router, cookie: &str, id: &str, content: &str) {
+/// 保存规则并返回响应中的离线重生成结果(`regenerate`)。
+async fn put_rules(app: &Router, cookie: &str, id: &str, content: &str) -> Value {
     let body = serde_json::json!({ "content": content }).to_string();
     let resp = app
         .clone()
@@ -1099,7 +1103,8 @@ async fn put_rules(app: &Router, cookie: &str, id: &str, content: &str) {
         ))
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    assert_eq!(resp.status(), StatusCode::OK);
+    json(resp).await["regenerate"].clone()
 }
 
 async fn get_text(app: &Router, path: &str) -> String {
@@ -1121,11 +1126,18 @@ async fn invalid_rule_edit_never_reaches_the_served_cache() {
     let id = profile["id"].as_str().unwrap();
     let sub = sub_path(profile["subscription_url"].as_str().unwrap());
 
-    put_rules(&app, &cookie, id, "MATCH,DIRECT").await;
+    let regen = put_rules(&app, &cookie, id, "MATCH,DIRECT").await;
+    assert_eq!(regen, serde_json::json!({ "status": "applied" }));
     assert!(get_text(&app, &sub).await.contains("MATCH,DIRECT"));
 
-    // 引用不存在的策略:规则照常保存,但所服务的缓存保持上一份合法输出。
-    put_rules(&app, &cookie, id, "MATCH,NoSuchGroup").await;
+    // 引用不存在的策略:规则照常保存,但所服务的缓存保持上一份合法输出,响应如实带回校验错误。
+    let regen = put_rules(&app, &cookie, id, "MATCH,NoSuchGroup").await;
+    assert_eq!(regen["status"], "invalid");
+    assert!(regen["errors"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|e| e.as_str().unwrap().contains("NoSuchGroup")));
     let body = get_text(&app, &sub).await;
     assert!(body.contains("MATCH,DIRECT"));
     assert!(!body.contains("NoSuchGroup"));
@@ -1147,7 +1159,8 @@ async fn legacy_cache_without_provider_original_is_left_untouched() {
         .unwrap();
     let before = get_text(&app, &sub).await;
 
-    put_rules(&app, &cookie, id, "MATCH,DIRECT").await;
+    let regen = put_rules(&app, &cookie, id, "MATCH,DIRECT").await;
+    assert_eq!(regen, serde_json::json!({ "status": "pending" }));
     assert_eq!(
         get_text(&app, &sub).await,
         before,

@@ -1,5 +1,5 @@
 //! 配置管理:profile CRUD,加规则与自定义分组。转换(generate/preview/公开端点)单独实现。
-//! 契约遵循 `docs/api-design.md`。
+//! 契约遵循 `docs/architecture.md`「API 设计」。
 
 use std::sync::Arc;
 
@@ -15,6 +15,7 @@ use sqlx::FromRow;
 
 use crate::app::AppState;
 use crate::error::{ApiError, ApiResult};
+use crate::generate::{regenerate_from_cache, Regenerated};
 use crate::mask::mask_url;
 use crate::ssrf;
 use crate::util::{now, random_token, MAX_ORDER_ENTRIES, MAX_ORDER_NAME_LEN};
@@ -376,7 +377,7 @@ pub async fn reset_token(
         .bind(&id)
         .execute(&state.db)
         .await?;
-    regenerate_served_cache(&state, &id).await;
+    regenerate_from_cache(&state, &id).await;
     Ok(Json(TokenResponse {
         subscription_url: state.subscription_url(&token),
         token,
@@ -384,6 +385,12 @@ pub async fn reset_token(
 }
 
 // ─── 规则 ──────────────────────────────────────────────────────────────────────
+
+/// 规则/排序类保存的响应:改动已入库,`regenerate` 说明它是否已下发到所服务的订阅。
+#[derive(Serialize)]
+pub struct SavedResponse {
+    regenerate: Regenerated,
+}
 
 #[derive(Deserialize)]
 pub struct PutRules {
@@ -404,8 +411,9 @@ pub async fn put_rules(
         .await?;
 
     // 用缓存的机场原文离线重生成,使编辑立即反映到所服务的订阅(不合法则保留上一份合法输出)。
-    regenerate_served_cache(&state, &id).await;
-    Ok(StatusCode::NO_CONTENT)
+    Ok(Json(SavedResponse {
+        regenerate: regenerate_from_cache(&state, &id).await,
+    }))
 }
 
 // ─── 代理预览 & 节点/分组排序 ─────────────────────────────────────────────────
@@ -554,13 +562,13 @@ pub struct OrderBody {
     order: Vec<String>,
 }
 
-/// 为给定列校验并持久化一个手动顺序。同时驱动生成输出(在下次生成时应用)与预览列表。
+/// 为给定列校验并持久化一个手动顺序。同时驱动生成输出(离线重生成后立即应用)与预览列表。
 async fn set_order(
     state: &AppState,
     id: &str,
     kind: OrderKind,
     body: OrderBody,
-) -> ApiResult<StatusCode> {
+) -> ApiResult<Json<SavedResponse>> {
     let _ = load_profile_row(state, id).await?;
 
     if body.order.len() > MAX_ORDER_ENTRIES {
@@ -598,19 +606,9 @@ async fn set_order(
         .await?;
 
     // 用缓存的机场原文离线重生成(不重拉机场),把新顺序立即应用到所服务的订阅;尽力而为。
-    regenerate_served_cache(state, id).await;
-    Ok(StatusCode::NO_CONTENT)
-}
-
-/// 离线重生成缓存,使排序/规则/token 改动立刻被服务。尽力而为:失败时让已保存的改动在下次生成时
-/// 生效,故它绝不能让发起请求失败。
-async fn regenerate_served_cache(state: &AppState, id: &str) {
-    if crate::generate::regenerate_from_cache(state, id)
-        .await
-        .is_err()
-    {
-        tracing::warn!(profile = %id, "failed to regenerate served cache after edit");
-    }
+    Ok(Json(SavedResponse {
+        regenerate: regenerate_from_cache(state, id).await,
+    }))
 }
 
 /// `PUT /api/profiles/:id/group-order` —— 持久化一个手动 proxy-group 顺序。

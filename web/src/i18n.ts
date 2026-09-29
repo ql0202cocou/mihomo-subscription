@@ -90,6 +90,7 @@ const zh = {
       generateSuccess: "已刷新",
       generateFailed: "刷新失败",
       generateFailedRules: "刷新失败:规则中有 {{count}} 处错误,请到「规则」页签查看",
+      invalidConfig: "当前配置未通过校验",
       rulesetConflict: "以下规则集与机场同名 rule-provider 冲突,已用面板托管版覆盖",
     },
     basic: {
@@ -252,7 +253,7 @@ const zh = {
       importHostedPolicyHint: "导入的规则集统一指向该策略,可在列表中逐条调整。",
       importHostedDone: "已导入 {{count}} 个托管规则集",
       incomplete: "规则类型、匹配内容与策略均为必填(MATCH 除外)。",
-      invalid: "上次生成时检测到规则错误:",
+      invalid: "规则未通过校验:",
       delete: "删除",
       deleteConfirm: "确定删除该规则?",
       dragHint: "规则按顺序匹配(命中即止);拖动左侧手柄可调整优先级,松手即保存并立即生效。",
@@ -260,6 +261,10 @@ const zh = {
       matchHint: "MATCH 为兜底规则,匹配所有未命中流量;仅需选择策略,永久固定在列表最后。",
       fallbackNote: "兜底 · 未命中以上规则时",
       count: "{{count}} 条",
+    },
+    regenerate: {
+      pending: "已保存;订阅将在下次刷新后更新。",
+      invalid: "已保存,但当前配置有 {{count}} 处未通过校验,订阅仍为上一份合法配置。",
     },
     preview: {
       title: "输出预览",

@@ -1,6 +1,6 @@
 //! 数据库初始化:连接池、迁移,以及 app-settings 的种子。
 //!
-//! 按 `docs/data-model.md`,`foreign_keys` 与 `busy_timeout` 是每连接 pragma。它们配置在
+//! 按 `docs/architecture.md`「数据模型」,`foreign_keys` 与 `busy_timeout` 是每连接 pragma。它们配置在
 //! `SqliteConnectOptions` 上,SQLx 会对它打开的 *每个* 物理连接下发——等价于 after-connect 钩子
 //! 的惯用做法——故 `ON DELETE CASCADE` 不会在池中某些连接上被静默禁用。`journal_mode = WAL`
 //! 只设一次,随数据库文件持久化。

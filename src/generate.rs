@@ -3,7 +3,7 @@
 //! `generate`(也是源卡片的手动刷新)拉取机场、转换、持久化缓存,并更新 `last_fetch_*`。
 //! `preview` 是只读对应物(不写缓存、不改 `last_fetch_*`)。公开端点提供新鲜缓存,在 per-profile
 //! single-flight 锁下刷新,刷新失败时回退到陈旧缓存,对无效访问返回统一 `404`、无缓存且拉取失败时
-//! 返回通用 `503`。见 `docs/api-design.md` 与 `docs/security-design.md`。
+//! 返回通用 `503`。见 `docs/architecture.md`「API 设计」与「安全设计」。
 
 use std::sync::Arc;
 
@@ -526,19 +526,32 @@ async fn update_last_fetch(state: &AppState, profile_id: &str, status: &str) -> 
     Ok(())
 }
 
+/// 离线重生成的结果。规则/排序类保存接口随响应返回,前端据此如实提示改动是否已下发。
+#[derive(Debug, Serialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum Regenerated {
+    /// 已按新配置重写缓存,公开链接立即下发新输出。
+    Applied,
+    /// 没有可用的机场原文(尚未生成、升级前的缓存),或重生成出错:改动在下次回源后生效。
+    Pending,
+    /// 新配置未通过校验:保留上一份合法输出。`errors` 与「生成」返回的逐条错误一致。
+    Invalid { errors: Vec<String> },
+}
+
 /// 用缓存中的机场原文离线重跑完整转换(校验、`rule-providers` 注入、排序),不重拉机场。规则/排序
 /// 编辑与重置 token/前缀后调用,使改动立即反映到所服务的订阅,且与完整生成走同一条路径。
 ///
-/// - 校验失败时保留上一份合法输出:编辑已入库,逐条错误由下次「生成」报出,坏配置不会被下发。
+/// - 校验失败时保留上一份合法输出:编辑已入库,坏配置不会被下发,逐条错误经返回值交给调用方。
 /// - 尚未生成、或升级前生成的缓存(无机场原文)为 no-op,改动在下次回源拉取后生效。
 /// - 保留 `generated_at`,使公开端点的回源节奏不变(内容仍来自上次拉取)。
 /// - 与公开刷新共用 per-profile 锁,避免并发刷新用旧输入覆盖本次结果。
-pub async fn regenerate_from_cache(state: &AppState, profile_id: &str) -> ApiResult<()> {
-    state
+/// - 尽力而为:出错时记日志并返回 `Pending`,绝不让发起的保存请求失败。
+pub async fn regenerate_from_cache(state: &AppState, profile_id: &str) -> Regenerated {
+    let result: ApiResult<Regenerated> = state
         .keyed_lock
         .run(profile_id, async {
             let Some(profile) = load_core(state, profile_id).await? else {
-                return Ok(());
+                return Ok(Regenerated::Pending);
             };
             let Some((Some(provider_yaml), userinfo, generated_at)) =
                 sqlx::query_as::<_, (Option<String>, Option<String>, String)>(
@@ -549,14 +562,17 @@ pub async fn regenerate_from_cache(state: &AppState, profile_id: &str) -> ApiRes
                 .fetch_optional(&state.db)
                 .await?
             else {
-                return Ok(());
+                return Ok(Regenerated::Pending);
             };
             let (yaml, ruleset_conflicts) =
                 match convert(state, profile_id, &profile.token, &provider_yaml).await? {
                     Ok(out) => out,
-                    Err(_) => {
+                    Err(e) => {
                         tracing::warn!(profile = %profile_id, "edited config is invalid; keeping the last valid cache");
-                        return Ok(());
+                        return Ok(match e {
+                            ConvertError::Validation(errors) => Regenerated::Invalid { errors },
+                            _ => Regenerated::Pending,
+                        });
                     }
                 };
             let built = Built {
@@ -567,9 +583,14 @@ pub async fn regenerate_from_cache(state: &AppState, profile_id: &str) -> ApiRes
                 generated_at,
                 ruleset_conflicts,
             };
-            persist_cache_and_group_order(state, profile_id, &built).await
+            persist_cache_and_group_order(state, profile_id, &built).await?;
+            Ok(Regenerated::Applied)
         })
-        .await
+        .await;
+    result.unwrap_or_else(|_| {
+        tracing::warn!(profile = %profile_id, "failed to regenerate cache");
+        Regenerated::Pending
+    })
 }
 
 /// 对每条 profile 执行 [`regenerate_from_cache`]。用于影响所有 profile 的改动(全局节点排序、重置公共
@@ -580,9 +601,7 @@ pub async fn regenerate_all_from_cache(state: &AppState) {
         .await
         .unwrap_or_default();
     for id in ids {
-        if regenerate_from_cache(state, &id).await.is_err() {
-            tracing::warn!(profile = %id, "failed to regenerate cache");
-        }
+        regenerate_from_cache(state, &id).await;
     }
 }
 

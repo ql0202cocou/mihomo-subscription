@@ -1,5 +1,5 @@
 //! 全局自定义节点:单一跨订阅的自定义代理节点池,自动追加到每条 profile 的输出(模型 C)。
-//! 提供增删改 + 全局排序。契约见 `docs/api-design.md`;转换时由 `src/generate.rs` 读取本池。
+//! 提供增删改 + 全局排序。契约见 `docs/architecture.md`「API 设计」;转换时由 `src/generate.rs` 读取本池。
 
 use std::sync::Arc;
 

@@ -1,4 +1,4 @@
-//! API 错误类型,映射到文档约定的错误信封与状态码(见 `docs/api-design.md`)。
+//! API 错误类型,映射到文档约定的错误信封与状态码(见 `docs/architecture.md`「API 设计」)。
 
 use axum::{
     http::StatusCode,

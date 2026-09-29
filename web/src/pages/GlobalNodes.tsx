@@ -24,6 +24,7 @@ import { CSS } from "@dnd-kit/utilities";
 import { useTranslation } from "react-i18next";
 import { api, errorMessage } from "../api";
 import type { CustomNode } from "../types";
+import { useSerialSave } from "../components/useSerialSave";
 import NodeForm, { contentToModel, modelToContent, type NodeModel } from "../components/NodeForm";
 import { NODE_TYPE_LABELS } from "../components/nodeSchema";
 import "../components/cards.css";
@@ -33,6 +34,7 @@ const EMPTY_MODEL: NodeModel = { name: "", type: "", fields: {} };
 export default function GlobalNodes() {
   const { t } = useTranslation();
   const { message } = AntdApp.useApp();
+  const saveInOrder = useSerialSave();
   const [rows, setRows] = useState<CustomNode[]>([]);
   const [open, setOpen] = useState(false);
   const [editing, setEditing] = useState<CustomNode | null>(null);
@@ -107,17 +109,17 @@ export default function GlobalNodes() {
     if (oldIndex < 0 || newIndex < 0) return;
     const next = arrayMove(rows, oldIndex, newIndex);
     setRows(next); // 乐观更新
-    try {
-      await api("/api/global-nodes/order", {
+    const res = await saveInOrder(() =>
+      api("/api/global-nodes/order", {
         method: "PUT",
         body: JSON.stringify({ order: next.map((n) => n.name) }),
-      });
-      message.success(t("nodes.orderSaved"));
-    } catch (e) {
-      message.error(errorMessage(e, t("nodes.orderSaveFailed")));
-    } finally {
-      void load();
-    }
+      }),
+    );
+    // 之后又有拖拽:界面交给最后一次保存决定,避免中途 reload 把列表打回旧顺序。
+    if (!res.latest) return;
+    if (res.ok) message.success(t("nodes.orderSaved"));
+    else message.error(errorMessage(res.error, t("nodes.orderSaveFailed")));
+    void load(); // 以服务端为准;保存失败时即回到服务端实际持有的顺序
   }
 
   return (

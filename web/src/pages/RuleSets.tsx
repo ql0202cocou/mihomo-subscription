@@ -24,6 +24,7 @@ import { CSS } from "@dnd-kit/utilities";
 import { useTranslation } from "react-i18next";
 import { api, errorMessage } from "../api";
 import type { RuleSet } from "../types";
+import { useSerialSave } from "../components/useSerialSave";
 import { TypeChips } from "../components/fields";
 import {
   RULE_SET_BEHAVIORS as BEHAVIORS,
@@ -62,6 +63,7 @@ const EMPTY: FormState = {
 export default function RuleSets() {
   const { t } = useTranslation();
   const { message } = AntdApp.useApp();
+  const saveInOrder = useSerialSave();
   const [rows, setRows] = useState<RuleSet[]>([]);
   const [open, setOpen] = useState(false);
   const [editing, setEditing] = useState<RuleSet | null>(null);
@@ -160,17 +162,17 @@ export default function RuleSets() {
     if (oldIndex < 0 || newIndex < 0) return;
     const next = arrayMove(rows, oldIndex, newIndex);
     setRows(next); // 乐观更新
-    try {
-      await api("/api/rule-sets/order", {
+    const res = await saveInOrder(() =>
+      api("/api/rule-sets/order", {
         method: "PUT",
         body: JSON.stringify({ order: next.map((n) => n.name) }),
-      });
-      message.success(t("ruleSets.orderSaved"));
-    } catch (e) {
-      message.error(errorMessage(e, t("ruleSets.orderSaveFailed")));
-    } finally {
-      void load();
-    }
+      }),
+    );
+    // 之后又有拖拽:界面交给最后一次保存决定,避免中途 reload 把列表打回旧顺序。
+    if (!res.latest) return;
+    if (res.ok) message.success(t("ruleSets.orderSaved"));
+    else message.error(errorMessage(res.error, t("ruleSets.orderSaveFailed")));
+    void load(); // 以服务端为准;保存失败时即回到服务端实际持有的顺序
   }
 
   const formatOptions = form.source === "remote" ? REMOTE_FORMATS : MANUAL_FORMATS;
@@ -284,6 +286,7 @@ export default function RuleSets() {
                   <label className="rs-label">{t("ruleSets.interval")}</label>
                   <InputNumber
                     min={1}
+                    precision={0}
                     value={form.intervalHours}
                     onChange={(v) => setForm({ ...form, intervalHours: v ?? 24 })}
                   />

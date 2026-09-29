@@ -148,7 +148,7 @@ GET    /api/profiles/:id/rule-sets                     # 列表；每项含 url�
 POST   /api/profiles/:id/rule-sets   { name, behavior, source?, format, ... }   # name 在本订阅内唯一（重名 409）；字段同 ②
 PUT    /api/profiles/:id/rule-sets/:rsid   { ...同上 }
 DELETE /api/profiles/:id/rule-sets/:rsid
-POST   /api/profiles/:id/rule-sets/import  { names: [②规则集名], policy }   # 复制 ② 定义进 ③（含真实远程 URL）+ 为未引用名追加 RULE-SET,<name>,<policy> 行（policy 须为单个非空名字，不含逗号/换行，否则 400 且不写入）；返回 { imported }（实际复制进 ③ 的定义数，已存在同名的不计）
+POST   /api/profiles/:id/rule-sets/import  { names: [②规则集名], policy }   # 复制 ② 定义进 ③（含真实远程 URL）+ 为未引用名追加 RULE-SET,<name>,<policy> 行（policy 须为单个非空名字，不含逗号/换行，否则 400 且不写入）；返回 { imported, regenerate }（imported 为实际复制进 ③ 的定义数，已存在同名的不计；regenerate 见「节点/分组预览与排序」，未追加规则行时为 null）
 ```
 
 - manual / remote 行为与 ② 一致（校验/渲染/镜像同一套逻辑）。托管在按订阅 token 隔离的链接
@@ -174,10 +174,10 @@ GET /api/profiles/:id/proxies
 分组。两者也作分组成员候选。
 
 ```text
-PUT /api/global-nodes/order               { order: [节点名] }              # 全局，未列出落末尾；重写为 0..n-1
+PUT /api/global-nodes/order               { order: [节点名] }              # 全局，未列出落末尾；重写为 0..n-1 -> 204
 PUT /api/profiles/:id/node-section-order  { order: ["custom","provider"] } # per-profile，必须是排列
 PUT /api/profiles/:id/group-order         { order: [分组名] }              # per-profile
--> 均 204
+-> 200 { "regenerate": { "status": "applied" | "pending" | "invalid", "errors"?: [..] } }
 ```
 
 - 自定义块顺序由全局 `global-nodes/order` 决定（作用所有配置）；两块先后由 per-profile
@@ -186,10 +186,13 @@ PUT /api/profiles/:id/group-order         { order: [分组名] }              # 
   机场**，改动**立即生效**（预览与公共链接随即反映）；全局排序重生成**每条配置**缓存，无缓存者
   首次生成时生效。
 - 规则拖拽同理：规则顺序即语义（命中即止），存为 `rulesets.content` 有序文本，前端经
-  `PUT .../rules` 整体保存，同样离线重生成、立即生效。
+  `PUT .../rules` 整体保存，同样离线重生成、立即生效，响应同上。
 - 离线重生成与 `generate` 走同一转换器（含校验与 `rule-providers` 注入）；所有写缓存的路径（生成、新建时的
-  自动拉取、公开刷新、离线重生成）共用 per-profile 锁；保留 `generated_at`（回源节奏不变）。校验失败时编辑照常入库，但缓存保留上一份合法输出（逐条错误
-  由下次「生成」报出）；无机场原文的旧缓存（`0012` 之前生成）为 no-op，下次回源后生效。
+  自动拉取、公开刷新、离线重生成）共用 per-profile 锁；保留 `generated_at`（回源节奏不变）。
+- per-profile 的保存接口（`rules`、`node-section-order`、`group-order`、`rule-sets/import`）在响应的
+  `regenerate` 如实说明改动是否已下发：`applied` 已重写缓存；`invalid` 校验失败，编辑照常入库但缓存保留
+  上一份合法输出，`errors` 为与「生成」一致的逐条错误；`pending` 没有机场原文（未生成或 `0012` 之前的旧
+  缓存）或重生成出错，下次回源后生效。保存本身始终成功（2xx），前端据 `status` 提示成功或警告。
 - 每次生成把输出的分组顺序快照回写 `group_order`（新增分组落末尾）；节点顺序为全局
   `global_nodes.position`，不 per-profile 快照，机场块恒上游序。
 - 节点/分组均结构化表单录入（节点常用字段 + 高级 KV；分组按类型给选项 + 高级 KV；成员从候选
