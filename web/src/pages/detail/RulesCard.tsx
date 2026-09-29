@@ -329,20 +329,27 @@ export default function RulesCard({ profileId, initial, nodes, groups, generated
   }
 
   // 把 RULE-SET 的内联 provider 定义 upsert 到本订阅 ③ 库(按名 POST 新建 / PUT 更新)。
+  // 表单不编辑 cache / enabled:更新时沿用已有值(PUT 整体替换,缺省会被后端当作 true),新建时启用并缓存。
   async function upsertRuleSet(m: RuleModel) {
     const name = m.payload.trim();
-    const base = { name, behavior: m.rsBehavior, format: m.rsFormat, source: m.rsSource };
+    const existing = profileRuleSets.find((r) => r.name === name);
+    const base = {
+      name,
+      behavior: m.rsBehavior,
+      format: m.rsFormat,
+      source: m.rsSource,
+      enabled: existing?.enabled ?? true,
+    };
     const body =
       m.rsSource === "remote"
         ? {
             ...base,
             interval_hours: m.rsInterval,
-            cache: true,
+            cache: existing?.cache ?? true,
             // 远程 URL 已脱敏不回显:留空时不传 url 字段,后端保留原 URL(见 submit 的校验)。
             ...(m.rsUrl.trim() ? { url: m.rsUrl.trim() } : {}),
           }
         : { ...base, content: m.rsContent };
-    const existing = profileRuleSets.find((r) => r.name === name);
     if (existing) {
       await api(`/api/profiles/${profileId}/rule-sets/${existing.id}`, {
         method: "PUT",
