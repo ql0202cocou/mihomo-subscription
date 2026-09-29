@@ -1202,3 +1202,29 @@ async fn unparsable_provider_body_is_recorded_as_provider_parse() {
         .unwrap();
     assert_eq!(json(resp).await["last_fetch_status"], "provider_parse");
 }
+
+#[tokio::test]
+async fn admin_generate_waits_for_the_per_profile_lock() {
+    let temp = TempDb::new();
+    let state = test_state_with_fetcher(&temp, Arc::new(FakeFetcher::default())).await;
+    let app = build_router(state.clone());
+    let cookie = login(&app).await;
+    let profile = create_profile(&app, &cookie).await;
+    let id = profile["id"].as_str().unwrap().to_string();
+    let generate = || authed("POST", &format!("/api/profiles/{id}/generate"), &cookie, "");
+
+    // 占住该 profile 的锁(模拟进行中的离线重生成):生成必须等锁,不能与之并发写缓存。
+    let blocked = state
+        .keyed_lock
+        .run(&id, async {
+            tokio::time::timeout(Duration::from_millis(300), app.clone().oneshot(generate()))
+                .await
+                .is_err()
+        })
+        .await;
+    assert!(blocked, "generate must wait for the per-profile lock");
+
+    // 锁释放后照常完成。
+    let resp = app.oneshot(generate()).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+}

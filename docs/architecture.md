@@ -187,8 +187,8 @@ PUT /api/profiles/:id/group-order         { order: [分组名] }              # 
   首次生成时生效。
 - 规则拖拽同理：规则顺序即语义（命中即止），存为 `rulesets.content` 有序文本，前端经
   `PUT .../rules` 整体保存，同样离线重生成、立即生效。
-- 离线重生成与 `generate` 走同一转换器（含校验与 `rule-providers` 注入），与公开刷新共用 per-profile
-  锁；保留 `generated_at`（回源节奏不变）。校验失败时编辑照常入库，但缓存保留上一份合法输出（逐条错误
+- 离线重生成与 `generate` 走同一转换器（含校验与 `rule-providers` 注入）；所有写缓存的路径（生成、新建时的
+  自动拉取、公开刷新、离线重生成）共用 per-profile 锁；保留 `generated_at`（回源节奏不变）。校验失败时编辑照常入库，但缓存保留上一份合法输出（逐条错误
   由下次「生成」报出）；无机场原文的旧缓存（`0012` 之前生成）为 no-op，下次回源后生效。
 - 每次生成把输出的分组顺序快照回写 `group_order`（新增分组落末尾）；节点顺序为全局
   `global_nodes.position`，不 per-profile 快照，机场块恒上游序。

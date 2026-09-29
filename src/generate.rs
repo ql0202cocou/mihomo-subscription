@@ -78,14 +78,20 @@ pub async fn generate(
 ) -> ApiResult<impl IntoResponse> {
     let profile = load_core(&state, &id).await?.ok_or(ApiError::NotFound)?;
 
-    let built = match fetch_convert_and_record(&state, &profile).await {
-        Ok(b) => b,
-        Err(BuildError::Validation(errors)) => return Err(ApiError::Validation(errors)),
-        Err(BuildError::Upstream(label)) => return Err(ApiError::Upstream(label)),
-        Err(BuildError::Internal) => return Err(ApiError::Internal),
-    };
-
-    persist_cache_and_group_order(&state, &profile.id, &built).await?;
+    // 与公开刷新、离线重生成共用 per-profile 锁:否则并发的一方可能用较旧的机场原文覆盖较新的缓存。
+    let built = state
+        .keyed_lock
+        .run(&profile.id, async {
+            let built = match fetch_convert_and_record(&state, &profile).await {
+                Ok(b) => b,
+                Err(BuildError::Validation(errors)) => return Err(ApiError::Validation(errors)),
+                Err(BuildError::Upstream(label)) => return Err(ApiError::Upstream(label)),
+                Err(BuildError::Internal) => return Err(ApiError::Internal),
+            };
+            persist_cache_and_group_order(&state, &profile.id, &built).await?;
+            Ok(built)
+        })
+        .await?;
     Ok(Json(GenerateResponse {
         subscription_url: state.subscription_url(&profile.token),
         generated_at: built.generated_at,
@@ -99,9 +105,15 @@ pub async fn generate_best_effort(state: &AppState, id: &str) {
     let Some(profile) = load_core(state, id).await.ok().flatten() else {
         return;
     };
-    if let Ok(built) = fetch_convert_and_record(state, &profile).await {
-        let _ = persist_cache_and_group_order(state, &profile.id, &built).await;
-    }
+    // 同 `generate`,写缓存前持有 per-profile 锁。
+    state
+        .keyed_lock
+        .run(&profile.id, async {
+            if let Ok(built) = fetch_convert_and_record(state, &profile).await {
+                let _ = persist_cache_and_group_order(state, &profile.id, &built).await;
+            }
+        })
+        .await;
 }
 
 /// `GET /api/profiles/:id/preview` —— 只读的生成 YAML。有新鲜缓存则返回,否则实时生成、不持久化、
