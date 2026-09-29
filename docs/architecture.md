@@ -148,7 +148,7 @@ GET    /api/profiles/:id/rule-sets                     # 列表；每项含 url�
 POST   /api/profiles/:id/rule-sets   { name, behavior, source?, format, ... }   # name 在本订阅内唯一（重名 409）；字段同 ②
 PUT    /api/profiles/:id/rule-sets/:rsid   { ...同上 }
 DELETE /api/profiles/:id/rule-sets/:rsid
-POST   /api/profiles/:id/rule-sets/import  { names: [②规则集名], policy }   # 复制 ② 定义进 ③（含真实远程 URL）+ 为未引用名追加 RULE-SET,<name>,<policy> 行（policy 须为单个非空名字，不含逗号/换行，否则 400 且不写入）；返回 { imported }（实际复制进 ③ 的定义数，已存在同名的不计）
+POST   /api/profiles/:id/rule-sets/import  { names: [②规则集名], policy }   # 复制 ② 定义进 ③（含真实远程 URL 与启用状态）+ 为未引用名追加 RULE-SET,<name>,<policy> 行（policy 须为单个非空名字，不含逗号/换行，否则 400 且不写入）；返回 { imported }（实际复制进 ③ 的定义数，已存在同名的不计）
 ```
 
 - manual / remote 行为与 ② 一致（校验/渲染/镜像同一套逻辑）。托管在按订阅 token 隔离的链接

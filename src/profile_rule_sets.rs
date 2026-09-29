@@ -245,6 +245,7 @@ struct GlobalRuleSet {
     url: Option<String>,
     interval_hours: i64,
     cache: bool,
+    enabled: bool,
     rule_count: i64,
 }
 
@@ -267,7 +268,7 @@ pub async fn import(
         ));
     }
 
-    // 复制定义:逐个把 ② 行复制进 ③(本订阅已有同名则跳过);rule_count 直接沿用 ② 的值。
+    // 复制定义:逐个把 ② 行复制进 ③(本订阅已有同名则跳过);rule_count 与启用状态直接沿用 ② 的值。
     let mut imported = 0usize;
     for name in &names {
         let exists = sqlx::query_scalar::<_, String>(
@@ -281,8 +282,8 @@ pub async fn import(
             continue;
         }
         let Some(g) = sqlx::query_as::<_, GlobalRuleSet>(
-            "SELECT name, behavior, format, source, content, url, interval_hours, cache, rule_count \
-             FROM rule_sets WHERE name = ?",
+            "SELECT name, behavior, format, source, content, url, interval_hours, cache, enabled, \
+             rule_count FROM rule_sets WHERE name = ?",
         )
         .bind(name)
         .fetch_optional(&state.db)
@@ -295,7 +296,7 @@ pub async fn import(
         sqlx::query(
             "INSERT INTO profile_rule_sets (id, profile_id, name, behavior, format, source, content, \
              rule_count, url, interval_hours, cache, enabled, created_at, updated_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)",
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&id)
         .bind(&profile_id)
@@ -308,6 +309,7 @@ pub async fn import(
         .bind(&g.url)
         .bind(g.interval_hours)
         .bind(g.cache)
+        .bind(g.enabled)
         .bind(&ts)
         .bind(&ts)
         .execute(&state.db)

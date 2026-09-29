@@ -595,3 +595,48 @@ async fn import_rejects_malformed_policy_without_writing() {
         .unwrap();
     assert_eq!(json(resp).await["rules"]["content"], "");
 }
+
+#[tokio::test]
+async fn import_keeps_the_global_enabled_state() {
+    let temp = TempDb::new();
+    let app = build_router(test_state_with_fetcher(&temp, Arc::new(FakeFetcher)).await);
+    let cookie = login(&app).await;
+    let (p1, _, _) = create_profile(&app, &cookie, "P1").await;
+    app.clone()
+        .oneshot(authed(
+            "POST",
+            "/api/rule-sets",
+            &cookie,
+            r#"{"name":"off","behavior":"domain","format":"yaml","content":"+.x.example","enabled":false}"#,
+        ))
+        .await
+        .unwrap();
+    app.clone()
+        .oneshot(authed(
+            "POST",
+            &format!("/api/profiles/{p1}/rule-sets/import"),
+            &cookie,
+            r#"{"names":["off"],"policy":"DIRECT"}"#,
+        ))
+        .await
+        .unwrap();
+
+    let resp = app
+        .clone()
+        .oneshot(authed(
+            "GET",
+            &format!("/api/profiles/{p1}/rule-sets"),
+            &cookie,
+            "",
+        ))
+        .await
+        .unwrap();
+    let list = json(resp).await;
+    let off = list
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["name"] == "off")
+        .unwrap();
+    assert_eq!(off["enabled"], false, "沿用 ② 的停用状态");
+}
