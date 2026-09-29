@@ -45,7 +45,7 @@ compose 的 `environment:` 与代码必须一致。
 | `PUBLIC_BASE_URL` | 空 | 建议 | 生成托管链接与校验管理 API `Origin` 的外部可达源（`https://sub.example.com`）。为空则链接缺少 scheme/host，且 Origin 校验仅回退到 Host |
 | `PUBLIC_PATH_PREFIX` | 随机 | 否 | 公共路径前缀的种子；运行时值存于 `app_settings` 并可重置。空/空白被忽略并随机生成 |
 | `RUST_LOG` | `info` | 否 | 日志级别 |
-| `FETCH_TIMEOUT_SECONDS` | `15` | 否 | 机场获取总超时 |
+| `FETCH_TIMEOUT_SECONDS` | `15` | 否 | 机场获取总超时（含 DNS 解析与全部重定向）。出站拉取不读取 `HTTP_PROXY`/`HTTPS_PROXY` 等代理变量 |
 | `FETCH_USER_AGENT` | `clash.meta/1.0` | 否 | 机场获取的 `User-Agent`。许多机场按 Clash 家族 UA 限制订阅、对未知客户端返回 `403`/`401`；默认匹配常见 `/clash/i` 检查。仅在面板需要特定客户端 UA 时覆盖（如 Shadowrocket/Stash） |
 | `MAX_SUBSCRIPTION_SIZE_MB` | `8` | 否 | 机场响应大小上限 |
 | `CACHE_TTL_MINUTES` | `15` | 否 | 仅管理员**预览**缓存 TTL；公共订阅回源节流由 `PUBLIC_REFRESH_MIN_SECONDS` 控制 |
