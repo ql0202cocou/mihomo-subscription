@@ -134,6 +134,8 @@ const zh = {
       addField: "添加字段",
       key: "字段名",
       remove: "删除",
+      keyConflict: "字段名重复或与上方已有字段相同,该行不会保存。",
+      kind: { text: "文本", number: "数字", bool: "开关", yaml: "YAML" },
     },
     nodeFields: {
       server: "服务器地址",

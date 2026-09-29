@@ -116,15 +116,106 @@ export function FieldInput({
   }
 }
 
-/** 可编辑的高级键值行列表,保持文档顺序。 */
+/** 高级行的值类型,决定该行用哪种编辑器;按行固定,不随输入中途的值变化。 */
+type AdvancedKind = "text" | "number" | "bool" | "yaml";
+
+interface AdvancedRow {
+  /** 稳定的行 id,作 React key:删除前面的行不会让后面的行错用别行的编辑器状态。 */
+  id: number;
+  key: string;
+  kind: AdvancedKind;
+  value: unknown;
+}
+
+function kindOf(v: unknown): AdvancedKind {
+  if (typeof v === "boolean") return "bool";
+  if (typeof v === "number") return "number";
+  if (v !== null && typeof v === "object") return "yaml";
+  return "text";
+}
+
+let nextRowId = 0;
+
+function toRows(entries: [string, unknown][]): AdvancedRow[] {
+  return entries.map(([key, value]) => ({ id: nextRowId++, key, kind: kindOf(value), value }));
+}
+
+/** 行在写回对象时是否被跳过:key 为空,或与保留字段、前面的行重名。 */
+function skippedRows(rows: AdvancedRow[], reserved: Set<string>): Set<number> {
+  const seen = new Set<string>();
+  const skipped = new Set<number>();
+  for (const r of rows) {
+    const k = r.key.trim();
+    if (!k || reserved.has(k) || seen.has(k)) skipped.add(r.id);
+    else seen.add(k);
+  }
+  return skipped;
+}
+
+/** 切换行类型时尽量保留已填的值。 */
+function convertValue(value: unknown, kind: AdvancedKind): unknown {
+  switch (kind) {
+    case "bool":
+      return value === true || value === "true";
+    case "number": {
+      const n = Number(value);
+      return value !== "" && value != null && Number.isFinite(n) ? n : null;
+    }
+    case "text":
+      return value !== null && typeof value === "object"
+        ? stringifyYaml(value).trimEnd()
+        : value == null
+          ? ""
+          : String(value);
+    default:
+      return value;
+  }
+}
+
+/**
+ * 可编辑的高级键值行列表,保持文档顺序。行在组件内保存:输入中途 key 与保留字段(表单已直接渲染的
+ * 字段)或前面的行重名时,该行标红且不写回,不会覆盖已有值。只有有效行经 `onChange` 写回。
+ */
 export function AdvancedFields({
   entries,
+  reserved,
   onChange,
 }: {
   entries: [string, unknown][];
+  reserved: Set<string>;
   onChange: (next: [string, unknown][]) => void;
 }) {
   const { t } = useTranslation();
+  const [rows, setRows] = useState(() => toRows(entries));
+  // 最近一次写回的有效行。外部值与之不同(如切换节点类型改变了已知字段)时,按外部值重建行。
+  const [synced, setSynced] = useState(() => JSON.stringify(entries));
+  const incoming = JSON.stringify(entries);
+  if (incoming !== synced) {
+    setSynced(incoming);
+    setRows(toRows(entries));
+  }
+
+  const skipped = skippedRows(rows, reserved);
+
+  function update(next: AdvancedRow[]) {
+    const skip = skippedRows(next, reserved);
+    const valid: [string, unknown][] = next
+      .filter((r) => !skip.has(r.id))
+      .map((r) => [r.key.trim(), r.value]);
+    setRows(next);
+    setSynced(JSON.stringify(valid));
+    onChange(valid);
+  }
+
+  function patch(id: number, change: Partial<AdvancedRow>) {
+    update(rows.map((r) => (r.id === id ? { ...r, ...change } : r)));
+  }
+
+  const kindOptions = (["text", "number", "bool", "yaml"] as const).map((k) => ({
+    value: k,
+    label: t(`fields.kind.${k}`),
+  }));
+
   return (
     <>
       <Divider orientation="left" plain>
@@ -133,62 +224,83 @@ export function AdvancedFields({
       <Typography.Paragraph type="secondary" style={{ marginTop: -8 }}>
         {t("fields.advancedHint")}
       </Typography.Paragraph>
-      {entries.map(([k, v], i) => (
-        <Space key={`adv-${i}`} align="start" style={{ display: "flex", marginBottom: 8 }}>
-          <Input
-            style={{ width: 180 }}
-            placeholder={t("fields.key")}
-            value={k}
-            onChange={(e) => {
-              const next = entries.slice();
-              next[i] = [e.target.value, v];
-              onChange(next);
-            }}
-          />
-          <AdvancedValue
-            value={v}
-            onChange={(nv) => {
-              const next = entries.slice();
-              next[i] = [k, nv];
-              onChange(next);
-            }}
-          />
-          <Button danger onClick={() => onChange(entries.filter((_, j) => j !== i))}>
-            {t("fields.remove")}
-          </Button>
-        </Space>
-      ))}
-      <Button onClick={() => onChange([...entries, ["", ""]])} style={{ marginTop: 4 }}>
+      {rows.map((r) => {
+        const conflict = r.key.trim() !== "" && skipped.has(r.id);
+        return (
+          <div key={r.id} style={{ marginBottom: 8 }}>
+            <Space align="start" style={{ display: "flex" }}>
+              <Input
+                style={{ width: 160 }}
+                placeholder={t("fields.key")}
+                status={conflict ? "error" : undefined}
+                value={r.key}
+                onChange={(e) => patch(r.id, { key: e.target.value })}
+              />
+              <Select
+                style={{ width: 84 }}
+                value={r.kind}
+                options={kindOptions}
+                onChange={(kind) => patch(r.id, { kind, value: convertValue(r.value, kind) })}
+              />
+              <AdvancedValue
+                kind={r.kind}
+                value={r.value}
+                onChange={(value) => patch(r.id, { value })}
+              />
+              <Button danger onClick={() => update(rows.filter((x) => x.id !== r.id))}>
+                {t("fields.remove")}
+              </Button>
+            </Space>
+            {conflict && (
+              <Typography.Text type="danger" style={{ fontSize: 12 }}>
+                {t("fields.keyConflict")}
+              </Typography.Text>
+            )}
+          </div>
+        );
+      })}
+      <Button
+        onClick={() => update([...rows, { id: nextRowId++, key: "", kind: "text", value: "" }])}
+        style={{ marginTop: 4 }}
+      >
         {t("fields.addField")}
       </Button>
     </>
   );
 }
 
-/** 高级行的值编辑器,按当前值的 JS 类型决定输入形态。 */
+/** 高级行的值编辑器,按行固定的类型渲染。 */
 function AdvancedValue({
+  kind,
   value,
   onChange,
 }: {
+  kind: AdvancedKind;
   value: unknown;
   onChange: (v: unknown) => void;
 }) {
-  if (typeof value === "boolean") {
-    return <Switch checked={value} onChange={onChange} />;
+  switch (kind) {
+    case "bool":
+      return <Switch checked={value === true} onChange={onChange} />;
+    case "number":
+      return (
+        <InputNumber
+          style={{ width: 220 }}
+          value={typeof value === "number" ? value : null}
+          onChange={(n) => onChange(n)}
+        />
+      );
+    case "yaml":
+      return <ObjectField value={value} onChange={onChange} />;
+    default:
+      return (
+        <Input
+          style={{ width: 220 }}
+          value={value == null ? "" : String(value)}
+          onChange={(e) => onChange(e.target.value)}
+        />
+      );
   }
-  if (typeof value === "number") {
-    return <InputNumber style={{ width: 260 }} value={value} onChange={(n) => onChange(n)} />;
-  }
-  if (value !== null && typeof value === "object") {
-    return <ObjectField value={value} onChange={onChange} />;
-  }
-  return (
-    <Input
-      style={{ width: 260 }}
-      value={value == null ? "" : String(value)}
-      onChange={(e) => onChange(e.target.value)}
-    />
-  );
 }
 
 /** 嵌套对象/数组的高级值,用一小段 YAML 编辑。 */
@@ -199,10 +311,10 @@ function ObjectField({
   value: unknown;
   onChange: (v: unknown) => void;
 }) {
-  const [text, setText] = useState(() => stringifyYaml(value).trimEnd());
+  const [text, setText] = useState(() => (value == null ? "" : stringifyYaml(value).trimEnd()));
   return (
     <Input.TextArea
-      style={{ width: 260, fontFamily: "monospace" }}
+      style={{ width: 220, fontFamily: "monospace" }}
       autoSize={{ minRows: 2, maxRows: 8 }}
       value={text}
       onChange={(e) => {
