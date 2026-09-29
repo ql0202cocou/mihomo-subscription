@@ -258,6 +258,14 @@ pub async fn import(
 ) -> ApiResult<impl IntoResponse> {
     let _ = profile_token(&state, &profile_id).await?;
     let names = normalize_names(&body.names);
+    // policy 原样拼进 `RULE-SET,<name>,<policy>` 行:必须是单个非空名字,逗号或换行会拼出畸形/额外的
+    // 规则行。在任何写入之前校验。
+    let policy = body.policy.trim();
+    if policy.is_empty() || policy.contains(',') || policy.chars().any(char::is_control) {
+        return Err(ApiError::BadRequest(
+            "policy must be a single non-empty policy name".into(),
+        ));
+    }
 
     // 复制定义:逐个把 ② 行复制进 ③(本订阅已有同名则跳过);rule_count 直接沿用 ② 的值。
     let mut imported = 0usize;
@@ -315,7 +323,6 @@ pub async fn import(
             .await?
             .unwrap_or_default();
     let referenced = crate::converter::ruleset_refs(&content);
-    let policy = body.policy.trim();
     let lines: Vec<String> = names
         .iter()
         .filter(|n| !referenced.iter().any(|r| r == *n))

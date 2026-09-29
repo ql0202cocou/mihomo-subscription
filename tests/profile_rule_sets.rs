@@ -544,3 +544,54 @@ async fn generate_rejects_rule_referencing_disabled_rule_set() {
     let details = json(resp).await["error"]["details"].to_string();
     assert!(details.contains("unknown rule-set `ads`"), "{details}");
 }
+
+#[tokio::test]
+async fn import_rejects_malformed_policy_without_writing() {
+    let temp = TempDb::new();
+    let app = build_router(test_state_with_fetcher(&temp, Arc::new(FakeFetcher)).await);
+    let cookie = login(&app).await;
+    let (p1, _, _) = create_profile(&app, &cookie, "P1").await;
+    app.clone()
+        .oneshot(authed(
+            "POST",
+            "/api/rule-sets",
+            &cookie,
+            r#"{"name":"gads","behavior":"domain","format":"yaml","content":"+.g.example"}"#,
+        ))
+        .await
+        .unwrap();
+
+    for policy in ["", "  ", "DIRECT\nMATCH,REJECT", "A,B"] {
+        let body = serde_json::json!({ "names": ["gads"], "policy": policy }).to_string();
+        let resp = app
+            .clone()
+            .oneshot(authed(
+                "POST",
+                &format!("/api/profiles/{p1}/rule-sets/import"),
+                &cookie,
+                &body,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "policy {policy:?}");
+    }
+
+    // 拒绝发生在任何写入之前:③ 为空、规则文本未被追加。
+    let resp = app
+        .clone()
+        .oneshot(authed(
+            "GET",
+            &format!("/api/profiles/{p1}/rule-sets"),
+            &cookie,
+            "",
+        ))
+        .await
+        .unwrap();
+    assert!(json(resp).await.as_array().unwrap().is_empty());
+    let resp = app
+        .clone()
+        .oneshot(authed("GET", &format!("/api/profiles/{p1}"), &cookie, ""))
+        .await
+        .unwrap();
+    assert_eq!(json(resp).await["rules"]["content"], "");
+}
