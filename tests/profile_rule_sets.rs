@@ -5,6 +5,7 @@
 mod common;
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
@@ -377,4 +378,128 @@ async fn import_from_global_copies_and_appends_rule() {
     assert!(body.contains(&format!(
         "https://sub.example.com/testprefix/api/sub/{token1}/r/gads/domain.yaml"
     )));
+}
+
+/// 公开刷新间隔足够长的 app:公开拉取直接返回缓存而不回源重生成,用于验证「编辑后的缓存本身」。
+async fn cached_app(temp: &TempDb) -> Router {
+    let mut state = test_state_with_fetcher(temp, Arc::new(FakeFetcher)).await;
+    Arc::get_mut(&mut state)
+        .unwrap()
+        .public_refresh_min_interval = Duration::from_secs(3600);
+    build_router(state)
+}
+
+async fn get_text(app: &Router, path: &str) -> String {
+    let resp = app
+        .clone()
+        .oneshot(Request::get(path).body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    text(resp).await
+}
+
+#[tokio::test]
+async fn import_injects_rule_provider_into_served_cache() {
+    let temp = TempDb::new();
+    let app = cached_app(&temp).await;
+    let cookie = login(&app).await;
+    let (p1, token1, sub_path) = create_profile(&app, &cookie, "P1").await;
+
+    app.clone()
+        .oneshot(authed(
+            "POST",
+            "/api/rule-sets",
+            &cookie,
+            r#"{"name":"gads","behavior":"domain","format":"yaml","content":"+.g.example"}"#,
+        ))
+        .await
+        .unwrap();
+    app.clone()
+        .oneshot(authed(
+            "POST",
+            &format!("/api/profiles/{p1}/rule-sets/import"),
+            &cookie,
+            r#"{"names":["gads"],"policy":"DIRECT"}"#,
+        ))
+        .await
+        .unwrap();
+
+    // 不回源:缓存里的规则行与 rule-providers 条目必须同时存在。
+    let body = get_text(&app, &sub_path).await;
+    assert!(body.contains("RULE-SET,gads,DIRECT"));
+    assert!(body.contains(&format!(
+        "https://sub.example.com/testprefix/api/sub/{token1}/r/gads/domain.yaml"
+    )));
+}
+
+#[tokio::test]
+async fn reset_token_rewrites_hosted_rule_set_links_in_cache() {
+    let temp = TempDb::new();
+    let app = cached_app(&temp).await;
+    let cookie = login(&app).await;
+    let (p1, old_token, _) = create_profile(&app, &cookie, "P1").await;
+    create_rs(
+        &app,
+        &cookie,
+        &p1,
+        r#"{"name":"ads","behavior":"domain","format":"yaml","content":"+.ad.example"}"#,
+    )
+    .await;
+    put_rules(&app, &cookie, &p1, "RULE-SET,ads,DIRECT\nMATCH,DIRECT").await;
+
+    let resp = app
+        .clone()
+        .oneshot(authed(
+            "POST",
+            &format!("/api/profiles/{p1}/reset-token"),
+            &cookie,
+            "",
+        ))
+        .await
+        .unwrap();
+    let new_token = json(resp).await["token"].as_str().unwrap().to_string();
+
+    let body = get_text(&app, &format!("/testprefix/api/sub/{new_token}")).await;
+    assert!(body.contains(&format!(
+        "https://sub.example.com/testprefix/api/sub/{new_token}/r/ads/domain.yaml"
+    )));
+    assert!(!body.contains(&old_token), "缓存中不再残留旧 token 链接");
+}
+
+#[tokio::test]
+async fn reset_public_path_rewrites_hosted_rule_set_links_in_cache() {
+    let temp = TempDb::new();
+    let app = cached_app(&temp).await;
+    let cookie = login(&app).await;
+    let (p1, token1, _) = create_profile(&app, &cookie, "P1").await;
+    create_rs(
+        &app,
+        &cookie,
+        &p1,
+        r#"{"name":"ads","behavior":"domain","format":"yaml","content":"+.ad.example"}"#,
+    )
+    .await;
+    put_rules(&app, &cookie, &p1, "RULE-SET,ads,DIRECT\nMATCH,DIRECT").await;
+
+    let resp = app
+        .clone()
+        .oneshot(authed(
+            "POST",
+            "/api/settings/reset-public-path",
+            &cookie,
+            "",
+        ))
+        .await
+        .unwrap();
+    let prefix = json(resp).await["public_path_prefix"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let body = get_text(&app, &format!("/{prefix}/api/sub/{token1}")).await;
+    assert!(body.contains(&format!(
+        "https://sub.example.com/{prefix}/api/sub/{token1}/r/ads/domain.yaml"
+    )));
+    assert!(!body.contains("/testprefix/"), "缓存中不再残留旧前缀链接");
 }

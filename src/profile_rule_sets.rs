@@ -250,7 +250,7 @@ struct GlobalRuleSet {
 
 /// `POST /api/profiles/:id/rule-sets/import` —— 从全局 ② 复制选中规则集进本订阅 ③(含真实远程 URL,
 /// 前端拿不到脱敏后的 URL,故由后端复制),并为尚未引用的名追加 `RULE-SET,<name>,<policy>` 规则行,
-/// 随后重缝缓存使其立即生效。已存在的定义/已引用的规则行跳过;`imported` 计实际复制的定义数。
+/// 随后离线重生成缓存使其立即生效。已存在的定义/已引用的规则行跳过;`imported` 计实际复制的定义数。
 pub async fn import(
     State(state): State<Arc<AppState>>,
     Path(profile_id): Path<String>,
@@ -332,12 +332,12 @@ pub async fn import(
             .bind(&profile_id)
             .execute(&state.db)
             .await?;
-        // 规则完全由用户定义,就地重缝缓存使编辑立即反映到所服务的订阅。
-        if crate::generate::resync_cache(&state, &profile_id)
+        // 用缓存的机场原文离线重生成(含 rule-providers 注入),使导入立即反映到所服务的订阅。
+        if crate::generate::regenerate_from_cache(&state, &profile_id)
             .await
             .is_err()
         {
-            tracing::warn!(profile = %profile_id, "failed to resync cache after rule-set import");
+            tracing::warn!(profile = %profile_id, "failed to regenerate cache after rule-set import");
         }
     }
 

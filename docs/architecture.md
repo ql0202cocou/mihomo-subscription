@@ -166,7 +166,7 @@ GET /api/profiles/:id/proxies
   "groups": [{ "name":"Proxy","type":"select" }] }
 ```
 
-只读，解析自 `generated_cache.output_yaml`，直接返回缓存当前内容（排序改动会就地重写缓存）；
+只读，解析自 `generated_cache.output_yaml`，直接返回缓存当前内容（排序改动会离线重生成缓存）；
 未生成返回 `generated:false` + 空数组。`proxies` = 机场块 + 自定义块按 `node_section_order` 拼接，
 前端据全局节点名集合拆成两块渲染（机场只读，自定义在「节点配置」排序）；`groups` 全为自定义
 分组。两者也作分组成员候选。
@@ -180,10 +180,14 @@ PUT /api/profiles/:id/group-order         { order: [分组名] }              # 
 
 - 自定义块顺序由全局 `global-nodes/order` 决定（作用所有配置）；两块先后由 per-profile
   `node-section-order`；分组顺序由 per-profile `group-order`。名字超长/数组过大 `400`。
-- 这些端点保存后**就地重写已生成缓存、无需重拉机场**，改动**立即生效**（预览与公共链接随即
-  反映）；全局排序重排**每条配置**缓存，无缓存者首次生成时生效。
+- 这些端点保存后用缓存中的机场原文（`generated_cache.provider_yaml`）**离线重跑完整转换、无需重拉
+  机场**，改动**立即生效**（预览与公共链接随即反映）；全局排序重生成**每条配置**缓存，无缓存者
+  首次生成时生效。
 - 规则拖拽同理：规则顺序即语义（命中即止），存为 `rulesets.content` 有序文本，前端经
-  `PUT .../rules` 整体保存，同样就地重写缓存 `rules` 块、立即生效。
+  `PUT .../rules` 整体保存，同样离线重生成、立即生效。
+- 离线重生成与 `generate` 走同一转换器（含校验与 `rule-providers` 注入），与公开刷新共用 per-profile
+  锁；保留 `generated_at`（回源节奏不变）。校验失败时编辑照常入库，但缓存保留上一份合法输出（逐条错误
+  由下次「生成」报出）；无机场原文的旧缓存（`0012` 之前生成）为 no-op，下次回源后生效。
 - 每次生成把输出的分组顺序快照回写 `group_order`（新增分组落末尾）；节点顺序为全局
   `global_nodes.position`，不 per-profile 快照，机场块恒上游序。
 - 节点/分组均结构化表单录入（节点常用字段 + 高级 KV；分组按类型给选项 + 高级 KV；成员从候选
@@ -488,6 +492,7 @@ CREATE TABLE generated_cache (
     content_hash          TEXT NOT NULL,
     output_yaml           TEXT NOT NULL,
     subscription_userinfo TEXT,
+    provider_yaml         TEXT,
     generated_at          TEXT NOT NULL
 );
 ```
@@ -495,6 +500,8 @@ CREATE TABLE generated_cache (
 - 每 profile 仅留最新一份；公共端点复用/回源/兜底与管理端 `preview` TTL 见「缓存与刷新」节。
 - `subscription_userinfo`：机场响应头原文，随缓存保存并在公共端点透传（无则 NULL）。
   `content_hash`：对生成输出（`output_yaml`）的哈希，随缓存保存；目前仅写入、无读取方。
+- `provider_yaml`：本次输出所用的机场原文，供排序/规则编辑与重置 token/前缀后离线重生成（见「节点/分组
+  预览与排序」）。迁移 `0012`；之前生成的缓存为 NULL，下次回源后补齐。
 
 ### 迁移
 
@@ -530,8 +537,8 @@ https://<PUBLIC_BASE_URL>/<PUBLIC_PATH_PREFIX>/api/sub/<profile_token>
 
 ### Token 轮换
 
-重置单配置 token、重置全局 `PUBLIC_PATH_PREFIX`（使所有链接失效）均支持；机场变化时链接保持
-稳定，除非显式重置。
+重置单配置 token、重置全局 `PUBLIC_PATH_PREFIX`（使所有链接失效）均支持；重置后缓存随即离线重生成，
+使其中按 token 隔离的规则集托管链接改用新值。机场变化时链接保持稳定，除非显式重置。
 
 ### 管理员认证
 

@@ -1076,3 +1076,81 @@ async fn wrong_prefix_and_unknown_token_are_404() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 }
+
+/// 公开刷新间隔足够长:公开拉取直接返回缓存,用于验证编辑后的缓存本身。返回 app 与 DB 句柄。
+async fn cached_app(temp: &TempDb) -> (Router, sqlx::SqlitePool) {
+    let mut state = test_state_with_fetcher(temp, Arc::new(FakeFetcher::default())).await;
+    Arc::get_mut(&mut state)
+        .unwrap()
+        .public_refresh_min_interval = Duration::from_secs(3600);
+    let db = state.db.clone();
+    (build_router(state), db)
+}
+
+async fn put_rules(app: &Router, cookie: &str, id: &str, content: &str) {
+    let body = serde_json::json!({ "content": content }).to_string();
+    let resp = app
+        .clone()
+        .oneshot(authed(
+            "PUT",
+            &format!("/api/profiles/{id}/rules"),
+            cookie,
+            &body,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+}
+
+async fn get_text(app: &Router, path: &str) -> String {
+    let resp = app
+        .clone()
+        .oneshot(Request::get(path).body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    text(resp).await
+}
+
+#[tokio::test]
+async fn invalid_rule_edit_never_reaches_the_served_cache() {
+    let temp = TempDb::new();
+    let (app, _) = cached_app(&temp).await;
+    let cookie = login(&app).await;
+    let profile = create_profile(&app, &cookie).await;
+    let id = profile["id"].as_str().unwrap();
+    let sub = sub_path(profile["subscription_url"].as_str().unwrap());
+
+    put_rules(&app, &cookie, id, "MATCH,DIRECT").await;
+    assert!(get_text(&app, &sub).await.contains("MATCH,DIRECT"));
+
+    // 引用不存在的策略:规则照常保存,但所服务的缓存保持上一份合法输出。
+    put_rules(&app, &cookie, id, "MATCH,NoSuchGroup").await;
+    let body = get_text(&app, &sub).await;
+    assert!(body.contains("MATCH,DIRECT"));
+    assert!(!body.contains("NoSuchGroup"));
+}
+
+#[tokio::test]
+async fn legacy_cache_without_provider_original_is_left_untouched() {
+    let temp = TempDb::new();
+    let (app, db) = cached_app(&temp).await;
+    let cookie = login(&app).await;
+    let profile = create_profile(&app, &cookie).await;
+    let id = profile["id"].as_str().unwrap();
+    let sub = sub_path(profile["subscription_url"].as_str().unwrap());
+
+    // 模拟升级前生成的缓存:没有保存机场原文,无法离线重生成。
+    sqlx::query("UPDATE generated_cache SET provider_yaml = NULL")
+        .execute(&db)
+        .await
+        .unwrap();
+    let before = get_text(&app, &sub).await;
+
+    put_rules(&app, &cookie, id, "MATCH,DIRECT").await;
+    assert_eq!(
+        get_text(&app, &sub).await,
+        before,
+        "等下一次回源后才吸收编辑"
+    );
+}
