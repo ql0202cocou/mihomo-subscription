@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   App as AntdApp,
   AutoComplete,
@@ -197,6 +197,10 @@ export default function RulesCard({ profileId, initial, nodes, groups, generated
 
   const sensors = useSensors(useSensor(PointerSensor, { activationConstraint: { distance: 4 } }));
 
+  // 服务端最近确认的规则(加载或保存成功时更新):保存失败时回滚到它。不用闭包里的 `rules`,
+  // 因为 persist 不依赖它(可能已过期),且连续保存时应回到服务端实际持有的状态。
+  const saved = useRef<{ rules: string[]; match: string | null }>({ rules: [], match: null });
+
   useEffect(() => {
     const all = initial.split("\n").map((l) => l.trim()).filter((l) => l !== "");
     // 最后一条 MATCH 作为兜底,钉底保留;其余行原样留在列表。
@@ -208,6 +212,7 @@ export default function RulesCard({ profileId, initial, nodes, groups, generated
     }
     setRules(rest);
     setMatchLine(match);
+    saved.current = { rules: rest, match };
     setModalOpen(false);
     setEditing(null);
     setModel(DEFAULT_RULE);
@@ -263,9 +268,12 @@ export default function RulesCard({ profileId, initial, nodes, groups, generated
           method: "PUT",
           body: JSON.stringify({ content }),
         });
+        saved.current = { rules: nextRules, match: nextMatch };
         onSaved();
         return true;
       } catch (e) {
+        setRules(saved.current.rules);
+        setMatchLine(saved.current.match);
         message.error(errorMessage(e, t("common.saveFailed")));
         return false;
       }
