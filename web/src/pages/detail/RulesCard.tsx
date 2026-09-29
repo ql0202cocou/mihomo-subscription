@@ -505,7 +505,7 @@ export default function RulesCard({ profileId, initial, nodes, groups, generated
       return;
     }
     try {
-      // 后端把 ② 定义复制进本订阅 ③(含真实远程 URL)并追加 RULE-SET 规则行,随后重缝缓存。
+      // 后端把 ② 定义复制进本订阅 ③(含真实远程 URL)并追加 RULE-SET 规则行,随后离线重生成缓存。
       const res = await api<{ imported: number }>(
         `/api/profiles/${profileId}/rule-sets/import`,
         { method: "POST", body: JSON.stringify({ names, policy: importPolicy }) },

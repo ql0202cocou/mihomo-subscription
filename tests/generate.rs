@@ -511,7 +511,7 @@ async fn reorder_applies_to_the_cache_immediately_without_a_fetch() {
     assert_eq!(resp.status(), StatusCode::NO_CONTENT);
 
     // The cached output (admin preview) reflects the new order immediately via
-    // resync_cache — no provider re-fetch.
+    // regenerate_from_cache — no provider re-fetch.
     assert_eq!(
         proxy_names(app.clone(), cookie.clone()).await,
         vec!["mine", "hk-1"]
