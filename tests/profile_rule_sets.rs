@@ -503,3 +503,44 @@ async fn reset_public_path_rewrites_hosted_rule_set_links_in_cache() {
     )));
     assert!(!body.contains("/testprefix/"), "缓存中不再残留旧前缀链接");
 }
+
+#[tokio::test]
+async fn generate_rejects_rule_referencing_disabled_rule_set() {
+    let temp = TempDb::new();
+    let app = build_router(test_state_with_fetcher(&temp, Arc::new(FakeFetcher)).await);
+    let cookie = login(&app).await;
+    let (p1, _, _) = create_profile(&app, &cookie, "P1").await;
+    let rs = create_rs(
+        &app,
+        &cookie,
+        &p1,
+        r#"{"name":"ads","behavior":"domain","format":"yaml","content":"+.ad.example"}"#,
+    )
+    .await;
+    put_rules(&app, &cookie, &p1, "RULE-SET,ads,DIRECT\nMATCH,DIRECT").await;
+
+    // 停用后规则行仍引用它:生成必须报错,而不是静默产出缺少 rule-providers 的配置。
+    let rsid = rs["id"].as_str().unwrap();
+    app.clone()
+        .oneshot(authed(
+            "PUT",
+            &format!("/api/profiles/{p1}/rule-sets/{rsid}"),
+            &cookie,
+            r#"{"name":"ads","behavior":"domain","format":"yaml","content":"+.ad.example","enabled":false}"#,
+        ))
+        .await
+        .unwrap();
+    let resp = app
+        .clone()
+        .oneshot(authed(
+            "POST",
+            &format!("/api/profiles/{p1}/generate"),
+            &cookie,
+            "",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let details = json(resp).await["error"]["details"].to_string();
+    assert!(details.contains("unknown rule-set `ads`"), "{details}");
+}
