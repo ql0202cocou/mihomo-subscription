@@ -104,8 +104,8 @@ GET  /api/auth/session -> 200 {username} | 401
   立即带有真实 `last_fetch_status`，不存在「未拉取」中间态。
 - `source_url` 写时静态校验（http/https、无内嵌凭据、非本地/私有地址），否则 `400`；真正 SSRF
   在拉取时按 DNS 解析 + IP 固定。
-- `last_fetch_status`：`success` / `http_error:<code>` / `ssrf_rejected` / `timeout` / `too_large`，
-  从未拉取为 `null`。
+- `last_fetch_status`：`success` / `http_error:<code>` / `ssrf_rejected` / `timeout` / `too_large` /
+  `provider_parse`（拉取成功但内容不是可解析的 Mihomo YAML），从未拉取为 `null`。
 
 请求体（节点走全局池，分组按配置）：
 

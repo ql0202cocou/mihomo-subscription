@@ -213,10 +213,8 @@ async fn serve_or_refresh(state: &AppState, profile: &ProfileCore) -> Option<Ser
                         userinfo: built.userinfo,
                     })
                 }
-                Err(err) => {
-                    if let BuildError::Upstream(label) = &err {
-                        let _ = update_last_fetch(state, &profile.id, label).await;
-                    }
+                // 机场侧失败的 `last_fetch_status` 已由 `fetch_convert_and_record` 记录。
+                Err(_) => {
                     // 有陈旧缓存就提供;否则给出 503。
                     match cached {
                         Some(cache) => {
@@ -242,7 +240,8 @@ impl From<CacheRow> for Served {
 
 // ─── 核心 拉取 + 转换 ──────────────────────────────────────────────────────────
 
-/// 拉取机场并转换。拉取成功时把 `last_fetch_*` 更新为 `success`;拉取失败时记录状态标签。
+/// 拉取机场并转换。拉取成功时把 `last_fetch_*` 更新为 `success`;拉取失败或机场内容无法解析时
+/// 记录对应状态标签。
 async fn fetch_convert_and_record(
     state: &AppState,
     profile: &ProfileCore,
@@ -257,15 +256,22 @@ async fn fetch_convert_and_record(
     };
     let _ = update_last_fetch(state, &profile.id, "success").await;
 
-    let (yaml, ruleset_conflicts) = convert(state, &profile.id, &profile.token, &fetched.body)
+    let converted = convert(state, &profile.id, &profile.token, &fetched.body)
         .await
         // DB 错误已被 `From<sqlx::Error>` 脱敏并记日志;传播为内部错误,不再误报为机场拉取失败。
-        .map_err(|_| BuildError::Internal)?
-        .map_err(|e| match e {
-            ConvertError::Validation(v) => BuildError::Validation(v),
-            ConvertError::ProviderParse => BuildError::Upstream("provider_parse".to_string()),
-            ConvertError::OutputSerialize => BuildError::Internal,
-        })?;
+        .map_err(|_| BuildError::Internal)?;
+    let (yaml, ruleset_conflicts) = match converted {
+        Ok(out) => out,
+        Err(ConvertError::Validation(v)) => return Err(BuildError::Validation(v)),
+        // 拉取成功但内容不是可解析的 Mihomo YAML(如机场不认 UA 返回的 base64 节点列表):同样是
+        // 机场侧问题,覆盖上面刚写入的 `success`,使列表/详情如实反映。
+        Err(ConvertError::ProviderParse) => {
+            let label = "provider_parse".to_string();
+            let _ = update_last_fetch(state, &profile.id, &label).await;
+            return Err(BuildError::Upstream(label));
+        }
+        Err(ConvertError::OutputSerialize) => return Err(BuildError::Internal),
+    };
     if !ruleset_conflicts.is_empty() {
         tracing::warn!(
             profile = %profile.id,

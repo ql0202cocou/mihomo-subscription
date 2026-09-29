@@ -1154,3 +1154,51 @@ async fn legacy_cache_without_provider_original_is_left_untouched() {
         "等下一次回源后才吸收编辑"
     );
 }
+
+/// 返回固定正文的 fetcher,用于模拟机场返回非 YAML 内容。
+struct BodyFetcher(&'static str);
+
+#[async_trait::async_trait]
+impl RemoteFetcher for BodyFetcher {
+    async fn fetch(&self, _url: &str) -> Result<Fetched, FetchError> {
+        Ok(Fetched {
+            body: self.0.to_string(),
+            subscription_userinfo: None,
+        })
+    }
+}
+
+#[tokio::test]
+async fn unparsable_provider_body_is_recorded_as_provider_parse() {
+    let temp = TempDb::new();
+    // 机场不认 UA 时常见:返回 base64 节点列表而非 Mihomo YAML。
+    let fetcher = Arc::new(BodyFetcher(
+        "c3M6Ly9ZV1Z6TFRJMU5pMW5ZMjA2Y0dGemMzZHZjbVE9QDEuMi4zLjQ6ODM4OA==",
+    ));
+    let app = build_router(test_state_with_fetcher(&temp, fetcher).await);
+    let cookie = login(&app).await;
+
+    // 新建时的自动拉取:拉取成功但解析失败,状态不能停在 success。
+    let profile = create_profile(&app, &cookie).await;
+    let id = profile["id"].as_str().unwrap();
+    assert_eq!(profile["last_fetch_status"], "provider_parse");
+
+    // 手动生成同样返回 502 并记录状态。
+    let resp = app
+        .clone()
+        .oneshot(authed(
+            "POST",
+            &format!("/api/profiles/{id}/generate"),
+            &cookie,
+            "",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+    let resp = app
+        .clone()
+        .oneshot(authed("GET", &format!("/api/profiles/{id}"), &cookie, ""))
+        .await
+        .unwrap();
+    assert_eq!(json(resp).await["last_fetch_status"], "provider_parse");
+}
