@@ -133,7 +133,7 @@ GET    /api/rule-sets                                  # 列表；每项含 coun
 POST   /api/rule-sets   { name, behavior, source?, format, ... }
    # name 全局唯一（重名 409）且限 [A-Za-z0-9._-]；behavior∈domain/ipcidr/classical；source∈manual（默认）/remote
    # source=manual: { content }                 format∈yaml/text
-   # source=remote: { url, interval_hours?=24, cache?=true }   format∈yaml/text/mrs；url 须 http(s)
+   # source=remote: { url, interval_hours?=24, cache?=true }   format∈yaml/text/mrs；url 须 http(s)，cache=true（面板代为拉取）时另做与 source_url 相同的 SSRF 静态校验，cache=false 时由客户端拉取、允许局域网地址
 PUT    /api/rule-sets/:id   { ...同上 }                 # remote 编辑 url 留空则沿用原值（已脱敏不回显）
 DELETE /api/rule-sets/:id
 PUT    /api/rule-sets/order { order: [规则集名] }        # 仅展示序，未列出落末尾

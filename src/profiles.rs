@@ -16,7 +16,7 @@ use sqlx::FromRow;
 use crate::app::AppState;
 use crate::error::{ApiError, ApiResult};
 use crate::mask::mask_url;
-use crate::ssrf::{self, SsrfError};
+use crate::ssrf;
 use crate::util::{now, random_token, MAX_ORDER_ENTRIES, MAX_ORDER_NAME_LEN};
 use crate::yaml;
 
@@ -178,25 +178,6 @@ pub struct UpdateProfile {
     source_url: Option<String>,
 }
 
-/// 写入时校验机场 URL。这是纵深防御,也带来更好的错误体验——权威的 SSRF 检查仍在拉取时带 DNS
-/// 解析与 IP 固定地运行(`src/fetch.rs`)。这里检查静态部分:scheme、内嵌凭据、回环名、被阻止的
-/// 字面 IP。仅含主机名的 URL 通过(写入时不做 DNS 查找)。消息按错误种类泛化,故原始 URL 永不回显。
-fn validate_source_url(raw: &str) -> ApiResult<()> {
-    let url = url::Url::parse(raw)
-        .map_err(|_| ApiError::BadRequest("source_url is not a valid URL".into()))?;
-    ssrf::validate_url(&url).map_err(|e| {
-        let msg = match e {
-            SsrfError::Scheme => "source_url must use http or https",
-            SsrfError::Host => "source_url is missing a host",
-            SsrfError::Credentials => "source_url must not embed credentials",
-            SsrfError::BlockedHost | SsrfError::BlockedIp => {
-                "source_url points to a disallowed (local/private) address"
-            }
-        };
-        ApiError::BadRequest(msg.into())
-    })
-}
-
 /// 读取 profile 行,顺带从 1—1 的 `generated_cache` 子查询出最近生成时间(无缓存则为 NULL)。
 async fn load_profile_row(state: &AppState, id: &str) -> ApiResult<ProfileRow> {
     sqlx::query_as::<_, ProfileRow>(
@@ -230,7 +211,7 @@ pub async fn create(
     if body.source_url.trim().is_empty() {
         return Err(ApiError::BadRequest("source_url is required".into()));
     }
-    validate_source_url(body.source_url.trim())?;
+    ssrf::validate_write_url(body.source_url.trim(), "source_url")?;
 
     let id = uuid::Uuid::new_v4().to_string();
     let token = random_token();
@@ -339,7 +320,7 @@ pub async fn update(
     let source_url = match body.source_url {
         Some(u) if !u.trim().is_empty() => {
             let trimmed = u.trim();
-            validate_source_url(trimmed)?;
+            ssrf::validate_write_url(trimmed, "source_url")?;
             trimmed.to_string()
         }
         _ => existing.source_url,

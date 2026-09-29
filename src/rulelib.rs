@@ -40,7 +40,7 @@ pub struct Normalized {
 }
 
 /// 校验并归一化请求体。name 入 URL 路径 + 作 `RULE-SET` 引用名,故限定安全字符集;manual/remote
-/// 各有合法的 format 集合,remote 必须给可拉取的 http(s) URL。`existing_url` 是更新时已存的远程
+/// 各有合法的 format 集合,remote 必须给 http(s) URL,由面板代为拉取(cache=true)时还须通过 SSRF 静态校验。`existing_url` 是更新时已存的远程
 /// URL:remote 编辑留空则沿用它(URL 已脱敏不回显,改地址需重填)。
 pub fn normalize(body: &RuleSetBody, existing_url: Option<&str>) -> ApiResult<Normalized> {
     let name = body.name.trim();
@@ -110,12 +110,18 @@ pub fn normalize(body: &RuleSetBody, existing_url: Option<&str>) -> ApiResult<No
             if interval_hours < 1 {
                 return Err(ApiError::BadRequest("interval_hours must be >= 1".into()));
             }
+            // cache=true 时由面板代为拉取,按 SSRF 规则做写入期静态校验(含沿用的旧 URL);cache=false 时
+            // URL 原样写进客户端配置、由客户端拉取,面板不出站,故允许局域网等规则源。
+            let cache = body.cache.unwrap_or(true);
+            if cache {
+                crate::ssrf::validate_write_url(&url, "url")?;
+            }
             Ok(Normalized {
                 source: "remote".into(),
                 content: String::new(),
                 url: Some(url),
                 interval_hours,
-                cache: body.cache.unwrap_or(true),
+                cache,
                 rule_count: 0, // 首次成功镜像后回填
             })
         }

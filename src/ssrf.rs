@@ -9,6 +9,8 @@ use std::sync::OnceLock;
 use ipnet::IpNet;
 use url::{Host, Url};
 
+use crate::error::{ApiError, ApiResult};
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SsrfError {
     /// scheme 不是 http/https。
@@ -79,6 +81,26 @@ pub fn validate_url(url: &Url) -> Result<(), SsrfError> {
         Some(Host::Ipv4(ip)) => reject_if_blocked(IpAddr::V4(ip)),
         Some(Host::Ipv6(ip)) => reject_if_blocked(IpAddr::V6(ip)),
     }
+}
+
+/// 写入时校验一个将由面板出站拉取的 URL(机场订阅、缓存托管的远程规则集),`field` 为报错里的字段名。
+/// 这是纵深防御,也带来更好的错误体验——权威的 SSRF 检查仍在拉取时带 DNS 解析与 IP 固定地运行
+/// (`src/fetch.rs`)。这里检查静态部分:scheme、内嵌凭据、回环名、被阻止的字面 IP。仅含主机名的 URL
+/// 通过(写入时不做 DNS 查找)。消息按错误种类泛化,故原始 URL 永不回显。
+pub fn validate_write_url(raw: &str, field: &str) -> ApiResult<()> {
+    let url =
+        Url::parse(raw).map_err(|_| ApiError::BadRequest(format!("{field} is not a valid URL")))?;
+    validate_url(&url).map_err(|e| {
+        let msg = match e {
+            SsrfError::Scheme => "must use http or https",
+            SsrfError::Host => "is missing a host",
+            SsrfError::Credentials => "must not embed credentials",
+            SsrfError::BlockedHost | SsrfError::BlockedIp => {
+                "points to a disallowed (local/private) address"
+            }
+        };
+        ApiError::BadRequest(format!("{field} {msg}"))
+    })
 }
 
 fn reject_if_blocked(ip: IpAddr) -> Result<(), SsrfError> {
