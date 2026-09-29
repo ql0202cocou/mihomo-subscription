@@ -101,11 +101,12 @@ GET  /api/auth/session -> 200 {username} | 401
 ```
 
 - 创建：`{name, source_url}`。创建成功后**同步触发一次生成/拉取**（尽力而为），故新订阅
-  立即带有真实 `last_fetch_status`，不存在「未拉取」中间态。
+  立即带有真实 `last_fetch_status`，不存在「未拉取」中间态。创建与更新的 `name` 均去除首尾空白，
+  空名 `400`。
 - `source_url` 写时静态校验（http/https、无内嵌凭据、非本地/私有地址），否则 `400`；真正 SSRF
   在拉取时按 DNS 解析 + IP 固定。
-- `last_fetch_status`：`success` / `http_error:<code>` / `ssrf_rejected` / `timeout` / `too_large`，
-  从未拉取为 `null`。
+- `last_fetch_status`：`success` / `http_error:<code>` / `ssrf_rejected` / `timeout` / `too_large` /
+  `provider_parse`（拉取成功但内容不是可解析的 Mihomo YAML），从未拉取为 `null`。
 
 请求体（节点走全局池，分组按配置）：
 
@@ -114,7 +115,8 @@ POST /api/global-nodes { name, node_type, content, enabled? }  # name 全局唯�
 POST /api/profiles/:id/groups { name, group_type, members, options?, enabled? }
 ```
 
-- 节点 `content` 保存时结构校验，生成时原样并入**每条配置**输出的 `proxies`；`PUT` 同体整体替换。
+- 节点 `content` 保存时结构校验，生成时并入**每条配置**输出的 `proxies`，其中 `name` 以库内 `name` 为准
+  （覆盖 content 中缺失或不一致的值）；`PUT` 同体整体替换。
 - 全局节点为单一共享池：新建落末尾、`name` 全局唯一；增删改在下次生成（公共链接每拉取即重生）
   进入各配置输出，排序见下立即生效。
 
@@ -131,7 +133,7 @@ GET    /api/rule-sets                                  # 列表；每项含 coun
 POST   /api/rule-sets   { name, behavior, source?, format, ... }
    # name 全局唯一（重名 409）且限 [A-Za-z0-9._-]；behavior∈domain/ipcidr/classical；source∈manual（默认）/remote
    # source=manual: { content }                 format∈yaml/text
-   # source=remote: { url, interval_hours?=24, cache?=true }   format∈yaml/text/mrs；url 须 http(s)
+   # source=remote: { url, interval_hours?=24, cache?=true }   format∈yaml/text/mrs；url 须 http(s)，cache=true（面板代为拉取）时另做与 source_url 相同的 SSRF 静态校验，cache=false 时由客户端拉取、允许局域网地址
 PUT    /api/rule-sets/:id   { ...同上 }                 # remote 编辑 url 留空则沿用原值（已脱敏不回显）
 DELETE /api/rule-sets/:id
 PUT    /api/rule-sets/order { order: [规则集名] }        # 仅展示序，未列出落末尾
@@ -146,7 +148,7 @@ GET    /api/profiles/:id/rule-sets                     # 列表；每项含 url�
 POST   /api/profiles/:id/rule-sets   { name, behavior, source?, format, ... }   # name 在本订阅内唯一（重名 409）；字段同 ②
 PUT    /api/profiles/:id/rule-sets/:rsid   { ...同上 }
 DELETE /api/profiles/:id/rule-sets/:rsid
-POST   /api/profiles/:id/rule-sets/import  { names: [②规则集名], policy }   # 复制 ② 定义进 ③（含真实远程 URL）+ 为未引用名追加 RULE-SET,<name>,<policy> 行；返回 { imported }（实际复制进 ③ 的定义数，已存在同名的不计）
+POST   /api/profiles/:id/rule-sets/import  { names: [②规则集名], policy }   # 复制 ② 定义进 ③（含真实远程 URL）+ 为未引用名追加 RULE-SET,<name>,<policy> 行（policy 须为单个非空名字，不含逗号/换行，否则 400 且不写入）；返回 { imported }（实际复制进 ③ 的定义数，已存在同名的不计）
 ```
 
 - manual / remote 行为与 ② 一致（校验/渲染/镜像同一套逻辑）。托管在按订阅 token 隔离的链接
@@ -166,7 +168,7 @@ GET /api/profiles/:id/proxies
   "groups": [{ "name":"Proxy","type":"select" }] }
 ```
 
-只读，解析自 `generated_cache.output_yaml`，直接返回缓存当前内容（排序改动会就地重写缓存）；
+只读，解析自 `generated_cache.output_yaml`，直接返回缓存当前内容（排序改动会离线重生成缓存）；
 未生成返回 `generated:false` + 空数组。`proxies` = 机场块 + 自定义块按 `node_section_order` 拼接，
 前端据全局节点名集合拆成两块渲染（机场只读，自定义在「节点配置」排序）；`groups` 全为自定义
 分组。两者也作分组成员候选。
@@ -180,10 +182,14 @@ PUT /api/profiles/:id/group-order         { order: [分组名] }              # 
 
 - 自定义块顺序由全局 `global-nodes/order` 决定（作用所有配置）；两块先后由 per-profile
   `node-section-order`；分组顺序由 per-profile `group-order`。名字超长/数组过大 `400`。
-- 这些端点保存后**就地重写已生成缓存、无需重拉机场**，改动**立即生效**（预览与公共链接随即
-  反映）；全局排序重排**每条配置**缓存，无缓存者首次生成时生效。
+- 这些端点保存后用缓存中的机场原文（`generated_cache.provider_yaml`）**离线重跑完整转换、无需重拉
+  机场**，改动**立即生效**（预览与公共链接随即反映）；全局排序重生成**每条配置**缓存，无缓存者
+  首次生成时生效。
 - 规则拖拽同理：规则顺序即语义（命中即止），存为 `rulesets.content` 有序文本，前端经
-  `PUT .../rules` 整体保存，同样就地重写缓存 `rules` 块、立即生效。
+  `PUT .../rules` 整体保存，同样离线重生成、立即生效。
+- 离线重生成与 `generate` 走同一转换器（含校验与 `rule-providers` 注入）；所有写缓存的路径（生成、新建时的
+  自动拉取、公开刷新、离线重生成）共用 per-profile 锁；保留 `generated_at`（回源节奏不变）。校验失败时编辑照常入库，但缓存保留上一份合法输出（逐条错误
+  由下次「生成」报出）；无机场原文的旧缓存（`0012` 之前生成）为 no-op，下次回源后生效。
 - 每次生成把输出的分组顺序快照回写 `group_order`（新增分组落末尾）；节点顺序为全局
   `global_nodes.position`，不 per-profile 快照，机场块恒上游序。
 - 节点/分组均结构化表单录入（节点常用字段 + 高级 KV；分组按类型给选项 + 高级 KV；成员从候选
@@ -194,9 +200,10 @@ PUT /api/profiles/:id/group-order         { order: [分组名] }              # 
 - `POST .../generate` 完整校验，成功刷新缓存并返回托管链接，失败 `400` + 逐条错误（对应弹窗
   文案）。详情页「原始订阅源」手动刷新复用本端点。
 - `GET .../preview` 是只读版：有新鲜缓存则返回，否则实时拉取生成；不写缓存、不动 `last_*`。
-- 校验：规则引用的分组须存在于已启用自定义分组；自定义分组名可与机场分组重名（机场分组整体
-  替换）；分组成员须引用存在的机场节点（透传）/启用自定义节点/启用自定义分组；输出须合法
-  Mihomo YAML。成功响应 `{ subscription_url, generated_at }`。
+- 校验：规则引用的分组须存在于已启用自定义分组；`RULE-SET,<name>` 的规则集须存在于本订阅已启用的
+  ③ 或机场自带 `rule-providers`；自定义分组名可与机场分组重名（机场分组整体替换），但不得与任何
+  代理（机场节点/自定义节点）重名；分组成员须引用存在的机场节点（透传）/启用自定义节点/启用自定义
+  分组，且分组间引用不得成环；输出须合法 Mihomo YAML。成功响应 `{ subscription_url, generated_at }`。
 
 顶层键处理（转换器逐键显式处理）：
 
@@ -366,7 +373,7 @@ CREATE INDEX idx_global_nodes_position ON global_nodes (position);
 ```
 
 - `name` 全局唯一；`node_type`（`ss`/`vmess`/…）不加 CHECK 免迁移；`content` 为完整 Mihomo proxy
-  映射，生成时并入每条 profile 输出。
+  映射，生成时并入每条 profile 输出（输出的 `name` 以本表 `name` 为准）。
 - `position`：全局自定义块顺序（`ORDER BY position, name`，name 作确定性兜底）；新建取 `MAX+1`，
   `PUT /api/global-nodes/order` 重写为 `0..n-1` 并即时重排所有 profile 缓存。
 - 迁移：原各 profile `custom_nodes` 按 `name` 去重（取 `updated_at` 最新）合并进本表（初始
@@ -474,7 +481,8 @@ CREATE INDEX idx_custom_groups_profile ON custom_groups (profile_id);
 - 是输出 `proxy-groups` 的**唯一来源**（转换器整体替换机场分组，机场原生分组不透传；经
   `import-provider-groups` 落为自定义分组才可编辑入输出）。
 - `members`：有序 JSON 数组，可引用机场节点（透传）/自定义节点/分组；引用有效性在生成时校验，
-  不靠 DB 约束。`options`：类型特有选项 JSON（如 `{"url":"...","interval":300}`）。
+  不靠 DB 约束。`options`：类型特有选项 JSON（如 `{"url":"...","interval":300}`）；生成时忽略其中的
+  `name`/`type`/`proxies`，这三项只由分组自身字段决定。
 
 > **已移除自定义规则集（rule-providers）托管：** `0005` 曾建 `rule_providers` 表，
 > `0006_drop_rule_providers.sql` 用 `DROP TABLE IF EXISTS` 删除（对旧装机幂等）。转换器只透传
@@ -488,6 +496,7 @@ CREATE TABLE generated_cache (
     content_hash          TEXT NOT NULL,
     output_yaml           TEXT NOT NULL,
     subscription_userinfo TEXT,
+    provider_yaml         TEXT,
     generated_at          TEXT NOT NULL
 );
 ```
@@ -495,6 +504,8 @@ CREATE TABLE generated_cache (
 - 每 profile 仅留最新一份；公共端点复用/回源/兜底与管理端 `preview` TTL 见「缓存与刷新」节。
 - `subscription_userinfo`：机场响应头原文，随缓存保存并在公共端点透传（无则 NULL）。
   `content_hash`：对生成输出（`output_yaml`）的哈希，随缓存保存；目前仅写入、无读取方。
+- `provider_yaml`：本次输出所用的机场原文，供排序/规则编辑与重置 token/前缀后离线重生成（见「节点/分组
+  预览与排序」）。迁移 `0012`；之前生成的缓存为 NULL，下次回源后补齐。
 
 ### 迁移
 
@@ -530,8 +541,8 @@ https://<PUBLIC_BASE_URL>/<PUBLIC_PATH_PREFIX>/api/sub/<profile_token>
 
 ### Token 轮换
 
-重置单配置 token、重置全局 `PUBLIC_PATH_PREFIX`（使所有链接失效）均支持；机场变化时链接保持
-稳定，除非显式重置。
+重置单配置 token、重置全局 `PUBLIC_PATH_PREFIX`（使所有链接失效）均支持；重置后缓存随即离线重生成，
+使其中按 token 隔离的规则集托管链接改用新值。机场变化时链接保持稳定，除非显式重置。
 
 ### 管理员认证
 
@@ -555,8 +566,9 @@ https://<PUBLIC_BASE_URL>/<PUBLIC_PATH_PREFIX>/api/sub/<profile_token>
   每个重定向同规则重查，上限 3。
 - IPv6 内嵌 IPv4（映射 `::ffff:0:0/96`、NAT64 `64:ff9b::/96`、6to4 `2002::/16`）须解包出
   IPv4 再按 IPv4 段查（经典绕过，如 `http://[::ffff:127.0.0.1]/`）。
-- 出站限制：连接超时 5-10s、总超时 10-20s、最大响应 5-10MB（按流字节计，不信
-  `Content-Length`）、重定向 ≤3、仅取文本/YAML。
+- 出站限制：连接超时 5-10s、总超时 10-20s（一次拉取共用一个截止时间，覆盖 DNS 解析、全部重定向跳与
+  响应体读取）、最大响应 5-10MB（按流字节计，不信 `Content-Length`）、重定向 ≤3、仅取文本/YAML。
+- 不使用系统/环境变量代理（`HTTP_PROXY` 等）：代理会自行解析域名，绕过 IP 固定。
 
 阻止 IPv4：`0.0.0.0/8 10.0.0.0/8 100.64.0.0/10 127.0.0.0/8 169.254.0.0/16 172.16.0.0/12
 192.0.0.0/24 192.0.2.0/24 192.88.99.0/24 192.168.0.0/16 198.18.0.0/15 198.51.100.0/24

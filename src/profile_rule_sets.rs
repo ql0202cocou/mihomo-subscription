@@ -250,7 +250,7 @@ struct GlobalRuleSet {
 
 /// `POST /api/profiles/:id/rule-sets/import` —— 从全局 ② 复制选中规则集进本订阅 ③(含真实远程 URL,
 /// 前端拿不到脱敏后的 URL,故由后端复制),并为尚未引用的名追加 `RULE-SET,<name>,<policy>` 规则行,
-/// 随后重缝缓存使其立即生效。已存在的定义/已引用的规则行跳过;`imported` 计实际复制的定义数。
+/// 随后离线重生成缓存使其立即生效。已存在的定义/已引用的规则行跳过;`imported` 计实际复制的定义数。
 pub async fn import(
     State(state): State<Arc<AppState>>,
     Path(profile_id): Path<String>,
@@ -258,6 +258,14 @@ pub async fn import(
 ) -> ApiResult<impl IntoResponse> {
     let _ = profile_token(&state, &profile_id).await?;
     let names = normalize_names(&body.names);
+    // policy 原样拼进 `RULE-SET,<name>,<policy>` 行:必须是单个非空名字,逗号或换行会拼出畸形/额外的
+    // 规则行。在任何写入之前校验。
+    let policy = body.policy.trim();
+    if policy.is_empty() || policy.contains(',') || policy.chars().any(char::is_control) {
+        return Err(ApiError::BadRequest(
+            "policy must be a single non-empty policy name".into(),
+        ));
+    }
 
     // 复制定义:逐个把 ② 行复制进 ③(本订阅已有同名则跳过);rule_count 直接沿用 ② 的值。
     let mut imported = 0usize;
@@ -315,7 +323,6 @@ pub async fn import(
             .await?
             .unwrap_or_default();
     let referenced = crate::converter::ruleset_refs(&content);
-    let policy = body.policy.trim();
     let lines: Vec<String> = names
         .iter()
         .filter(|n| !referenced.iter().any(|r| r == *n))
@@ -332,12 +339,12 @@ pub async fn import(
             .bind(&profile_id)
             .execute(&state.db)
             .await?;
-        // 规则完全由用户定义,就地重缝缓存使编辑立即反映到所服务的订阅。
-        if crate::generate::resync_cache(&state, &profile_id)
+        // 用缓存的机场原文离线重生成(含 rule-providers 注入),使导入立即反映到所服务的订阅。
+        if crate::generate::regenerate_from_cache(&state, &profile_id)
             .await
             .is_err()
         {
-            tracing::warn!(profile = %profile_id, "failed to resync cache after rule-set import");
+            tracing::warn!(profile = %profile_id, "failed to regenerate cache after rule-set import");
         }
     }
 

@@ -205,3 +205,56 @@ async fn remote_source_masks_url() {
         "② 全局库不再公开托管规则内容"
     );
 }
+
+#[tokio::test]
+async fn remote_url_is_ssrf_checked_when_the_panel_fetches_it() {
+    let temp = TempDb::new();
+    let app = build_router(test_state(&temp).await);
+    let cookie = login(&app).await;
+    let send = |method: &'static str, path: String, body: String| {
+        let app = app.clone();
+        let cookie = cookie.clone();
+        async move {
+            app.oneshot(authed(method, &path, &cookie, &body))
+                .await
+                .unwrap()
+        }
+    };
+    let remote = |name: &str, url: &str, cache: bool| {
+        serde_json::json!({
+            "name": name, "behavior": "classical", "format": "text",
+            "source": "remote", "url": url, "cache": cache,
+        })
+        .to_string()
+    };
+
+    // cache=true:面板代为拉取,内网地址、内嵌凭据、非 http(s) 在写入时即拒绝。
+    for url in [
+        "http://127.0.0.1/list.txt",
+        "http://10.0.0.1/list.txt",
+        "https://u:p@up.example/list.txt",
+        "ftp://up.example/list.txt",
+    ] {
+        let resp = send("POST", "/api/rule-sets".into(), remote("m", url, true)).await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{url}");
+    }
+
+    // cache=false:URL 原样写进客户端配置、由客户端拉取,面板不出站,允许局域网规则源。
+    let resp = send(
+        "POST",
+        "/api/rule-sets".into(),
+        remote("lan", "http://192.168.1.2/list.txt", false),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let id = json(resp).await["id"].as_str().unwrap().to_string();
+
+    // 改为 cache=true 且 url 留空沿用旧值:面板将代为拉取,同样要校验。
+    let body = serde_json::json!({
+        "name": "lan", "behavior": "classical", "format": "text",
+        "source": "remote", "cache": true,
+    })
+    .to_string();
+    let resp = send("PUT", format!("/api/rule-sets/{id}"), body).await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}

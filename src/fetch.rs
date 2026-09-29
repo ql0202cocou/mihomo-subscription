@@ -5,7 +5,7 @@
 //! 响应体按流式字节上限读取,而非信任 `Content-Length`。见 `docs/security-design.md`。
 
 use std::net::SocketAddr;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use reqwest::header::{ACCEPT, CONTENT_TYPE, LOCATION};
 use reqwest::redirect::Policy;
@@ -99,7 +99,8 @@ impl From<SsrfError> for FetchError {
 
 /// 带完整 SSRF 保护与限制地拉取一个机场订阅(要求 UTF-8 文本体)。
 ///
-/// `total_timeout` 限制整个请求;`max_bytes` 限制流式读取的响应体。
+/// `total_timeout` 限制整个拉取(含 DNS 解析、全部重定向跳与响应体读取);`max_bytes` 限制流式读取的
+/// 响应体。
 pub async fn fetch_subscription(
     raw_url: &str,
     total_timeout: Duration,
@@ -125,6 +126,8 @@ async fn fetch_raw(
     user_agent: &str,
 ) -> Result<(Vec<u8>, Option<String>), FetchError> {
     let mut url = Url::parse(raw_url).map_err(|_| FetchError::Ssrf(SsrfError::Host))?;
+    // 整个拉取共用一个截止时间:DNS 解析与每一跳请求只拿剩余时长,而非每跳各拿一份完整超时。
+    let deadline = Instant::now() + total_timeout;
 
     // 客户端跨跳复用:仅在钉定的 (host, addr) 变化时(重定向到新主机)才重建,无重定向的常规
     // 路径整个循环只构建一次。IP 钉定仍按跳传递(`.resolve(host, addr)`)。
@@ -132,7 +135,10 @@ async fn fetch_raw(
 
     for _ in 0..=MAX_REDIRECTS {
         ssrf::validate_url(&url)?;
-        let addr = resolve_validated(&url).await?;
+        // 系统解析器本身可能久等不返回,故解析也受截止时间约束。
+        let addr = tokio::time::timeout(remaining(deadline)?, resolve_validated(&url))
+            .await
+            .map_err(|_| FetchError::Timeout)??;
 
         let host = url.host_str().ok_or(FetchError::Ssrf(SsrfError::Host))?;
         let pin = (host.to_string(), addr);
@@ -142,7 +148,8 @@ async fn fetch_raw(
                 pin,
                 reqwest::Client::builder()
                     .connect_timeout(CONNECT_TIMEOUT)
-                    .timeout(total_timeout)
+                    // 不走系统/环境变量代理:代理会自行解析域名,绕过下面的 IP 钉定。
+                    .no_proxy()
                     .user_agent(user_agent) // 许多面板以 Clash 家族 UA 作为订阅门槛
                     .redirect(Policy::none()) // 手动跟随重定向,以便逐跳重新校验
                     .resolve(host, addr) // 固定到已校验的 IP
@@ -155,6 +162,8 @@ async fn fetch_raw(
         let resp = client
             .get(url.clone())
             .header(ACCEPT, "text/yaml, text/plain, application/x-yaml, */*")
+            // 请求级超时覆盖连接到响应体读完,取剩余时长。
+            .timeout(remaining(deadline)?)
             .send()
             .await
             .map_err(classify_reqwest)?;
@@ -190,6 +199,14 @@ async fn fetch_raw(
     }
 
     Err(FetchError::TooManyRedirects)
+}
+
+/// 距截止时间的剩余时长;已到期视为超时。
+fn remaining(deadline: Instant) -> Result<Duration, FetchError> {
+    deadline
+        .checked_duration_since(Instant::now())
+        .filter(|d| !d.is_zero())
+        .ok_or(FetchError::Timeout)
 }
 
 /// 把 URL 主机解析为单个已校验、可连接的 socket 地址。
@@ -281,6 +298,27 @@ fn classify_reqwest(err: reqwest::Error) -> FetchError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn remaining_budget_shrinks_and_expires_as_timeout() {
+        let left = remaining(Instant::now() + Duration::from_secs(60)).unwrap();
+        assert!(left <= Duration::from_secs(60) && left > Duration::from_secs(59));
+        assert!(matches!(
+            remaining(Instant::now()),
+            Err(FetchError::Timeout)
+        ));
+        let past = Instant::now() - Duration::from_secs(1);
+        assert!(matches!(remaining(past), Err(FetchError::Timeout)));
+    }
+
+    #[tokio::test]
+    async fn exhausted_budget_times_out_before_any_network() {
+        // 预算为零:在 DNS 解析与建连之前即以超时失败(域名为 RFC 2606 保留名,不会真正出网)。
+        let err = fetch_subscription("https://provider.example/sub", Duration::ZERO, 1024, "ua")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, FetchError::Timeout), "{err:?}");
+    }
 
     #[test]
     fn default_user_agent_is_clash_compatible() {

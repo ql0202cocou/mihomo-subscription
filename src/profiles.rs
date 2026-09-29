@@ -16,7 +16,7 @@ use sqlx::FromRow;
 use crate::app::AppState;
 use crate::error::{ApiError, ApiResult};
 use crate::mask::mask_url;
-use crate::ssrf::{self, SsrfError};
+use crate::ssrf;
 use crate::util::{now, random_token, MAX_ORDER_ENTRIES, MAX_ORDER_NAME_LEN};
 use crate::yaml;
 
@@ -178,25 +178,6 @@ pub struct UpdateProfile {
     source_url: Option<String>,
 }
 
-/// 写入时校验机场 URL。这是纵深防御,也带来更好的错误体验——权威的 SSRF 检查仍在拉取时带 DNS
-/// 解析与 IP 固定地运行(`src/fetch.rs`)。这里检查静态部分:scheme、内嵌凭据、回环名、被阻止的
-/// 字面 IP。仅含主机名的 URL 通过(写入时不做 DNS 查找)。消息按错误种类泛化,故原始 URL 永不回显。
-fn validate_source_url(raw: &str) -> ApiResult<()> {
-    let url = url::Url::parse(raw)
-        .map_err(|_| ApiError::BadRequest("source_url is not a valid URL".into()))?;
-    ssrf::validate_url(&url).map_err(|e| {
-        let msg = match e {
-            SsrfError::Scheme => "source_url must use http or https",
-            SsrfError::Host => "source_url is missing a host",
-            SsrfError::Credentials => "source_url must not embed credentials",
-            SsrfError::BlockedHost | SsrfError::BlockedIp => {
-                "source_url points to a disallowed (local/private) address"
-            }
-        };
-        ApiError::BadRequest(msg.into())
-    })
-}
-
 /// 读取 profile 行,顺带从 1—1 的 `generated_cache` 子查询出最近生成时间(无缓存则为 NULL)。
 async fn load_profile_row(state: &AppState, id: &str) -> ApiResult<ProfileRow> {
     sqlx::query_as::<_, ProfileRow>(
@@ -230,7 +211,7 @@ pub async fn create(
     if body.source_url.trim().is_empty() {
         return Err(ApiError::BadRequest("source_url is required".into()));
     }
-    validate_source_url(body.source_url.trim())?;
+    ssrf::validate_write_url(body.source_url.trim(), "source_url")?;
 
     let id = uuid::Uuid::new_v4().to_string();
     let token = random_token();
@@ -327,12 +308,19 @@ pub async fn update(
 ) -> ApiResult<impl IntoResponse> {
     let existing = load_profile_row(&state, &id).await?;
 
-    let name = body.name.unwrap_or(existing.name);
+    // 与创建一致:去除首尾空白,空名拒绝。
+    let name = match body.name {
+        Some(n) if n.trim().is_empty() => {
+            return Err(ApiError::BadRequest("name is required".into()))
+        }
+        Some(n) => n.trim().to_string(),
+        None => existing.name,
+    };
     // 只写 URL:除非提供非空值,否则保持已存值。
     let source_url = match body.source_url {
         Some(u) if !u.trim().is_empty() => {
             let trimmed = u.trim();
-            validate_source_url(trimmed)?;
+            ssrf::validate_write_url(trimmed, "source_url")?;
             trimmed.to_string()
         }
         _ => existing.source_url,
@@ -374,7 +362,8 @@ pub struct TokenResponse {
     subscription_url: String,
 }
 
-/// 重置订阅 token。旧 token 立即失效(公开端点按 token 查库),已生成缓存不受影响。
+/// 重置订阅 token。旧 token 立即失效(公开端点按 token 查库);缓存随即离线重生成,使其中按 token
+/// 隔离的规则集托管链接改用新 token。
 pub async fn reset_token(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -387,6 +376,7 @@ pub async fn reset_token(
         .bind(&id)
         .execute(&state.db)
         .await?;
+    regenerate_served_cache(&state, &id).await;
     Ok(Json(TokenResponse {
         subscription_url: state.subscription_url(&token),
         token,
@@ -413,8 +403,8 @@ pub async fn put_rules(
         .execute(&state.db)
         .await?;
 
-    // 规则完全由用户定义(与机场无关),故通过就地重缝缓存输出,使编辑立即反映到所服务的订阅。
-    resync_served_cache(&state, &id).await;
+    // 用缓存的机场原文离线重生成,使编辑立即反映到所服务的订阅(不合法则保留上一份合法输出)。
+    regenerate_served_cache(&state, &id).await;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -472,7 +462,7 @@ pub async fn list_proxies_and_groups(
         }));
     };
 
-    // 输出是可信的(我们自己产生)且已分块/排序(任何排序编辑都经 `resync_cache` 重缝缓存),
+    // 输出是可信的(我们自己产生)且已分块/排序(任何排序编辑都经 `regenerate_from_cache` 重生成缓存),
     // 故原样返回。仍走限界解析器解析;遇到任何意外时优雅降级。
     let (proxies, groups) = yaml::parse_limited(&output_yaml)
         .ok()
@@ -529,7 +519,7 @@ pub(crate) fn parse_order(stored: Option<String>) -> Vec<String> {
 }
 
 /// 读取 profile 持久化的手动顺序(proxy-group 或 section 名)。缺失/NULL 或异常 JSON 返回空列表
-/// (= 默认顺序)。生成(`src/generate.rs`)与预览共用此实现。
+/// (= 默认顺序)。
 pub(crate) async fn load_order(
     state: &AppState,
     profile_id: &str,
@@ -607,16 +597,19 @@ async fn set_order(
         .execute(&state.db)
         .await?;
 
-    // 通过就地重缝缓存输出(不重拉机场)把新顺序立即应用到所服务的订阅;尽力而为。
-    resync_served_cache(state, id).await;
+    // 用缓存的机场原文离线重生成(不重拉机场),把新顺序立即应用到所服务的订阅;尽力而为。
+    regenerate_served_cache(state, id).await;
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// 重缝生成缓存,使排序/规则改动立刻被服务。尽力而为:失败时让已保存的改动在下次生成时生效,
-/// 故它绝不能让发起请求失败。
-async fn resync_served_cache(state: &AppState, id: &str) {
-    if crate::generate::resync_cache(state, id).await.is_err() {
-        tracing::warn!(profile = %id, "failed to resync served cache after edit");
+/// 离线重生成缓存,使排序/规则/token 改动立刻被服务。尽力而为:失败时让已保存的改动在下次生成时
+/// 生效,故它绝不能让发起请求失败。
+async fn regenerate_served_cache(state: &AppState, id: &str) {
+    if crate::generate::regenerate_from_cache(state, id)
+        .await
+        .is_err()
+    {
+        tracing::warn!(profile = %id, "failed to regenerate served cache after edit");
     }
 }
 

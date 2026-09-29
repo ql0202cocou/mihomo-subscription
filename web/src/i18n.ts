@@ -89,6 +89,7 @@ const zh = {
       alwaysLive: "该链接始终实时:客户端每次拉取都会即时拉取机场最新节点并应用当前配置,无需手动生成。",
       generateSuccess: "已刷新",
       generateFailed: "刷新失败",
+      generateFailedRules: "刷新失败:规则中有 {{count}} 处错误,请到「规则」页签查看",
       rulesetConflict: "以下规则集与机场同名 rule-provider 冲突,已用面板托管版覆盖",
     },
     basic: {
@@ -134,6 +135,8 @@ const zh = {
       addField: "添加字段",
       key: "字段名",
       remove: "删除",
+      keyConflict: "字段名重复或与上方已有字段相同,该行不会保存。",
+      kind: { text: "文本", number: "数字", bool: "开关", yaml: "YAML" },
     },
     nodeFields: {
       server: "服务器地址",

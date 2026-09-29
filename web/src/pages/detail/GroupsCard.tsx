@@ -239,6 +239,8 @@ export default function GroupsCard({ profileId, groups, nodes, generatedAt, onSa
 
   const optionFields = groupOptionFields(groupType);
   const advancedOptions = advancedEntries(options, groupOptionKeys(groupType));
+  // 表单已直接渲染的选项,加上由分组自身字段决定、后端生成时忽略的结构键。
+  const reservedOptionKeys = new Set([...groupOptionKeys(groupType), "name", "type", "proxies"]);
 
   return (
     <div className="dcard">
@@ -323,7 +325,11 @@ export default function GroupsCard({ profileId, groups, nodes, generatedAt, onSa
             </div>
           )}
 
-          <AdvancedFields entries={advancedOptions} onChange={setAdvancedOptions} />
+          <AdvancedFields
+            entries={advancedOptions}
+            reserved={reservedOptionKeys}
+            onChange={setAdvancedOptions}
+          />
         </Form>
       </Modal>
     </div>

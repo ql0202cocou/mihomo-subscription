@@ -170,7 +170,7 @@ export default function NodeForm({ value, onChange }: Props) {
           );
         })}
 
-      <AdvancedFields entries={advanced} onChange={setAdvanced} />
+      <AdvancedFields entries={advanced} reserved={known} onChange={setAdvanced} />
     </Form>
   );
 }

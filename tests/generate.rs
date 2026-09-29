@@ -511,7 +511,7 @@ async fn reorder_applies_to_the_cache_immediately_without_a_fetch() {
     assert_eq!(resp.status(), StatusCode::NO_CONTENT);
 
     // The cached output (admin preview) reflects the new order immediately via
-    // resync_cache — no provider re-fetch.
+    // regenerate_from_cache — no provider re-fetch.
     assert_eq!(
         proxy_names(app.clone(), cookie.clone()).await,
         vec!["mine", "hk-1"]
@@ -1075,4 +1075,156 @@ async fn wrong_prefix_and_unknown_token_are_404() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+/// 公开刷新间隔足够长:公开拉取直接返回缓存,用于验证编辑后的缓存本身。返回 app 与 DB 句柄。
+async fn cached_app(temp: &TempDb) -> (Router, sqlx::SqlitePool) {
+    let mut state = test_state_with_fetcher(temp, Arc::new(FakeFetcher::default())).await;
+    Arc::get_mut(&mut state)
+        .unwrap()
+        .public_refresh_min_interval = Duration::from_secs(3600);
+    let db = state.db.clone();
+    (build_router(state), db)
+}
+
+async fn put_rules(app: &Router, cookie: &str, id: &str, content: &str) {
+    let body = serde_json::json!({ "content": content }).to_string();
+    let resp = app
+        .clone()
+        .oneshot(authed(
+            "PUT",
+            &format!("/api/profiles/{id}/rules"),
+            cookie,
+            &body,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+}
+
+async fn get_text(app: &Router, path: &str) -> String {
+    let resp = app
+        .clone()
+        .oneshot(Request::get(path).body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    text(resp).await
+}
+
+#[tokio::test]
+async fn invalid_rule_edit_never_reaches_the_served_cache() {
+    let temp = TempDb::new();
+    let (app, _) = cached_app(&temp).await;
+    let cookie = login(&app).await;
+    let profile = create_profile(&app, &cookie).await;
+    let id = profile["id"].as_str().unwrap();
+    let sub = sub_path(profile["subscription_url"].as_str().unwrap());
+
+    put_rules(&app, &cookie, id, "MATCH,DIRECT").await;
+    assert!(get_text(&app, &sub).await.contains("MATCH,DIRECT"));
+
+    // 引用不存在的策略:规则照常保存,但所服务的缓存保持上一份合法输出。
+    put_rules(&app, &cookie, id, "MATCH,NoSuchGroup").await;
+    let body = get_text(&app, &sub).await;
+    assert!(body.contains("MATCH,DIRECT"));
+    assert!(!body.contains("NoSuchGroup"));
+}
+
+#[tokio::test]
+async fn legacy_cache_without_provider_original_is_left_untouched() {
+    let temp = TempDb::new();
+    let (app, db) = cached_app(&temp).await;
+    let cookie = login(&app).await;
+    let profile = create_profile(&app, &cookie).await;
+    let id = profile["id"].as_str().unwrap();
+    let sub = sub_path(profile["subscription_url"].as_str().unwrap());
+
+    // 模拟升级前生成的缓存:没有保存机场原文,无法离线重生成。
+    sqlx::query("UPDATE generated_cache SET provider_yaml = NULL")
+        .execute(&db)
+        .await
+        .unwrap();
+    let before = get_text(&app, &sub).await;
+
+    put_rules(&app, &cookie, id, "MATCH,DIRECT").await;
+    assert_eq!(
+        get_text(&app, &sub).await,
+        before,
+        "等下一次回源后才吸收编辑"
+    );
+}
+
+/// 返回固定正文的 fetcher,用于模拟机场返回非 YAML 内容。
+struct BodyFetcher(&'static str);
+
+#[async_trait::async_trait]
+impl RemoteFetcher for BodyFetcher {
+    async fn fetch(&self, _url: &str) -> Result<Fetched, FetchError> {
+        Ok(Fetched {
+            body: self.0.to_string(),
+            subscription_userinfo: None,
+        })
+    }
+}
+
+#[tokio::test]
+async fn unparsable_provider_body_is_recorded_as_provider_parse() {
+    let temp = TempDb::new();
+    // 机场不认 UA 时常见:返回 base64 节点列表而非 Mihomo YAML。
+    let fetcher = Arc::new(BodyFetcher(
+        "c3M6Ly9ZV1Z6TFRJMU5pMW5ZMjA2Y0dGemMzZHZjbVE9QDEuMi4zLjQ6ODM4OA==",
+    ));
+    let app = build_router(test_state_with_fetcher(&temp, fetcher).await);
+    let cookie = login(&app).await;
+
+    // 新建时的自动拉取:拉取成功但解析失败,状态不能停在 success。
+    let profile = create_profile(&app, &cookie).await;
+    let id = profile["id"].as_str().unwrap();
+    assert_eq!(profile["last_fetch_status"], "provider_parse");
+
+    // 手动生成同样返回 502 并记录状态。
+    let resp = app
+        .clone()
+        .oneshot(authed(
+            "POST",
+            &format!("/api/profiles/{id}/generate"),
+            &cookie,
+            "",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+    let resp = app
+        .clone()
+        .oneshot(authed("GET", &format!("/api/profiles/{id}"), &cookie, ""))
+        .await
+        .unwrap();
+    assert_eq!(json(resp).await["last_fetch_status"], "provider_parse");
+}
+
+#[tokio::test]
+async fn admin_generate_waits_for_the_per_profile_lock() {
+    let temp = TempDb::new();
+    let state = test_state_with_fetcher(&temp, Arc::new(FakeFetcher::default())).await;
+    let app = build_router(state.clone());
+    let cookie = login(&app).await;
+    let profile = create_profile(&app, &cookie).await;
+    let id = profile["id"].as_str().unwrap().to_string();
+    let generate = || authed("POST", &format!("/api/profiles/{id}/generate"), &cookie, "");
+
+    // 占住该 profile 的锁(模拟进行中的离线重生成):生成必须等锁,不能与之并发写缓存。
+    let blocked = state
+        .keyed_lock
+        .run(&id, async {
+            tokio::time::timeout(Duration::from_millis(300), app.clone().oneshot(generate()))
+                .await
+                .is_err()
+        })
+        .await;
+    assert!(blocked, "generate must wait for the per-profile lock");
+
+    // 锁释放后照常完成。
+    let resp = app.oneshot(generate()).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
 }

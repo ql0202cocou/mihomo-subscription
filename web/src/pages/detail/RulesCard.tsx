@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   App as AntdApp,
   AutoComplete,
@@ -197,6 +197,10 @@ export default function RulesCard({ profileId, initial, nodes, groups, generated
 
   const sensors = useSensors(useSensor(PointerSensor, { activationConstraint: { distance: 4 } }));
 
+  // 服务端最近确认的规则(加载或保存成功时更新):保存失败时回滚到它。不用闭包里的 `rules`,
+  // 因为 persist 不依赖它(可能已过期),且连续保存时应回到服务端实际持有的状态。
+  const saved = useRef<{ rules: string[]; match: string | null }>({ rules: [], match: null });
+
   useEffect(() => {
     const all = initial.split("\n").map((l) => l.trim()).filter((l) => l !== "");
     // 最后一条 MATCH 作为兜底,钉底保留;其余行原样留在列表。
@@ -208,6 +212,7 @@ export default function RulesCard({ profileId, initial, nodes, groups, generated
     }
     setRules(rest);
     setMatchLine(match);
+    saved.current = { rules: rest, match };
     setModalOpen(false);
     setEditing(null);
     setModel(DEFAULT_RULE);
@@ -263,9 +268,12 @@ export default function RulesCard({ profileId, initial, nodes, groups, generated
           method: "PUT",
           body: JSON.stringify({ content }),
         });
+        saved.current = { rules: nextRules, match: nextMatch };
         onSaved();
         return true;
       } catch (e) {
+        setRules(saved.current.rules);
+        setMatchLine(saved.current.match);
         message.error(errorMessage(e, t("common.saveFailed")));
         return false;
       }
@@ -329,20 +337,27 @@ export default function RulesCard({ profileId, initial, nodes, groups, generated
   }
 
   // 把 RULE-SET 的内联 provider 定义 upsert 到本订阅 ③ 库(按名 POST 新建 / PUT 更新)。
+  // 表单不编辑 cache / enabled:更新时沿用已有值(PUT 整体替换,缺省会被后端当作 true),新建时启用并缓存。
   async function upsertRuleSet(m: RuleModel) {
     const name = m.payload.trim();
-    const base = { name, behavior: m.rsBehavior, format: m.rsFormat, source: m.rsSource };
+    const existing = profileRuleSets.find((r) => r.name === name);
+    const base = {
+      name,
+      behavior: m.rsBehavior,
+      format: m.rsFormat,
+      source: m.rsSource,
+      enabled: existing?.enabled ?? true,
+    };
     const body =
       m.rsSource === "remote"
         ? {
             ...base,
             interval_hours: m.rsInterval,
-            cache: true,
+            cache: existing?.cache ?? true,
             // 远程 URL 已脱敏不回显:留空时不传 url 字段,后端保留原 URL(见 submit 的校验)。
             ...(m.rsUrl.trim() ? { url: m.rsUrl.trim() } : {}),
           }
         : { ...base, content: m.rsContent };
-    const existing = profileRuleSets.find((r) => r.name === name);
     if (existing) {
       await api(`/api/profiles/${profileId}/rule-sets/${existing.id}`, {
         method: "PUT",
@@ -490,7 +505,7 @@ export default function RulesCard({ profileId, initial, nodes, groups, generated
       return;
     }
     try {
-      // 后端把 ② 定义复制进本订阅 ③(含真实远程 URL)并追加 RULE-SET 规则行,随后重缝缓存。
+      // 后端把 ② 定义复制进本订阅 ③(含真实远程 URL)并追加 RULE-SET 规则行,随后离线重生成缓存。
       const res = await api<{ imported: number }>(
         `/api/profiles/${profileId}/rule-sets/import`,
         { method: "POST", body: JSON.stringify({ names, policy: importPolicy }) },

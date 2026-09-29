@@ -245,3 +245,25 @@ async fn delete_profile_returns_404_afterward() {
     .await;
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 }
+
+#[tokio::test]
+async fn update_trims_name_and_rejects_blank() {
+    let temp = TempDb::new();
+    let app = build_router(test_state(&temp).await);
+    let cookie = login(&app).await;
+
+    let profile = create_profile(&app, &cookie, "p").await;
+    let path = format!("/api/profiles/{}", profile["id"].as_str().unwrap());
+
+    // 与创建一致:空白名拒绝,首尾空白去除。
+    let resp = send(&app, authed("PUT", &path, &cookie, r#"{"name":"   "}"#)).await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    let resp = send(
+        &app,
+        authed("PUT", &path, &cookie, r#"{"name":"  renamed  "}"#),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(json(resp).await["name"], "renamed");
+}

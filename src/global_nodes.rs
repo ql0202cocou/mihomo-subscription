@@ -182,7 +182,7 @@ pub struct ReorderBody {
 
 /// `PUT /api/global-nodes/order` —— 设置全局自定义块顺序。列出的名字按给定次序在前,未列出的
 /// 保持在末尾;`position` 重写为连续的 `0..n-1`。改动即时应用到每条 profile 的缓存(尽力而为地
-/// 就地重缝,不重拉机场)。
+/// 离线重生成,不重拉机场)。
 pub async fn set_order(
     State(state): State<Arc<AppState>>,
     Json(body): Json<ReorderBody>,
@@ -216,7 +216,7 @@ pub async fn set_order(
     }
     tx.commit().await?;
 
-    // 排序只是对各缓存输出中已存在的节点做重排,故可就地重缝每条 profile 的缓存、立即生效。
-    crate::generate::resync_all_caches(&state).await;
+    // 用各 profile 缓存的机场原文离线重生成,新顺序立即生效、不重拉机场。
+    crate::generate::regenerate_all_from_cache(&state).await;
     Ok(StatusCode::NO_CONTENT)
 }

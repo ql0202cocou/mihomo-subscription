@@ -20,7 +20,7 @@ use sqlx::FromRow;
 use crate::app::AppState;
 use crate::converter::{self, ConvertError, ConvertInput, CustomGroup, CustomNode, RuleProvider};
 use crate::error::{ApiError, ApiResult};
-use crate::profiles::{self, OrderKind};
+use crate::profiles;
 use crate::util::{is_fresh, now};
 
 const UPDATE_INTERVAL_HOURS: u32 = 24;
@@ -45,6 +45,8 @@ struct CacheRow {
 struct Built {
     yaml: String,
     userinfo: Option<String>,
+    /// 本次转换所用的机场原文,随缓存保存,供编辑后离线重生成(见 [`regenerate_from_cache`])。
+    provider_yaml: String,
     content_hash: String,
     generated_at: String,
     /// 与机场 `rule-providers` 撞名、已被面板托管版覆盖的自定义规则集名(空表示无冲突)。
@@ -76,14 +78,20 @@ pub async fn generate(
 ) -> ApiResult<impl IntoResponse> {
     let profile = load_core(&state, &id).await?.ok_or(ApiError::NotFound)?;
 
-    let built = match fetch_convert_and_record(&state, &profile).await {
-        Ok(b) => b,
-        Err(BuildError::Validation(errors)) => return Err(ApiError::Validation(errors)),
-        Err(BuildError::Upstream(label)) => return Err(ApiError::Upstream(label)),
-        Err(BuildError::Internal) => return Err(ApiError::Internal),
-    };
-
-    persist_cache_and_group_order(&state, &profile.id, &built).await?;
+    // 与公开刷新、离线重生成共用 per-profile 锁:否则并发的一方可能用较旧的机场原文覆盖较新的缓存。
+    let built = state
+        .keyed_lock
+        .run(&profile.id, async {
+            let built = match fetch_convert_and_record(&state, &profile).await {
+                Ok(b) => b,
+                Err(BuildError::Validation(errors)) => return Err(ApiError::Validation(errors)),
+                Err(BuildError::Upstream(label)) => return Err(ApiError::Upstream(label)),
+                Err(BuildError::Internal) => return Err(ApiError::Internal),
+            };
+            persist_cache_and_group_order(&state, &profile.id, &built).await?;
+            Ok(built)
+        })
+        .await?;
     Ok(Json(GenerateResponse {
         subscription_url: state.subscription_url(&profile.token),
         generated_at: built.generated_at,
@@ -97,9 +105,15 @@ pub async fn generate_best_effort(state: &AppState, id: &str) {
     let Some(profile) = load_core(state, id).await.ok().flatten() else {
         return;
     };
-    if let Ok(built) = fetch_convert_and_record(state, &profile).await {
-        let _ = persist_cache_and_group_order(state, &profile.id, &built).await;
-    }
+    // 同 `generate`,写缓存前持有 per-profile 锁。
+    state
+        .keyed_lock
+        .run(&profile.id, async {
+            if let Ok(built) = fetch_convert_and_record(state, &profile).await {
+                let _ = persist_cache_and_group_order(state, &profile.id, &built).await;
+            }
+        })
+        .await;
 }
 
 /// `GET /api/profiles/:id/preview` —— 只读的生成 YAML。有新鲜缓存则返回,否则实时生成、不持久化、
@@ -211,10 +225,8 @@ async fn serve_or_refresh(state: &AppState, profile: &ProfileCore) -> Option<Ser
                         userinfo: built.userinfo,
                     })
                 }
-                Err(err) => {
-                    if let BuildError::Upstream(label) = &err {
-                        let _ = update_last_fetch(state, &profile.id, label).await;
-                    }
+                // 机场侧失败的 `last_fetch_status` 已由 `fetch_convert_and_record` 记录。
+                Err(_) => {
                     // 有陈旧缓存就提供;否则给出 503。
                     match cached {
                         Some(cache) => {
@@ -240,7 +252,8 @@ impl From<CacheRow> for Served {
 
 // ─── 核心 拉取 + 转换 ──────────────────────────────────────────────────────────
 
-/// 拉取机场并转换。拉取成功时把 `last_fetch_*` 更新为 `success`;拉取失败时记录状态标签。
+/// 拉取机场并转换。拉取成功时把 `last_fetch_*` 更新为 `success`;拉取失败或机场内容无法解析时
+/// 记录对应状态标签。
 async fn fetch_convert_and_record(
     state: &AppState,
     profile: &ProfileCore,
@@ -255,15 +268,22 @@ async fn fetch_convert_and_record(
     };
     let _ = update_last_fetch(state, &profile.id, "success").await;
 
-    let (yaml, ruleset_conflicts) = convert(state, &profile.id, &profile.token, &fetched.body)
+    let converted = convert(state, &profile.id, &profile.token, &fetched.body)
         .await
         // DB 错误已被 `From<sqlx::Error>` 脱敏并记日志;传播为内部错误,不再误报为机场拉取失败。
-        .map_err(|_| BuildError::Internal)?
-        .map_err(|e| match e {
-            ConvertError::Validation(v) => BuildError::Validation(v),
-            ConvertError::ProviderParse => BuildError::Upstream("provider_parse".to_string()),
-            ConvertError::OutputSerialize => BuildError::Internal,
-        })?;
+        .map_err(|_| BuildError::Internal)?;
+    let (yaml, ruleset_conflicts) = match converted {
+        Ok(out) => out,
+        Err(ConvertError::Validation(v)) => return Err(BuildError::Validation(v)),
+        // 拉取成功但内容不是可解析的 Mihomo YAML(如机场不认 UA 返回的 base64 节点列表):同样是
+        // 机场侧问题,覆盖上面刚写入的 `success`,使列表/详情如实反映。
+        Err(ConvertError::ProviderParse) => {
+            let label = "provider_parse".to_string();
+            let _ = update_last_fetch(state, &profile.id, &label).await;
+            return Err(BuildError::Upstream(label));
+        }
+        Err(ConvertError::OutputSerialize) => return Err(BuildError::Internal),
+    };
     if !ruleset_conflicts.is_empty() {
         tracing::warn!(
             profile = %profile.id,
@@ -276,6 +296,7 @@ async fn fetch_convert_and_record(
     Ok(Built {
         yaml,
         userinfo: fetched.subscription_userinfo,
+        provider_yaml: fetched.body,
         content_hash,
         generated_at: now(),
         ruleset_conflicts,
@@ -433,18 +454,20 @@ async fn persist_cache_and_group_order(
     built: &Built,
 ) -> ApiResult<()> {
     sqlx::query(
-        "INSERT INTO generated_cache (profile_id, content_hash, output_yaml, subscription_userinfo, generated_at)
-         VALUES (?, ?, ?, ?, ?)
+        "INSERT INTO generated_cache (profile_id, content_hash, output_yaml, subscription_userinfo, provider_yaml, generated_at)
+         VALUES (?, ?, ?, ?, ?, ?)
          ON CONFLICT(profile_id) DO UPDATE SET
             content_hash = excluded.content_hash,
             output_yaml = excluded.output_yaml,
             subscription_userinfo = excluded.subscription_userinfo,
+            provider_yaml = excluded.provider_yaml,
             generated_at = excluded.generated_at",
     )
     .bind(profile_id)
     .bind(&built.content_hash)
     .bind(&built.yaml)
     .bind(&built.userinfo)
+    .bind(&built.provider_yaml)
     .bind(&built.generated_at)
     .execute(&state.db)
     .await?;
@@ -476,26 +499,6 @@ async fn snapshot_group_order(state: &AppState, profile_id: &str, yaml: &str) ->
     Ok(())
 }
 
-/// 全部全局自定义节点名(无论启用与否)的集合,用于在 resync 时从缓存输出中切分出自定义块。
-async fn global_node_names(state: &AppState) -> ApiResult<std::collections::HashSet<String>> {
-    Ok(
-        sqlx::query_scalar::<_, String>("SELECT name FROM global_nodes")
-            .fetch_all(&state.db)
-            .await?
-            .into_iter()
-            .collect(),
-    )
-}
-
-/// 按自定义块顺序(`position`,再按 `name`)排列的全局自定义节点名,用于在 resync 时重排自定义块。
-async fn global_node_order(state: &AppState) -> ApiResult<Vec<String>> {
-    Ok(sqlx::query_scalar::<_, String>(
-        "SELECT name FROM global_nodes ORDER BY position ASC, name ASC",
-    )
-    .fetch_all(&state.db)
-    .await?)
-}
-
 /// 提取某顶层序列的有序 `name`,仅保留匹配 `keep` 的,序列化为 JSON 数组;无则 `None`(→ SQL NULL)。
 fn order_json(root: &serde_yaml::Value, key: &str, keep: impl Fn(&str) -> bool) -> Option<String> {
     let names: Vec<&str> = match root.get(key) {
@@ -523,97 +526,62 @@ async fn update_last_fetch(state: &AppState, profile_id: &str, status: &str) -> 
     Ok(())
 }
 
-/// 就地重缝缓存输出,使其反映当前保存的节点/分组顺序与规则集,**不** 重拉机场——故拖拽排序
-/// (或规则编辑)会被公开链接立即提供,而不必等下一次完整生成。重排只是对缓存输出中已有的条目
-/// 做置换,且规则块完全由用户定义(与机场无关),故对这些操作等价于重新生成。尚未生成过时为
-/// no-op(此时顺序在首次生成时应用)。
-pub async fn resync_cache(state: &AppState, profile_id: &str) -> ApiResult<()> {
-    let Some(cache) = load_cache(state, profile_id).await? else {
-        return Ok(());
-    };
-    let Ok(serde_yaml::Value::Mapping(mut root)) = crate::yaml::parse_limited(&cache.output_yaml)
-    else {
-        return Ok(());
-    };
-
-    // proxies:从缓存输出重建两个块——按全局自定义节点名切分,自定义块按全局节点顺序
-    // (`global_nodes.position`)重排,再按 `node_section_order` 拼接(机场块保持其缓存/上游顺序)。
-    let node_order = global_node_order(state).await?;
-    let node_section_order = profiles::load_order(state, profile_id, OrderKind::Section).await?;
-    let custom = global_node_names(state).await?;
-    if let Some(serde_yaml::Value::Sequence(proxies)) = root.get_mut("proxies") {
-        let (mut custom_block, provider_block): (Vec<_>, Vec<_>) =
-            std::mem::take(proxies).into_iter().partition(|item| {
-                item.get("name")
-                    .and_then(|v| v.as_str())
-                    .is_some_and(|n| custom.contains(n))
-            });
-        converter::reorder_by_name(
-            &mut custom_block,
-            |item| item.get("name").and_then(|v| v.as_str()),
-            &node_order,
-        );
-        *proxies = converter::concat_sections(provider_block, custom_block, &node_section_order);
-    }
-
-    // proxy-groups:按保存的分组顺序重排。
-    let group_order = profiles::load_order(state, profile_id, OrderKind::Group).await?;
-    reorder_seq(&mut root, "proxy-groups", &group_order);
-
-    // 用当前规则集替换 rules 块(顺序有意义);与转换器一致(跳过空/注释行,保持顺序)。
-    let rules =
-        sqlx::query_scalar::<_, String>("SELECT content FROM rulesets WHERE profile_id = ?")
-            .bind(profile_id)
-            .fetch_optional(&state.db)
-            .await?
-            .unwrap_or_default();
-    let rule_values: Vec<serde_yaml::Value> = rules
-        .lines()
-        .map(str::trim)
-        .filter(|l| !l.is_empty() && !l.starts_with('#'))
-        .map(serde_yaml::Value::from)
-        .collect();
-    root.insert(
-        serde_yaml::Value::from("rules"),
-        serde_yaml::Value::Sequence(rule_values),
-    );
-
-    let Ok(new_yaml) = serde_yaml::to_string(&serde_yaml::Value::Mapping(root)) else {
-        return Ok(());
-    };
-    if new_yaml == cache.output_yaml {
-        return Ok(());
-    }
-
-    // 就地打补丁更新缓存输出;保留 `generated_at`,使机场重拉节奏不变(内容仍是上次拉取、只是重排)。
-    sqlx::query(
-        "UPDATE generated_cache SET output_yaml = ?, content_hash = ? WHERE profile_id = ?",
-    )
-    .bind(&new_yaml)
-    .bind(content_hash_of(&new_yaml))
-    .bind(profile_id)
-    .execute(&state.db)
-    .await?;
-    Ok(())
+/// 用缓存中的机场原文离线重跑完整转换(校验、`rule-providers` 注入、排序),不重拉机场。规则/排序
+/// 编辑与重置 token/前缀后调用,使改动立即反映到所服务的订阅,且与完整生成走同一条路径。
+///
+/// - 校验失败时保留上一份合法输出:编辑已入库,逐条错误由下次「生成」报出,坏配置不会被下发。
+/// - 尚未生成、或升级前生成的缓存(无机场原文)为 no-op,改动在下次回源拉取后生效。
+/// - 保留 `generated_at`,使公开端点的回源节奏不变(内容仍来自上次拉取)。
+/// - 与公开刷新共用 per-profile 锁,避免并发刷新用旧输入覆盖本次结果。
+pub async fn regenerate_from_cache(state: &AppState, profile_id: &str) -> ApiResult<()> {
+    state
+        .keyed_lock
+        .run(profile_id, async {
+            let Some(profile) = load_core(state, profile_id).await? else {
+                return Ok(());
+            };
+            let Some((Some(provider_yaml), userinfo, generated_at)) =
+                sqlx::query_as::<_, (Option<String>, Option<String>, String)>(
+                    "SELECT provider_yaml, subscription_userinfo, generated_at \
+                     FROM generated_cache WHERE profile_id = ?",
+                )
+                .bind(profile_id)
+                .fetch_optional(&state.db)
+                .await?
+            else {
+                return Ok(());
+            };
+            let (yaml, ruleset_conflicts) =
+                match convert(state, profile_id, &profile.token, &provider_yaml).await? {
+                    Ok(out) => out,
+                    Err(_) => {
+                        tracing::warn!(profile = %profile_id, "edited config is invalid; keeping the last valid cache");
+                        return Ok(());
+                    }
+                };
+            let built = Built {
+                content_hash: content_hash_of(&yaml),
+                yaml,
+                userinfo,
+                provider_yaml,
+                generated_at,
+                ruleset_conflicts,
+            };
+            persist_cache_and_group_order(state, profile_id, &built).await
+        })
+        .await
 }
 
-/// 按名字就地重排某顶层 `proxies`/`proxy-groups` 序列。
-fn reorder_seq(root: &mut serde_yaml::Mapping, key: &str, order: &[String]) {
-    if let Some(serde_yaml::Value::Sequence(seq)) = root.get_mut(key) {
-        converter::reorder_by_name(seq, |item| item.get("name").and_then(|v| v.as_str()), order);
-    }
-}
-
-/// 就地重缝每条 profile 的服务缓存。用于全局节点排序之后(它影响所有 profile 的自定义块)。
-/// 逐 profile 尽力而为:某个失败就让该 profile 在下次生成时再吸收新顺序。
-pub async fn resync_all_caches(state: &AppState) {
+/// 对每条 profile 执行 [`regenerate_from_cache`]。用于影响所有 profile 的改动(全局节点排序、重置公共
+/// 路径前缀)。逐 profile 尽力而为:某个失败就让该 profile 在下次生成时再吸收改动。
+pub async fn regenerate_all_from_cache(state: &AppState) {
     let ids = sqlx::query_scalar::<_, String>("SELECT id FROM profiles")
         .fetch_all(&state.db)
         .await
         .unwrap_or_default();
     for id in ids {
-        if resync_cache(state, &id).await.is_err() {
-            tracing::warn!(profile = %id, "failed to resync cache after global-node reorder");
+        if regenerate_from_cache(state, &id).await.is_err() {
+            tracing::warn!(profile = %id, "failed to regenerate cache");
         }
     }
 }

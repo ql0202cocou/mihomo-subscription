@@ -72,8 +72,17 @@ export default function ProfileDetail() {
       setGenWarnings(res.ruleset_conflicts ?? []);
       await reload();
     } catch (e) {
-      if (e instanceof ApiError && e.details?.length) setGenErrors(e.details);
-      else message.error(errorMessage(e, t("detail.generateFailed")));
+      if (e instanceof ApiError && e.details?.length) {
+        setGenErrors(e.details);
+        // 规则行错误只在「规则」tab 内展示(未激活的 tab 不渲染),这里必须给出提示,否则在其他 tab
+        // 点刷新失败时毫无反馈。
+        const ruleErrors = e.details.filter((d) => /rules line/.test(d)).length;
+        message.error(
+          ruleErrors > 0
+            ? t("detail.generateFailedRules", { count: ruleErrors })
+            : t("detail.generateFailed"),
+        );
+      } else message.error(errorMessage(e, t("detail.generateFailed")));
     } finally {
       setGenerating(false);
     }

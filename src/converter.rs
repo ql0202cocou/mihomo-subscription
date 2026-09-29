@@ -77,13 +77,26 @@ pub fn convert(input: ConvertInput) -> Result<(String, Vec<String>), ConvertErro
         yaml::parse_mapping(input.provider_yaml).map_err(|_| ConvertError::ProviderParse)?;
 
     let provider_proxies = names_in(root.get("proxies"));
+    let provider_rule_providers: Vec<String> = match root.get("rule-providers") {
+        Some(Value::Mapping(m)) => m
+            .keys()
+            .filter_map(Value::as_str)
+            .map(str::to_string)
+            .collect(),
+        _ => Vec::new(),
+    };
 
     // 先解析自定义节点 content;把解析失败收集为校验错误,而非直接中止。
     let mut errors: Vec<String> = Vec::new();
     let mut parsed_nodes: Vec<(String, Mapping)> = Vec::new();
     for node in &input.nodes {
         match yaml::parse_mapping(&node.content) {
-            Ok(m) => parsed_nodes.push((node.name.clone(), m)),
+            Ok(mut m) => {
+                // 输出以库内 name 为准:校验、分组成员与规则都按它引用,content 里的 name 可能缺失
+                // 或与之不一致(如末尾多了空格)。
+                m.insert(Value::from("name"), Value::from(node.name.clone()));
+                parsed_nodes.push((node.name.clone(), m));
+            }
             Err(_) => errors.push(format!(
                 "custom node `{}` has invalid YAML content",
                 node.name
@@ -97,6 +110,7 @@ pub fn convert(input: ConvertInput) -> Result<(String, Vec<String>), ConvertErro
     validate(
         &input,
         &provider_proxies,
+        &provider_rule_providers,
         &custom_node_names,
         &custom_group_names,
         &mut errors,
@@ -178,6 +192,7 @@ pub fn convert(input: ConvertInput) -> Result<(String, Vec<String>), ConvertErro
 fn validate(
     input: &ConvertInput,
     provider_proxies: &[String],
+    provider_rule_providers: &[String],
     custom_node_names: &[String],
     custom_group_names: &[String],
     errors: &mut Vec<String>,
@@ -189,6 +204,13 @@ fn validate(
             errors.push(format!(
                 "custom node `{name}` conflicts with a provider proxy name"
             ));
+        }
+    }
+
+    // 代理与分组共用同一命名空间:自定义分组不得与任何代理(机场或自定义节点)重名。
+    for name in custom_group_names {
+        if provider_proxies.contains(name) || custom_node_names.contains(name) {
+            errors.push(format!("custom group `{name}` conflicts with a proxy name"));
         }
     }
 
@@ -213,7 +235,18 @@ fn validate(
         }
     }
 
+    // 分组之间的引用不得成环(Mihomo 拒绝加载含环的分组)。
+    for group in &input.groups {
+        if in_cycle(&input.groups, &group.name) {
+            errors.push(format!(
+                "custom group `{}` is part of a reference cycle",
+                group.name
+            ));
+        }
+    }
+
     // 每条规则的策略目标必须存在。无法可靠解析的高级/逻辑规则透传,不做目标校验。
+    // `RULE-SET` 引用的规则集必须存在:本订阅注入的规则集(③,仅已启用者)或机场自带的 rule-providers。
     for (lineno, line) in rule_lines(input.rules) {
         if let Some(target) = rule_target(line) {
             if !known(&target) {
@@ -222,7 +255,36 @@ fn validate(
                 ));
             }
         }
+        if let Some(name) = ruleset_name(line) {
+            let injected = input.rule_providers.iter().any(|rp| rp.name == name);
+            if !injected && !provider_rule_providers.iter().any(|n| n == name) {
+                errors.push(format!(
+                    "rules line {lineno} references unknown rule-set `{name}`"
+                ));
+            }
+        }
     }
+}
+
+/// 分组 `start` 是否在引用环上:沿「成员是自定义分组」的边从其成员出发能否回到它自身。
+fn in_cycle(groups: &[CustomGroup], start: &str) -> bool {
+    let members_of = |name: &str| {
+        groups
+            .iter()
+            .find(|g| g.name == name)
+            .map_or(&[][..], |g| g.members.as_slice())
+    };
+    let mut stack: Vec<&str> = members_of(start).iter().map(String::as_str).collect();
+    let mut seen = std::collections::HashSet::new();
+    while let Some(name) = stack.pop() {
+        if name == start {
+            return true;
+        }
+        if seen.insert(name) {
+            stack.extend(members_of(name).iter().map(String::as_str));
+        }
+    }
+    false
 }
 
 /// 从 `proxies`/`proxy-groups` 值中提取各代理/分组的 `name`。
@@ -292,11 +354,14 @@ fn build_group(group: CustomGroup) -> Mapping {
     let mut m = Mapping::new();
     m.insert(Value::from("name"), Value::from(group.name));
     m.insert(Value::from("type"), Value::from(group.group_type));
-    // 在成员列表之前合并分组特有的选项(url、interval…)。
+    // 在成员列表之前合并分组特有的选项(url、interval…)。结构键由分组自身字段决定,选项不得
+    // 覆盖,否则输出会与已校验的名字/类型/成员不一致。
     if let Some(opts) = group.options {
         if let Ok(Value::Mapping(opt_map)) = serde_yaml::to_value(&opts) {
             for (k, v) in opt_map {
-                m.insert(k, v);
+                if !matches!(k.as_str(), Some("name" | "type" | "proxies")) {
+                    m.insert(k, v);
+                }
             }
         }
     }
@@ -328,16 +393,22 @@ fn build_rule_provider(rp: &RuleProvider) -> Value {
 pub fn ruleset_refs(rules: &str) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     for (_, line) in rule_lines(rules) {
-        let mut parts = line.split(',').map(str::trim);
-        if parts.next().map(|k| k.eq_ignore_ascii_case("RULE-SET")) == Some(true) {
-            if let Some(name) = parts.next() {
-                if !name.is_empty() && !out.iter().any(|n| n == name) {
-                    out.push(name.to_string());
-                }
+        if let Some(name) = ruleset_name(line) {
+            if !out.iter().any(|n| n == name) {
+                out.push(name.to_string());
             }
         }
     }
     out
+}
+
+/// `RULE-SET,<name>,...` 规则行引用的规则集名;其他规则(含逻辑规则内嵌的 RULE-SET)返回 `None`。
+fn ruleset_name(line: &str) -> Option<&str> {
+    let mut parts = line.split(',').map(str::trim);
+    parts
+        .next()
+        .filter(|k| k.eq_ignore_ascii_case("RULE-SET"))?;
+    parts.next().filter(|name| !name.is_empty())
 }
 
 /// 遍历非空、非注释的规则行,带其 1-based 行号(按原始文本编号,使消息与编辑器一致)。
@@ -650,5 +721,129 @@ rules:
     fn empty_orders_keep_provider_first_then_custom() {
         let root = out(input("MATCH,DIRECT", vec![node("z")], vec![]));
         assert_eq!(names_in(root.get("proxies")), vec!["hk-1", "z"]);
+    }
+
+    fn group(name: &str, members: &[&str]) -> CustomGroup {
+        CustomGroup {
+            name: name.into(),
+            group_type: "select".into(),
+            members: members.iter().map(|m| m.to_string()).collect(),
+            options: None,
+        }
+    }
+
+    fn validation_errors(input: ConvertInput) -> Vec<String> {
+        match convert(input) {
+            Err(ConvertError::Validation(errs)) => errs,
+            _ => panic!("expected validation error"),
+        }
+    }
+
+    #[test]
+    fn rule_set_reference_must_exist() {
+        let errs = validation_errors(input("RULE-SET,ghost,DIRECT\nMATCH,DIRECT", vec![], vec![]));
+        assert_eq!(errs.len(), 1);
+        assert!(errs[0].contains("rules line 1"));
+        assert!(errs[0].contains("unknown rule-set `ghost`"));
+    }
+
+    #[test]
+    fn rule_set_may_reference_provider_or_injected_rule_providers() {
+        // `ads` 来自机场 rule-providers,`mine` 来自本订阅注入的规则集。
+        let mut inp = input(
+            "RULE-SET,ads,DIRECT\nRULE-SET,mine,DIRECT\nMATCH,DIRECT",
+            vec![],
+            vec![],
+        );
+        inp.rule_providers = vec![RuleProvider {
+            name: "mine".into(),
+            behavior: "domain".into(),
+            format: "yaml".into(),
+            url: "https://panel.example/ruleset".into(),
+        }];
+        assert!(convert(inp).is_ok());
+    }
+
+    #[test]
+    fn group_name_conflicting_with_a_proxy_is_rejected() {
+        let groups = vec![group("hk-1", &["DIRECT"]), group("a", &["DIRECT"])];
+        let errs = validation_errors(input("MATCH,DIRECT", vec![node("a")], groups));
+        assert!(errs
+            .iter()
+            .any(|e| e.contains("custom group `hk-1` conflicts")));
+        assert!(errs
+            .iter()
+            .any(|e| e.contains("custom group `a` conflicts")));
+    }
+
+    #[test]
+    fn group_reference_cycle_is_rejected() {
+        let groups = vec![
+            group("A", &["B"]),
+            group("B", &["A"]),
+            group("Self", &["Self"]),
+            group("Ok", &["A", "hk-1"]),
+        ];
+        let errs = validation_errors(input("MATCH,DIRECT", vec![], groups));
+        let cyclic: Vec<&String> = errs.iter().filter(|e| e.contains("cycle")).collect();
+        assert_eq!(cyclic.len(), 3, "{errs:?}");
+        assert!(
+            !errs.iter().any(|e| e.contains("`Ok`")),
+            "引用环但不在环上的分组不报"
+        );
+    }
+
+    #[test]
+    fn nested_groups_without_cycle_are_allowed() {
+        let groups = vec![
+            group("Outer", &["Inner", "DIRECT"]),
+            group("Inner", &["hk-1"]),
+        ];
+        assert!(convert(input("MATCH,Outer", vec![], groups)).is_ok());
+    }
+
+    #[test]
+    fn custom_node_output_name_is_the_stored_name() {
+        // content 中的 name 与库内 name 不一致(末尾多了空格)或缺失时,输出以库内 name 为准,
+        // 使校验(按库内 name)与输出一致。
+        let nodes = vec![
+            CustomNode {
+                name: "a".into(),
+                content: "{ name: 'a ', type: ss, server: 9.9.9.9, port: 1080 }".into(),
+            },
+            CustomNode {
+                name: "b".into(),
+                content: "{ type: ss, server: 9.9.9.9, port: 1081 }".into(),
+            },
+        ];
+        let root = out(input("MATCH,G", nodes, vec![group("G", &["a", "b"])]));
+        assert_eq!(names_in(root.get("proxies")), vec!["hk-1", "a", "b"]);
+    }
+
+    #[test]
+    fn group_options_cannot_override_structural_keys() {
+        let mut g = group("G", &["hk-1"]);
+        g.options = Some(serde_json::json!({
+            "name": "Hijack",
+            "type": "url-test",
+            "proxies": ["DIRECT"],
+            "url": "http://x/generate_204",
+        }));
+        let root = out(input("MATCH,G", vec![], vec![g]));
+        let out_group = &root.get("proxy-groups").unwrap().as_sequence().unwrap()[0];
+        assert_eq!(out_group.get("name").and_then(Value::as_str), Some("G"));
+        assert_eq!(
+            out_group.get("type").and_then(Value::as_str),
+            Some("select")
+        );
+        assert_eq!(
+            out_group.get("proxies").unwrap().as_sequence().unwrap(),
+            &vec![Value::from("hk-1")]
+        );
+        assert_eq!(
+            out_group.get("url").and_then(Value::as_str),
+            Some("http://x/generate_204"),
+            "其余选项照常合并"
+        );
     }
 }
