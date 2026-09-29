@@ -155,6 +155,15 @@ function skippedRows(rows: AdvancedRow[], reserved: Set<string>): Set<number> {
 /** 切换行类型时尽量保留已填的值。 */
 function convertValue(value: unknown, kind: AdvancedKind): unknown {
   switch (kind) {
+    case "yaml":
+      // 先填文本再切到 YAML 时,用户的本意是把这段文本当 YAML;解析失败则保留原文交给用户修正。
+      if (typeof value !== "string") return value;
+      if (value.trim() === "") return null;
+      try {
+        return parseYaml(value);
+      } catch {
+        return value;
+      }
     case "bool":
       return value === true || value === "true";
     case "number": {
@@ -311,7 +320,10 @@ function ObjectField({
   value: unknown;
   onChange: (v: unknown) => void;
 }) {
-  const [text, setText] = useState(() => (value == null ? "" : stringifyYaml(value).trimEnd()));
+  // 字符串只来自「文本切到 YAML 且解析失败」:原样显示,交给用户修正;其余值序列化为 YAML。
+  const [text, setText] = useState(() =>
+    typeof value === "string" ? value : value == null ? "" : stringifyYaml(value).trimEnd(),
+  );
   return (
     <Input.TextArea
       style={{ width: 220, fontFamily: "monospace" }}
