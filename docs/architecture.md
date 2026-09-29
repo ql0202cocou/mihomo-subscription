@@ -114,7 +114,8 @@ POST /api/global-nodes { name, node_type, content, enabled? }  # name 全局唯�
 POST /api/profiles/:id/groups { name, group_type, members, options?, enabled? }
 ```
 
-- 节点 `content` 保存时结构校验，生成时原样并入**每条配置**输出的 `proxies`；`PUT` 同体整体替换。
+- 节点 `content` 保存时结构校验，生成时并入**每条配置**输出的 `proxies`，其中 `name` 以库内 `name` 为准
+  （覆盖 content 中缺失或不一致的值）；`PUT` 同体整体替换。
 - 全局节点为单一共享池：新建落末尾、`name` 全局唯一；增删改在下次生成（公共链接每拉取即重生）
   进入各配置输出，排序见下立即生效。
 
@@ -371,7 +372,7 @@ CREATE INDEX idx_global_nodes_position ON global_nodes (position);
 ```
 
 - `name` 全局唯一；`node_type`（`ss`/`vmess`/…）不加 CHECK 免迁移；`content` 为完整 Mihomo proxy
-  映射，生成时并入每条 profile 输出。
+  映射，生成时并入每条 profile 输出（输出的 `name` 以本表 `name` 为准）。
 - `position`：全局自定义块顺序（`ORDER BY position, name`，name 作确定性兜底）；新建取 `MAX+1`，
   `PUT /api/global-nodes/order` 重写为 `0..n-1` 并即时重排所有 profile 缓存。
 - 迁移：原各 profile `custom_nodes` 按 `name` 去重（取 `updated_at` 最新）合并进本表（初始

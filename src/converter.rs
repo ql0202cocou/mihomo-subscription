@@ -91,7 +91,12 @@ pub fn convert(input: ConvertInput) -> Result<(String, Vec<String>), ConvertErro
     let mut parsed_nodes: Vec<(String, Mapping)> = Vec::new();
     for node in &input.nodes {
         match yaml::parse_mapping(&node.content) {
-            Ok(m) => parsed_nodes.push((node.name.clone(), m)),
+            Ok(mut m) => {
+                // 输出以库内 name 为准:校验、分组成员与规则都按它引用,content 里的 name 可能缺失
+                // 或与之不一致(如末尾多了空格)。
+                m.insert(Value::from("name"), Value::from(node.name.clone()));
+                parsed_nodes.push((node.name.clone(), m));
+            }
             Err(_) => errors.push(format!(
                 "custom node `{}` has invalid YAML content",
                 node.name
@@ -792,5 +797,23 @@ rules:
             group("Inner", &["hk-1"]),
         ];
         assert!(convert(input("MATCH,Outer", vec![], groups)).is_ok());
+    }
+
+    #[test]
+    fn custom_node_output_name_is_the_stored_name() {
+        // content 中的 name 与库内 name 不一致(末尾多了空格)或缺失时,输出以库内 name 为准,
+        // 使校验(按库内 name)与输出一致。
+        let nodes = vec![
+            CustomNode {
+                name: "a".into(),
+                content: "{ name: 'a ', type: ss, server: 9.9.9.9, port: 1080 }".into(),
+            },
+            CustomNode {
+                name: "b".into(),
+                content: "{ type: ss, server: 9.9.9.9, port: 1081 }".into(),
+            },
+        ];
+        let root = out(input("MATCH,G", nodes, vec![group("G", &["a", "b"])]));
+        assert_eq!(names_in(root.get("proxies")), vec!["hk-1", "a", "b"]);
     }
 }
