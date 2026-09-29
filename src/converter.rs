@@ -354,11 +354,14 @@ fn build_group(group: CustomGroup) -> Mapping {
     let mut m = Mapping::new();
     m.insert(Value::from("name"), Value::from(group.name));
     m.insert(Value::from("type"), Value::from(group.group_type));
-    // 在成员列表之前合并分组特有的选项(url、interval…)。
+    // 在成员列表之前合并分组特有的选项(url、interval…)。结构键由分组自身字段决定,选项不得
+    // 覆盖,否则输出会与已校验的名字/类型/成员不一致。
     if let Some(opts) = group.options {
         if let Ok(Value::Mapping(opt_map)) = serde_yaml::to_value(&opts) {
             for (k, v) in opt_map {
-                m.insert(k, v);
+                if !matches!(k.as_str(), Some("name" | "type" | "proxies")) {
+                    m.insert(k, v);
+                }
             }
         }
     }
@@ -815,5 +818,32 @@ rules:
         ];
         let root = out(input("MATCH,G", nodes, vec![group("G", &["a", "b"])]));
         assert_eq!(names_in(root.get("proxies")), vec!["hk-1", "a", "b"]);
+    }
+
+    #[test]
+    fn group_options_cannot_override_structural_keys() {
+        let mut g = group("G", &["hk-1"]);
+        g.options = Some(serde_json::json!({
+            "name": "Hijack",
+            "type": "url-test",
+            "proxies": ["DIRECT"],
+            "url": "http://x/generate_204",
+        }));
+        let root = out(input("MATCH,G", vec![], vec![g]));
+        let out_group = &root.get("proxy-groups").unwrap().as_sequence().unwrap()[0];
+        assert_eq!(out_group.get("name").and_then(Value::as_str), Some("G"));
+        assert_eq!(
+            out_group.get("type").and_then(Value::as_str),
+            Some("select")
+        );
+        assert_eq!(
+            out_group.get("proxies").unwrap().as_sequence().unwrap(),
+            &vec![Value::from("hk-1")]
+        );
+        assert_eq!(
+            out_group.get("url").and_then(Value::as_str),
+            Some("http://x/generate_204"),
+            "其余选项照常合并"
+        );
     }
 }

@@ -480,7 +480,8 @@ CREATE INDEX idx_custom_groups_profile ON custom_groups (profile_id);
 - 是输出 `proxy-groups` 的**唯一来源**（转换器整体替换机场分组，机场原生分组不透传；经
   `import-provider-groups` 落为自定义分组才可编辑入输出）。
 - `members`：有序 JSON 数组，可引用机场节点（透传）/自定义节点/分组；引用有效性在生成时校验，
-  不靠 DB 约束。`options`：类型特有选项 JSON（如 `{"url":"...","interval":300}`）。
+  不靠 DB 约束。`options`：类型特有选项 JSON（如 `{"url":"...","interval":300}`）；生成时忽略其中的
+  `name`/`type`/`proxies`，这三项只由分组自身字段决定。
 
 > **已移除自定义规则集（rule-providers）托管：** `0005` 曾建 `rule_providers` 表，
 > `0006_drop_rule_providers.sql` 用 `DROP TABLE IF EXISTS` 删除（对旧装机幂等）。转换器只透传
