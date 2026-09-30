@@ -52,6 +52,8 @@
 ### 变更
 
 - 「输出预览」的 YAML 区域高度改为跟随浏览器窗口（原固定 440px），长订阅一屏可读更多内容。
+- 后端依赖升级到最新大版本：`sqlx` 0.9、`reqwest` 0.13（显式保留 `native-tls`，不跟随新默认的
+  rustls）、`tower-http` 0.7、`rand` 0.10、`sha2` 0.11、`base64` 0.23。
 - 镜像：构建阶段改用 Rust 1.98、Node 24（CI 前端 job 同步改用 Node 24），运行时改为
   `debian:trixie-slim`（与 Rust 构建镜像同为 Debian 13，避免 glibc 版本不匹配）。
 - CI：GitHub Actions 升级到 Node 24 运行时版本（`checkout` v7、`cache` v6、`setup-node` v7、
@@ -63,7 +65,7 @@
 
 ### 安全
 
-- 
+- `rsa` 已随 `sqlx` 0.9 移出依赖树，删除对应的 `cargo audit` 忽略项 `RUSTSEC-2023-0071`。
 
 ### 文档
 

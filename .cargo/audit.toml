@@ -5,11 +5,8 @@
 # dependency bump.
 [advisories]
 ignore = [
-    # rsa Marvin timing side-channel. Pulled only by sqlx-mysql, which is NOT
-    # enabled (we use sqlx features = ["sqlite", "runtime-tokio"]). `cargo tree
-    # -i rsa` is empty and rsa is never compiled into the binary. No fixed
-    # upgrade is available upstream.
-    "RUSTSEC-2023-0071",
+    # (none) RUSTSEC-2023-0071 (rsa) was ignored until sqlx 0.9 dropped rsa
+    # from Cargo.lock entirely.
 ]
 
 # YAML: the deprecated serde_yaml was replaced by its maintained fork
