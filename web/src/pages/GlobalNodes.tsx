@@ -159,7 +159,7 @@ export default function GlobalNodes() {
         width={680}
         okText={t("common.save")}
         cancelText={t("common.cancel")}
-        destroyOnClose
+        destroyOnHidden
       >
         <NodeForm key={formKey} value={model} onChange={setModel} />
       </Modal>

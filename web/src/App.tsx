@@ -1,5 +1,5 @@
 // 路由表:/login 公开,其余页面统一套 RequireAuth(会话守卫)+ AppLayout(主框架)。
-import { Navigate, Route, Routes } from "react-router-dom";
+import { Navigate, Route, Routes } from "react-router";
 import AppLayout from "./components/AppLayout";
 import RequireAuth from "./components/RequireAuth";
 import Login from "./pages/Login";

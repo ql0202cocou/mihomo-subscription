@@ -227,7 +227,7 @@ export function AdvancedFields({
 
   return (
     <>
-      <Divider orientation="left" plain>
+      <Divider titlePlacement="start" plain>
         {t("fields.advanced")}
       </Divider>
       <Typography.Paragraph type="secondary" style={{ marginTop: -8 }}>

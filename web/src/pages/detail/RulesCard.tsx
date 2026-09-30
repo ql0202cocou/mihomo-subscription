@@ -606,7 +606,7 @@ export default function RulesCard({
         onCancel={closeModal}
         okText={t("common.save")}
         cancelText={t("common.cancel")}
-        destroyOnClose
+        destroyOnHidden
       >
         <RuleComposer
           model={model}
@@ -623,7 +623,7 @@ export default function RulesCard({
         okText={t("common.save")}
         cancelText={t("common.cancel")}
         width={520}
-        destroyOnClose
+        destroyOnHidden
       >
         <p className="rules-import-desc">{t("rules.importHostedDesc")}</p>
         {ruleSets.length === 0 ? (
