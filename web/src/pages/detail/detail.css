@@ -1,0 +1,390 @@
+/* ProfileDetail 页与其 tab 卡片专用样式;跨页面共享的卡片/行样式在 components/cards.css。 */
+
+/* .page 的修饰类:只覆盖与通用页面容器不同的宽度与上下留白(基类见 components/AppLayout.css)。 */
+.page-detail {
+  max-width: 1080px;
+  padding-top: 22px;
+  padding-bottom: 48px;
+}
+
+/* 顶部:返回 + 名称 + 启用 pill + 说明 */
+.detail-back {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 13px;
+  color: var(--text-3);
+  text-decoration: none;
+  cursor: pointer;
+}
+.detail-back:hover {
+  color: var(--primary);
+}
+.detail-head {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin: 12px 0 2px;
+}
+.detail-name {
+  font-size: 22px;
+  font-weight: 650;
+  color: var(--text);
+}
+.pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  height: 22px;
+  padding: 0 9px;
+  border-radius: 6px;
+  font-size: 12px;
+  font-weight: 500;
+  border: 1px solid var(--primary-border);
+  color: var(--primary);
+  background: var(--primary-bg);
+}
+
+/* HERO 托管订阅 */
+.hero {
+  display: flex;
+  gap: 24px;
+  background: var(--bg-container);
+  border: 1px solid var(--border-2);
+  border-radius: 14px;
+  box-shadow: var(--shadow-card);
+  padding: 22px;
+  margin-bottom: 20px;
+}
+.hero-main {
+  flex: 1;
+  min-width: 0;
+}
+.hero-title {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  font-size: 16px;
+  font-weight: 620;
+  color: var(--text);
+}
+.hero-title .anticon {
+  color: var(--primary);
+}
+.hero-desc {
+  font-size: 12.5px;
+  color: var(--text-3);
+  max-width: 480px;
+  margin: 8px 0 14px;
+  line-height: 1.6;
+}
+.hero-url {
+  font-family: var(--font-mono);
+  font-size: 12.5px;
+  color: var(--text-2);
+  background: var(--bg-code);
+  border: 1px solid var(--border-2);
+  border-radius: 9px;
+  padding: 9px 12px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.hero-actions {
+  display: flex;
+  gap: 10px;
+  margin-top: 14px;
+}
+.hero-qr {
+  flex-shrink: 0;
+  border-left: 1px solid var(--border-2);
+  padding-left: 24px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+}
+.hero-qr-frame {
+  background: #fff;
+  padding: 10px;
+  border-radius: 11px;
+  line-height: 0;
+}
+.hero-qr-cap {
+  font-size: 11px;
+  color: var(--text-4);
+}
+
+/* 基础信息键值表 */
+.kv {
+  border: 1px solid var(--border-2);
+  border-radius: 10px;
+  overflow: hidden;
+}
+.kv-row {
+  display: flex;
+  border-bottom: 1px solid var(--border-2);
+}
+.kv-row:last-child {
+  border-bottom: none;
+}
+.kv-key {
+  width: 150px;
+  flex-shrink: 0;
+  background: var(--bg-subtle);
+  border-right: 1px solid var(--border-2);
+  padding: 11px 14px;
+  font-size: 13px;
+  color: var(--text-2);
+}
+.kv-val {
+  flex: 1;
+  min-width: 0;
+  padding: 11px 14px;
+  font-size: 13.5px;
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.kv-val.mono {
+  font-size: 12.5px;
+  color: var(--text-2);
+}
+
+/* detail 卡片内专用行样式;共享行样式在 components/cards.css */
+.row-lock {
+  color: var(--text-4);
+  display: flex;
+  font-size: 14px;
+  width: 15px;
+}
+/* 分组行的名称列:弹性占满剩余宽度,长名省略号截断。 */
+.group-row-name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.group-row-title {
+  font-size: 13.5px;
+  color: var(--text);
+  font-weight: 550;
+}
+/* 禁用图标上叠一道对角斜杠(如 MATCH 不可删除) */
+.icon-slash {
+  position: relative;
+}
+.icon-slash::after {
+  content: "";
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  width: 17px;
+  height: 1.5px;
+  background: currentColor;
+  border-radius: 1px;
+  transform: translate(-50%, -50%) rotate(-45deg);
+}
+
+/* 策略/类型标签 */
+.tag-policy {
+  background: var(--primary-bg);
+  color: var(--primary);
+}
+.tag-type {
+  min-width: 118px;
+  text-align: center;
+}
+.rule-arrow {
+  color: var(--text-4);
+}
+.rule-content {
+  flex: 1;
+  min-width: 0;
+  font-family: var(--font-mono);
+  font-size: 12.5px;
+  color: var(--text-2);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* 规则编辑弹窗(RuleComposer) */
+.composer-label-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 6px;
+}
+.rule-cat-badge {
+  font-size: 11px;
+  padding: 1px 8px;
+  border-radius: 5px;
+  background: var(--fill);
+  color: var(--text-3);
+}
+.composer-hint {
+  display: block;
+  margin-top: 6px;
+  font-size: 11.5px;
+  color: var(--text-4);
+}
+.rule-match-note {
+  font-size: 12.5px;
+  color: var(--text-3);
+  background: var(--bg-subtle);
+  border: 1px solid var(--border-2);
+  border-radius: 8px;
+  padding: 11px 13px;
+  line-height: 1.6;
+}
+
+/* 节点两块分区(机场 / 自定义) */
+.node-section {
+  border: 1px solid var(--border-2);
+  border-radius: 10px;
+  margin-bottom: 10px;
+  overflow: hidden;
+}
+.node-section-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 14px;
+  background: var(--bg-subtle);
+}
+.node-section-title {
+  font-size: 13px;
+  font-weight: 550;
+  color: var(--text);
+}
+.node-section-sub {
+  font-size: 11.5px;
+  color: var(--text-4);
+}
+.node-section-body {
+  padding: 4px 4px;
+}
+
+/* 兜底 MATCH 行 */
+.row-match {
+  background: var(--bg-subtle);
+}
+
+/* 预览 */
+.preview-pre {
+  font-family: var(--font-mono);
+  font-size: 12.5px;
+  background: var(--bg-code);
+  border: 1px solid var(--border-2);
+  border-radius: 9px;
+  padding: 14px;
+  max-height: 440px;
+  overflow: auto;
+  margin: 0;
+  color: var(--text-2);
+  white-space: pre;
+}
+.preview-loading {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  padding: 48px 0;
+  color: var(--text-3);
+}
+
+/* 规则错误 banner */
+.warn-banner {
+  background: var(--warning-bg);
+  border: 1px solid var(--warning-border);
+  color: var(--warning);
+  border-radius: 8px;
+  padding: 10px 12px;
+  font-size: 12.5px;
+  margin-bottom: 12px;
+}
+.warn-banner.error {
+  background: var(--danger-bg);
+  border-color: var(--danger-border);
+  color: var(--danger);
+}
+
+/* 导入托管规则弹窗 */
+.rules-import-desc {
+  font-size: 12.5px;
+  color: var(--text-3);
+  line-height: 1.55;
+  margin: 0 0 14px;
+}
+.rules-import-list {
+  border: 1px solid var(--border-2);
+  border-radius: 10px;
+  overflow: hidden;
+  max-height: 320px;
+  overflow-y: auto;
+}
+.rules-import-item {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 11px 14px;
+  cursor: pointer;
+}
+.rules-import-item + .rules-import-item {
+  border-top: 1px solid var(--border-2);
+}
+.rules-import-item:hover {
+  background: var(--bg-subtle);
+}
+.rules-import-main {
+  flex: 1;
+  min-width: 0;
+}
+.rules-import-name {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13.5px;
+  font-weight: 500;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.rules-import-tag {
+  flex-shrink: 0;
+  font-size: 11px;
+  font-weight: 400;
+  padding: 0 7px;
+  border-radius: 6px;
+  background: var(--primary-bg);
+  color: var(--primary);
+}
+.rules-import-url {
+  font-size: 11.5px;
+  color: var(--text-4);
+  font-family: var(--font-mono);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  margin-top: 2px;
+}
+.rules-import-count {
+  flex-shrink: 0;
+  width: 56px;
+  text-align: right;
+  font-size: 12px;
+  color: var(--text-4);
+  font-family: var(--font-mono);
+}
+.rules-import-policy {
+  margin-top: 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.rules-import-hint {
+  font-size: 11.5px;
+  color: var(--text-4);
+}

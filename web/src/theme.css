@@ -1,0 +1,101 @@
+/* 设计令牌的 CSS 变量层:供自定义样式(侧栏/hero/pill 等 AntD token 管不到的元素)使用。
+ * AntD 组件本身的主题走 ConfigProvider(见 theme.tsx);两边数值保持一致。
+ * data-theme 由 ThemeProvider 设在 <html> 上,亮/暗即时切换。
+ * --info、--bg-elevated 暂无 var() 消费者,保留是为镜像 theme.tsx 的 colorInfo/colorBgElevated。 */
+
+:root,
+:root[data-theme="light"] {
+  --primary: #d97757;
+  --primary-bg: #fbf1ec;
+  --primary-bg-2: #f6e3d9;
+  --primary-border: #ebc3b0;
+
+  --success: #3f9e63;
+  --warning: #d9a036;
+  --warning-bg: #fbf3e3;
+  --warning-border: #efd8a8;
+  --danger: #d9534f;
+  --danger-bg: #fbeeed;
+  --danger-border: #eec4c2;
+  --info: #4c6ef5;
+
+  --bg-layout: #f4f5f7;
+  --bg-container: #ffffff;
+  --bg-elevated: #ffffff;
+  --bg-sider: #ffffff;
+  --bg-subtle: #fafafa;
+  --bg-code: #f6f6f4;
+  --fill: #f0f0f0;
+  --fill-hover: #f5f5f5;
+  --border: #e6e6e6;
+  --border-2: #f0f0f0;
+
+  --text: rgba(0, 0, 0, 0.88);
+  --text-2: rgba(0, 0, 0, 0.62);
+  --text-3: rgba(0, 0, 0, 0.42);
+  --text-4: rgba(0, 0, 0, 0.28);
+
+  --shadow-card: 0 1px 2px 0 rgba(0, 0, 0, 0.03), 0 1px 6px -1px rgba(0, 0, 0, 0.02),
+    0 2px 4px 0 rgba(0, 0, 0, 0.02);
+  --shadow-pop: 0 6px 16px 0 rgba(0, 0, 0, 0.08), 0 3px 6px -4px rgba(0, 0, 0, 0.12),
+    0 9px 28px 8px rgba(0, 0, 0, 0.05);
+}
+
+:root[data-theme="dark"] {
+  --primary: #e08c70;
+  --primary-bg: #2c211c;
+  --primary-bg-2: #3a2a22;
+  --primary-border: #5a4036;
+
+  --success: #5bbe82;
+  --warning: #e0b24e;
+  --warning-bg: #2c2519;
+  --warning-border: #5c4d2a;
+  --danger: #e07370;
+  --danger-bg: #2c1e1d;
+  --danger-border: #5c3936;
+  --info: #6b85f0;
+
+  --bg-layout: #121316;
+  --bg-container: #1b1c1f;
+  --bg-elevated: #232427;
+  --bg-sider: #18191c;
+  --bg-subtle: #202125;
+  --bg-code: #0f1012;
+  --fill: #2a2b2f;
+  --fill-hover: #303135;
+  --border: #303236;
+  --border-2: #26282c;
+
+  --text: rgba(255, 255, 255, 0.88);
+  --text-2: rgba(255, 255, 255, 0.6);
+  --text-3: rgba(255, 255, 255, 0.4);
+  --text-4: rgba(255, 255, 255, 0.26);
+
+  --shadow-card: 0 1px 2px 0 rgba(0, 0, 0, 0.4);
+  --shadow-pop: 0 6px 16px 0 rgba(0, 0, 0, 0.5), 0 9px 28px 8px rgba(0, 0, 0, 0.35);
+}
+
+:root {
+  --font-sans: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Hiragino Sans GB",
+    "Microsoft YaHei", Roboto, Helvetica, Arial, sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+
+* {
+  box-sizing: border-box;
+}
+html,
+body,
+#root {
+  height: 100%;
+}
+body {
+  margin: 0;
+  font-family: var(--font-sans);
+  background: var(--bg-layout);
+  color: var(--text);
+}
+.mono {
+  font-family: var(--font-mono);
+}

@@ -1,0 +1,38 @@
+/* 窄屏降级(桌面优先,但 <=880px 仍可用)。侧栏收 64px 见 AppLayout.css。 */
+@media (max-width: 880px) {
+  .page {
+    padding-left: 16px;
+    padding-right: 16px;
+  }
+
+  /* 指标条:三列 → 单列 */
+  .metrics {
+    grid-template-columns: 1fr;
+  }
+
+  /* 配置横条:动作换行到下方 */
+  .profile-bar {
+    flex-wrap: wrap;
+    gap: 12px;
+  }
+  .profile-actions {
+    width: 100%;
+  }
+
+  /* 详情 hero:左右并排 → 上下堆叠,二维码移到下方 */
+  .hero {
+    flex-direction: column;
+  }
+  .hero-qr {
+    border-left: none;
+    border-top: 1px solid var(--border-2);
+    padding-left: 0;
+    padding-top: 16px;
+    align-items: flex-start;
+  }
+
+  /* 基础信息键值表:窄屏缩短表头列 */
+  .kv-key {
+    width: 104px;
+  }
+}

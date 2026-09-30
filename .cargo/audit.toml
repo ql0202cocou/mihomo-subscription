@@ -1,0 +1,18 @@
+# cargo-audit configuration. See: https://github.com/rustsec/rustsec/tree/main/cargo-audit
+#
+# Each ignored advisory below has been individually assessed as not reachable in
+# this crate's actual (sqlite-only, native-tls) build. Re-evaluate on every
+# dependency bump.
+[advisories]
+ignore = [
+    # rsa Marvin timing side-channel. Pulled only by sqlx-mysql, which is NOT
+    # enabled (we use sqlx features = ["sqlite", "runtime-tokio"]). `cargo tree
+    # -i rsa` is empty and rsa is never compiled into the binary. No fixed
+    # upgrade is available upstream.
+    "RUSTSEC-2023-0071",
+]
+
+# YAML: the deprecated serde_yaml was replaced by its maintained fork
+# serde_norway (renamed back to `serde_yaml` in Cargo.toml), which also drops
+# the archived unsafe-libyaml in favour of unsafe-libyaml-norway.
+# RUSTSEC-2025-0068 covers the different `serde_yml` crate and does not apply.

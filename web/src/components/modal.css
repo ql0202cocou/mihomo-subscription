@@ -1,0 +1,44 @@
+/* 结构化表单弹窗:类型 chip 行 + 带标题的子区块。 */
+.type-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-bottom: 8px;
+}
+.type-chip {
+  padding: 4px 11px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: var(--bg-container);
+  color: var(--text-2);
+  font-size: 12.5px;
+  font-family: var(--font-mono);
+  cursor: pointer;
+  transition: border-color 0.12s, color 0.12s, background 0.12s;
+}
+.type-chip:hover {
+  border-color: var(--primary);
+  color: var(--primary);
+}
+.type-chip.active {
+  background: var(--primary-bg);
+  border-color: var(--primary-border);
+  color: var(--primary);
+  font-weight: 550;
+}
+
+.modal-block {
+  background: var(--bg-subtle);
+  border: 1px solid var(--border-2);
+  border-radius: 10px;
+  padding: 12px 14px;
+  margin-bottom: 12px;
+}
+.modal-block-title {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-3);
+  font-weight: 600;
+  margin-bottom: 8px;
+}
