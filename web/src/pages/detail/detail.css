@@ -280,7 +280,8 @@
   border: 1px solid var(--border-2);
   border-radius: 9px;
   padding: 14px;
-  max-height: 440px;
+  /* 高度跟随视口:160px ≈ 顶栏 60 + 卡片内边距/标题栏,滚到卡片顶部时整块恰好一屏;矮窗口不低于原 440px。 */
+  max-height: max(440px, calc(100vh - 160px));
   overflow: auto;
   margin: 0;
   color: var(--text-2);
