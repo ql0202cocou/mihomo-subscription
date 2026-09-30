@@ -87,7 +87,7 @@ compose 的 `environment:` 与代码必须一致。
 ### 版本规则
 
 - 语义化版本 `MAJOR.MINOR.PATCH`；`0.x` 允许破坏性变更，但每项须记入 changelog。
-- 镜像 tag、`Cargo.toml`、`web/package.json`（及其锁文件）保持一致。
+- 镜像 tag、`Cargo.toml`、`web/package.json`、`web/package-lock.json` 四处保持一致。
 
 ### 发布前检查
 

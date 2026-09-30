@@ -63,7 +63,10 @@
 
 ### 文档
 
-- 
+- 更正 `AGENTS.md` 与实现不符处（SQLite 迁移优先原生 `ALTER TABLE`、`public_gate` 先比前缀再查
+  token、登录端点同样受 Origin/请求体上限约束），版本一致性清单把 `web/package-lock.json` 列为
+  独立一项（`deploy.md` 同步）；补充 `net.rs`/`rate_limit.rs`、CI docker 冒烟 job、ESLint 最小
+  配置的说明。
 
 ## [0.6.0] - 2026-09-30
 
