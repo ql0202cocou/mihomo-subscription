@@ -215,7 +215,7 @@ export default function RuleSets() {
         width={600}
         okText={t("common.save")}
         cancelText={t("common.cancel")}
-        destroyOnClose
+        destroyOnHidden
       >
         <div className="rs-form">
           <label className="rs-label">{t("ruleSets.name")}</label>
