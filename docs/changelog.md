@@ -52,6 +52,14 @@
 ### 变更
 
 - 「输出预览」的 YAML 区域高度改为跟随浏览器窗口（原固定 440px），长订阅一屏可读更多内容。
+- 后端依赖升级到最新大版本：`sqlx` 0.9、`reqwest` 0.13（显式保留 `native-tls`，不跟随新默认的
+  rustls）、`tower-http` 0.7、`rand` 0.10、`sha2` 0.11、`base64` 0.23。
+- 前端依赖升级到最新大版本：React 19、antd 6、`react-router` 8（取代已移除的 `react-router-dom`）、
+  i18next 26 / react-i18next 17、TypeScript 6.0（typescript-eslint 尚不支持 7）；本地构建需 Node `>=22.22.0`。
+- 镜像：构建阶段改用 Rust 1.98、Node 24（CI 前端 job 同步改用 Node 24），运行时改为
+  `debian:trixie-slim`（与 Rust 构建镜像同为 Debian 13，避免 glibc 版本不匹配）。
+- CI：GitHub Actions 升级到 Node 24 运行时版本（`checkout` v7、`cache` v6、`setup-node` v7、
+  `setup-buildx-action` v4、`build-push-action` v7），消除 Node 20 弃用告警。
 
 ### 修复
 
@@ -59,7 +67,8 @@
 
 ### 安全
 
-- 
+- `rsa` 已随 `sqlx` 0.9 移出依赖树，删除对应的 `cargo audit` 忽略项 `RUSTSEC-2023-0071`。
+- 修复前端间接依赖 `browserslist`、`brace-expansion` 的 high 级漏洞。
 
 ### 文档
 

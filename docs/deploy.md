@@ -96,7 +96,7 @@ cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test
 ( cd web && npm ci && npm run build )
 ```
 
-前端检查需 Node `^20.19.0 || >=22.12.0`；CI 与 Docker 构建阶段使用 Node 22。
+前端检查需 Node `>=22.22.0`；CI 与 Docker 构建阶段使用 Node 24。
 
 人工确认：`changelog.md` 的 `[Unreleased]` 已含本次全部变更；受影响文档已对齐；版本号在各处一致。
 

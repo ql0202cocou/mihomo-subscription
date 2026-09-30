@@ -94,7 +94,7 @@ https://<host>/<public-path-prefix>/api/sub/<profile-token>
 [.github/workflows/ci.yml](.github/workflows/ci.yml)，发布与变更规则见
 [docs/deploy.md](docs/deploy.md)。
 
-前端本地构建需 Node `^20.19.0 || >=22.12.0`;CI 与 Docker 镜像构建使用 Node 22。
+前端本地构建需 Node `>=22.22.0`;CI 与 Docker 镜像构建使用 Node 24。
 
 ## 许可证
 

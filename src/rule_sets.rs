@@ -15,7 +15,7 @@ use axum::{
     Json,
 };
 use serde::{Deserialize, Serialize};
-use sqlx::FromRow;
+use sqlx::{AssertSqlSafe, FromRow};
 
 use crate::app::AppState;
 use crate::error::{ApiError, ApiResult};
@@ -62,6 +62,7 @@ pub struct RuleSetResponse {
     updated_at: String,
 }
 
+// 列名常量,仅经 `AssertSqlSafe(format!(..))` 拼入 SQL,不含外部输入。
 const META_COLS: &str = "id, name, behavior, format, source, content, rule_count, url, \
      interval_hours, cache, enabled, created_at, updated_at";
 
@@ -87,19 +88,21 @@ fn rule_set_response(row: RuleSetRow) -> RuleSetResponse {
 // ─── CRUD ──────────────────────────────────────────────────────────────────────
 
 async fn fetch_all(state: &AppState) -> ApiResult<Vec<RuleSetRow>> {
-    Ok(sqlx::query_as::<_, RuleSetRow>(&format!(
+    Ok(sqlx::query_as::<_, RuleSetRow>(AssertSqlSafe(format!(
         "SELECT {META_COLS} FROM rule_sets ORDER BY position ASC, name ASC"
-    ))
+    )))
     .fetch_all(&state.db)
     .await?)
 }
 
 async fn fetch_one(state: &AppState, id: &str) -> ApiResult<RuleSetRow> {
-    sqlx::query_as::<_, RuleSetRow>(&format!("SELECT {META_COLS} FROM rule_sets WHERE id = ?"))
-        .bind(id)
-        .fetch_optional(&state.db)
-        .await?
-        .ok_or(ApiError::NotFound)
+    sqlx::query_as::<_, RuleSetRow>(AssertSqlSafe(format!(
+        "SELECT {META_COLS} FROM rule_sets WHERE id = ?"
+    )))
+    .bind(id)
+    .fetch_optional(&state.db)
+    .await?
+    .ok_or(ApiError::NotFound)
 }
 
 /// `GET /api/rule-sets` —— 按库内顺序列出全部规则集。

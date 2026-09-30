@@ -15,17 +15,18 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # serde_yaml 上游已弃用;serde_norway 是其维护中的分支(API 与输出一致),沿用 `serde_yaml` 名以免改源码。
 serde_yaml = { package = "serde_norway", version = "0.9" }
-tower-http = { version = "0.6", features = ["fs", "trace"] }
+tower-http = { version = "0.7", features = ["fs", "trace"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1", features = ["v4"] }
 chrono = { version = "0.4", features = ["serde"] }
-sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite", "macros", "migrate"] }
-reqwest = { version = "0.12", features = ["json"] }
-base64 = "0.22"
+sqlx = { version = "0.9", features = ["runtime-tokio", "sqlite", "macros", "migrate"] }
+# 0.13 起默认 TLS 改为 rustls + aws-lc;显式保留 native-tls(系统 OpenSSL),行为与 0.12 一致。
+reqwest = { version = "0.13", default-features = false, features = ["native-tls", "charset", "http2", "json"] }
+base64 = "0.23"
 url = "2"
-rand = "0.9"
-sha2 = "0.10"
+rand = "0.10"
+sha2 = "0.11"
 subtle = "2.5"
 ipnet = "2"
 async-trait = "0.1"
