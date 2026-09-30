@@ -52,6 +52,8 @@
 ### 变更
 
 - 「输出预览」的 YAML 区域高度改为跟随浏览器窗口（原固定 440px），长订阅一屏可读更多内容。
+- CI：GitHub Actions 升级到 Node 24 运行时版本（`checkout` v7、`cache` v6、`setup-node` v7、
+  `setup-buildx-action` v4、`build-push-action` v7），消除 Node 20 弃用告警。
 
 ### 修复
 
