@@ -1,0 +1,20 @@
+.env
+target/
+*.db
+
+# Local-only AI assistant project guides (kept out of version control by request).
+CLAUDE.md
+AGENTS.md
+
+# Local-only IDE / editor configurations.
+.claude/
+
+# Local-only scratch / audit notes (not for the public repo).
+plan-*.md
+
+# Local design references (redesign brief + HTML prototypes) — not for the public repo.
+Design/
+web-redesign-brief.md
+
+# macOS junk
+.DS_Store

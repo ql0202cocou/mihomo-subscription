@@ -1,0 +1,11 @@
+-- Order of the two node blocks in the output `proxies`.
+--
+-- JSON 2-element array over "provider" / "custom". NULL means the default
+-- ["provider","custom"] (provider block first). The output proxies are the
+-- provider block (upstream order, not user-orderable) and the custom block
+-- (ordered by `node_order`) concatenated in this section order.
+--
+-- Note: as of this migration `node_order` means the CUSTOM node order only
+-- (the provider block's internal order is always upstream); it no longer holds
+-- provider proxy names.
+ALTER TABLE profiles ADD COLUMN node_section_order TEXT;

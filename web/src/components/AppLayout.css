@@ -1,0 +1,227 @@
+/* 左侧栏 App Shell。颜色全走 theme.css 的 CSS 变量,亮/暗即时切换。
+ * 窄屏(<=880px)侧栏收为 64px:隐藏文字、图标居中。 */
+
+.app-shell {
+  display: flex;
+  height: 100vh;
+  overflow: hidden;
+}
+
+/* ── 侧栏 ── */
+.sidebar {
+  width: 236px;
+  flex-shrink: 0;
+  background: var(--bg-sider);
+  border-right: 1px solid var(--border-2);
+  display: flex;
+  flex-direction: column;
+}
+
+.brand {
+  height: 60px;
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 0 16px;
+  border-bottom: 1px solid var(--border-2);
+}
+.brand-tile {
+  width: 34px;
+  height: 34px;
+  border-radius: 10px;
+  background: var(--primary);
+  color: #fff;
+  display: grid;
+  place-items: center;
+  flex-shrink: 0;
+  font-size: 18px;
+}
+.brand-text {
+  display: flex;
+  flex-direction: column;
+  line-height: 1.25;
+  min-width: 0;
+}
+.brand-title {
+  font-size: 15px;
+  font-weight: 650;
+  color: var(--text);
+}
+.brand-sub {
+  font-size: 11px;
+  color: var(--text-3);
+}
+
+.nav {
+  flex: 1;
+  padding: 14px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  overflow-y: auto;
+}
+.nav-item {
+  height: 40px;
+  padding: 0 12px;
+  border-radius: 9px;
+  display: flex;
+  align-items: center;
+  gap: 11px;
+  font-size: 14px;
+  color: var(--text-2);
+  font-weight: 450;
+  text-decoration: none;
+  cursor: pointer;
+  transition: background 0.15s, color 0.15s;
+}
+.nav-item:hover {
+  background: var(--fill-hover);
+}
+.nav-item.active {
+  color: var(--primary);
+  background: var(--primary-bg);
+  font-weight: 600;
+}
+.nav-icon {
+  font-size: 17px;
+  display: flex;
+  flex-shrink: 0;
+}
+
+.account {
+  flex-shrink: 0;
+  border-top: 1px solid var(--border-2);
+  padding: 12px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.account-avatar {
+  width: 32px;
+  height: 32px;
+  border-radius: 50%;
+  background: var(--primary-bg-2);
+  color: var(--primary);
+  display: grid;
+  place-items: center;
+  font-weight: 600;
+  flex-shrink: 0;
+}
+.account-info {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  line-height: 1.25;
+}
+.account-name {
+  font-size: 13px;
+  font-weight: 550;
+  color: var(--text);
+}
+.account-role {
+  font-size: 11px;
+  color: var(--text-3);
+}
+.account-logout {
+  border: none;
+  background: none;
+  color: var(--text-3);
+  cursor: pointer;
+  padding: 6px;
+  border-radius: 6px;
+  display: flex;
+  font-size: 16px;
+  transition: background 0.15s, color 0.15s;
+}
+.account-logout:hover {
+  color: var(--danger);
+  background: var(--fill-hover);
+}
+
+/* ── 主列 ── */
+.main {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  background: var(--bg-layout);
+}
+.header {
+  height: 60px;
+  flex-shrink: 0;
+  border-bottom: 1px solid var(--border-2);
+  background: var(--bg-container);
+  padding: 0 24px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+}
+.header-title {
+  font-size: 15.5px;
+  font-weight: 650;
+  color: var(--text);
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.theme-toggle {
+  height: 34px;
+  padding: 0 12px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: var(--bg-container);
+  color: var(--text-2);
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  cursor: pointer;
+  font-size: 13px;
+  transition: border-color 0.15s, color 0.15s;
+}
+.theme-toggle:hover {
+  border-color: var(--primary);
+  color: var(--primary);
+}
+.content {
+  flex: 1;
+  overflow-y: auto;
+  overflow-x: hidden;
+}
+
+/* 页面顶层容器:各路由页面的最外层 div 统一用 .page,差异值由页面自己的修饰类覆盖
+   (见 detail.css 的 .page-detail);窄屏 gutter 见 responsive.css。 */
+.page {
+  max-width: 1180px;
+  margin: 0 auto;
+  padding: 26px 28px 40px;
+}
+
+@media (max-width: 880px) {
+  .sidebar {
+    width: 64px;
+  }
+  .brand {
+    padding: 0;
+    justify-content: center;
+  }
+  .brand-text {
+    display: none;
+  }
+  .nav-item {
+    justify-content: center;
+    padding: 0;
+  }
+  .nav-label {
+    display: none;
+  }
+  .account {
+    justify-content: center;
+    padding: 12px 0;
+  }
+  .account-info {
+    display: none;
+  }
+}

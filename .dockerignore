@@ -1,0 +1,10 @@
+target
+.git
+.agents
+.codex
+apps
+.DS_Store
+web/node_modules
+web/dist
+.github
+docs

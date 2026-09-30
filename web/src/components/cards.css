@@ -1,0 +1,137 @@
+/* 跨页面共享的卡片/行样式:ProfileDetail 各 tab、RuleSets、GlobalNodes 等列表页共用。
+   ProfileDetail 页专用样式在 pages/detail/detail.css。 */
+
+.detail-context {
+  font-size: 12.5px;
+  color: var(--text-3);
+  margin-bottom: 18px;
+}
+
+/* 卡片(详情 tab 与列表页共用的内容容器) */
+.dcard {
+  background: var(--bg-container);
+  border: 1px solid var(--border-2);
+  border-radius: 12px;
+  box-shadow: var(--shadow-card);
+  padding: 18px 20px;
+}
+.dcard-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 14px;
+}
+.dcard-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 14.5px;
+  font-weight: 600;
+  color: var(--text);
+}
+.dcard-title .lock {
+  color: var(--text-3);
+  font-size: 13px;
+}
+.dcard-actions {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+.dcard-note {
+  font-size: 12px;
+  color: var(--text-4);
+  margin-top: 10px;
+}
+
+/* 行(节点/分组/规则共用列节奏) */
+.row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 11px 14px;
+  border-radius: 8px;
+}
+.row:hover {
+  background: var(--bg-subtle);
+}
+.row + .row {
+  border-top: 1px solid var(--border-2);
+}
+.row-grab {
+  color: var(--text-4);
+  cursor: grab;
+  user-select: none;
+  touch-action: none;
+  display: flex;
+  font-size: 15px;
+}
+.row-name {
+  flex: 1;
+  min-width: 0;
+  font-size: 13.5px;
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.row-sub {
+  font-size: 11.5px;
+  color: var(--text-4);
+  margin-left: 6px;
+}
+.row-actions {
+  flex-shrink: 0;
+  display: flex;
+  gap: 6px;
+}
+.icon-btn {
+  border: none;
+  background: none;
+  color: var(--text-3);
+  cursor: pointer;
+  padding: 4px 6px;
+  border-radius: 6px;
+  display: inline-flex;
+  font-size: 14px;
+}
+.icon-btn:hover {
+  color: var(--primary);
+  background: var(--fill-hover);
+}
+.icon-btn.danger:hover {
+  color: var(--danger);
+}
+.icon-btn:disabled {
+  color: var(--text-4);
+  cursor: not-allowed;
+}
+.icon-btn:disabled:hover {
+  color: var(--text-4);
+  background: none;
+}
+
+/* 标签 */
+.tag-mono {
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  padding: 2px 8px;
+  border-radius: 6px;
+  background: var(--fill);
+  color: var(--text-2);
+  white-space: nowrap;
+}
+.tag-proto {
+  flex-shrink: 0;
+}
+.tag-proto.custom {
+  background: var(--primary-bg);
+  color: var(--primary);
+}
+.empty-line {
+  text-align: center;
+  padding: 28px 0;
+  color: var(--text-3);
+  font-size: 13px;
+}

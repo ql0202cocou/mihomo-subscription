@@ -1,0 +1,109 @@
+/* 规则托管(全局规则集库)页:列表行 + 弹窗。复用 components/cards.css 的 .dcard /
+   .row-grab / .icon-btn / .tag-mono 等基类,这里只补规则集特有的两行卡片与表单。 */
+
+.rs-row {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 14px 14px;
+  border-radius: 8px;
+}
+.rs-row:hover {
+  background: var(--bg-subtle);
+}
+.rs-row + .rs-row {
+  border-top: 1px solid var(--border-2);
+}
+.rs-main {
+  flex: 1;
+  min-width: 0;
+}
+.rs-line1 {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  min-width: 0;
+}
+.rs-name {
+  font-size: 15px;
+  font-weight: 600;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.rs-count {
+  flex-shrink: 0;
+  font-size: 12px;
+  color: var(--text-4);
+  font-family: var(--font-mono);
+}
+.rs-line2 {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 5px;
+  min-width: 0;
+  color: var(--text-4);
+  font-size: 12px;
+}
+.rs-url {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--text-3);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* 弹窗表单 */
+.rs-form {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+.rs-label {
+  display: block;
+  margin-bottom: 6px;
+  font-size: 13px;
+  color: var(--text-2);
+}
+.rs-grid2 {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 14px;
+}
+.rs-section {
+  background: var(--bg-subtle);
+  border: 1px solid var(--border-2);
+  border-radius: 10px;
+  padding: 14px;
+}
+.rs-section-title {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-3);
+  margin-bottom: 10px;
+}
+.rs-hint {
+  font-size: 11.5px;
+  color: var(--text-4);
+  line-height: 1.5;
+  margin-top: 8px;
+}
+
+/* 远程来源:间隔 + 缓存开关 */
+.rs-remote-row {
+  display: flex;
+  align-items: flex-end;
+  gap: 28px;
+  margin-top: 12px;
+}
+.rs-cache {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 13px;
+  color: var(--text-2);
+  padding-bottom: 4px;
+}
