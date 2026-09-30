@@ -18,7 +18,7 @@ use axum::{
     Json,
 };
 use serde::{Deserialize, Serialize};
-use sqlx::FromRow;
+use sqlx::{AssertSqlSafe, FromRow};
 
 use crate::app::AppState;
 use crate::error::{ApiError, ApiResult};
@@ -48,6 +48,7 @@ struct RuleSetRow {
     updated_at: String,
 }
 
+// 列名常量,仅经 `AssertSqlSafe(format!(..))` 拼入 SQL,不含外部输入。
 const META_COLS: &str = "id, name, behavior, format, source, content, rule_count, url, \
      interval_hours, cache, last_fetch_status, enabled, created_at, updated_at";
 
@@ -103,9 +104,9 @@ async fn profile_token(state: &AppState, profile_id: &str) -> ApiResult<String> 
 }
 
 async fn fetch_one(state: &AppState, profile_id: &str, id: &str) -> ApiResult<RuleSetRow> {
-    sqlx::query_as::<_, RuleSetRow>(&format!(
+    sqlx::query_as::<_, RuleSetRow>(AssertSqlSafe(format!(
         "SELECT {META_COLS} FROM profile_rule_sets WHERE id = ? AND profile_id = ?"
-    ))
+    )))
     .bind(id)
     .bind(profile_id)
     .fetch_optional(&state.db)
@@ -121,9 +122,9 @@ pub async fn list(
     Path(profile_id): Path<String>,
 ) -> ApiResult<impl IntoResponse> {
     let token = profile_token(&state, &profile_id).await?;
-    let rows = sqlx::query_as::<_, RuleSetRow>(&format!(
+    let rows = sqlx::query_as::<_, RuleSetRow>(AssertSqlSafe(format!(
         "SELECT {META_COLS} FROM profile_rule_sets WHERE profile_id = ? ORDER BY name ASC"
-    ))
+    )))
     .bind(&profile_id)
     .fetch_all(&state.db)
     .await?;
@@ -382,6 +383,7 @@ struct ServeRow {
     cached_at: Option<String>,
 }
 
+// 列名常量,仅经 `AssertSqlSafe(format!(..))` 拼入 SQL,不含外部输入。
 const SERVE_COLS: &str =
     "id, behavior, format, source, content, url, interval_hours, cache, cached_body, cached_at";
 
@@ -428,9 +430,9 @@ async fn fetch_serve_by_name(
     profile_id: &str,
     name: &str,
 ) -> ApiResult<Option<ServeRow>> {
-    Ok(sqlx::query_as::<_, ServeRow>(&format!(
+    Ok(sqlx::query_as::<_, ServeRow>(AssertSqlSafe(format!(
         "SELECT {SERVE_COLS} FROM profile_rule_sets WHERE profile_id = ? AND name = ? AND enabled = 1"
-    ))
+    )))
     .bind(profile_id)
     .bind(name)
     .fetch_optional(&state.db)
@@ -438,9 +440,9 @@ async fn fetch_serve_by_name(
 }
 
 async fn fetch_serve_by_id(state: &AppState, id: &str) -> ApiResult<Option<ServeRow>> {
-    Ok(sqlx::query_as::<_, ServeRow>(&format!(
+    Ok(sqlx::query_as::<_, ServeRow>(AssertSqlSafe(format!(
         "SELECT {SERVE_COLS} FROM profile_rule_sets WHERE id = ?"
-    ))
+    )))
     .bind(id)
     .fetch_optional(&state.db)
     .await?)

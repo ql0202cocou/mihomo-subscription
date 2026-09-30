@@ -3,7 +3,7 @@
 use std::time::Duration;
 
 use base64::Engine;
-use rand::RngCore;
+use rand::Rng;
 
 /// 排序请求的上界(条目数 / 名字字节数),所有排序端点(per-profile、全局节点、规则库)共享,
 /// 使持久化的顺序保持得小、请求校验便宜。现实中条目数远低于此。
