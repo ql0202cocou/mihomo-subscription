@@ -1,5 +1,5 @@
 import { useState, type FormEvent } from "react";
-import { useLocation, useNavigate, type Location } from "react-router-dom";
+import { useLocation, useNavigate, type Location } from "react-router";
 import { Button, Input } from "antd";
 import { DeploymentUnitOutlined, ExclamationCircleFilled } from "@ant-design/icons";
 import { useTranslation } from "react-i18next";

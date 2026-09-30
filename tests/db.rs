@@ -57,7 +57,8 @@ async fn seed_profile_with_children(pool: &SqlitePool, profile_id: &str) {
 
 async fn count(pool: &SqlitePool, table: &str, profile_id: &str) -> i64 {
     let sql = format!("SELECT COUNT(*) FROM {table} WHERE profile_id = ?");
-    sqlx::query_scalar::<_, i64>(&sql)
+    // table 只来自测试里写死的表名。
+    sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(sql))
         .bind(profile_id)
         .fetch_one(pool)
         .await

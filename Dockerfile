@@ -1,5 +1,5 @@
 # ─── Web Build Stage ────────────────────────────────────────────────────────
-FROM node:22-slim AS web
+FROM node:24-slim AS web
 
 WORKDIR /web
 
@@ -11,7 +11,7 @@ COPY web/ ./
 RUN npm run build
 
 # ─── Rust Build Stage ───────────────────────────────────────────────────────
-FROM rust:1.90-slim AS builder
+FROM rust:1.98-slim-trixie AS builder
 
 WORKDIR /app
 
@@ -29,7 +29,7 @@ COPY migrations ./migrations
 RUN touch src/main.rs && cargo build --release
 
 # ─── Runtime Stage ────────────────────────────────────────────────────────────
-FROM debian:bookworm-slim
+FROM debian:trixie-slim
 
 WORKDIR /app
 

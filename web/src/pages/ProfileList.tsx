@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { Link } from "react-router-dom";
+import { Link } from "react-router";
 import { App as AntdApp, Button, Form, Input, Modal } from "antd";
 import { CopyOutlined, PlusOutlined, RightOutlined } from "@ant-design/icons";
 import { useTranslation } from "react-i18next";
@@ -121,7 +121,7 @@ export default function ProfileList() {
         onOk={() => form.submit()}
         okText={t("common.create")}
         cancelText={t("common.cancel")}
-        destroyOnClose
+        destroyOnHidden
       >
         <Form form={form} layout="vertical" onFinish={onCreate}>
           <Form.Item name="name" label={t("profiles.name")} rules={[{ required: true }]}>

@@ -303,7 +303,7 @@ export default function GroupsCard({
         width={560}
         okText={t("common.save")}
         cancelText={t("common.cancel")}
-        destroyOnClose
+        destroyOnHidden
       >
         <Form layout="vertical">
           <Form.Item label={t("groups.name")} required>
