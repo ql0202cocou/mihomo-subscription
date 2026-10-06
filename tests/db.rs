@@ -123,3 +123,53 @@ async fn ensure_public_path_prefix_is_idempotent() {
         .unwrap();
     assert_eq!(second, "seeded-prefix");
 }
+
+#[tokio::test]
+async fn refresh_migration_preserves_existing_profiles_and_mirror_cache() {
+    let temp = TempDb::new();
+    let pool = SqlitePool::connect_with(db::connect_options(&temp.path))
+        .await
+        .unwrap();
+    let migrations = sqlx::migrate!("./migrations");
+    let old = sqlx::migrate::Migrator::with_migrations(
+        migrations
+            .iter()
+            .filter(|m| m.version <= 12)
+            .cloned()
+            .collect(),
+    );
+    old.run(&pool).await.unwrap();
+    seed_profile_with_children(&pool, "profile").await;
+    sqlx::query(
+        "INSERT INTO profile_rule_sets (id, profile_id, name, behavior, format, source, url, \
+         cached_body, cached_at, last_fetch_status, created_at, updated_at) \
+         VALUES ('mirror', 'profile', 'ads', 'domain', 'text', 'remote', \
+         'https://provider.example/rules', ?, '2026-10-05T00:00:00Z', 'success', 'now', 'now')",
+    )
+    .bind(b"+.example.org\n".as_slice())
+    .execute(&pool)
+    .await
+    .unwrap();
+    pool.close().await;
+
+    let upgraded = db::init(&temp.path).await.unwrap();
+    let profile: (String, Option<String>) =
+        sqlx::query_as("SELECT token, public_refresh_at FROM profiles WHERE id = 'profile'")
+            .fetch_one(&upgraded)
+            .await
+            .unwrap();
+    assert_eq!(profile, ("tok".into(), None));
+    let mirror: (Vec<u8>, i64, Option<String>, String) = sqlx::query_as(
+        "SELECT cached_body, revision, last_fetch_at, last_fetch_status FROM profile_rule_sets WHERE id = 'mirror'",
+    ).fetch_one(&upgraded).await.unwrap();
+    assert_eq!(
+        mirror,
+        (b"+.example.org\n".to_vec(), 0, None, "success".into())
+    );
+    assert_eq!(count(&upgraded, "generated_cache", "profile").await, 1);
+    sqlx::query("DELETE FROM profiles WHERE id = 'profile'")
+        .execute(&upgraded)
+        .await
+        .unwrap();
+    assert_eq!(count(&upgraded, "profile_rule_sets", "profile").await, 0);
+}

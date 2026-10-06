@@ -27,9 +27,14 @@ import "../components/cards.css";
 import "./detail/detail.css";
 
 export default function ProfileDetail() {
+  const { id } = useParams<{ id: string }>();
+  // 详情之间的 SPA 导航必须同步卸载旧表单/预览及本地状态,不可等新请求完成后再换目标。
+  return id ? <ProfileDetailContent key={id} id={id} /> : null;
+}
+
+function ProfileDetailContent({ id }: { id: string }) {
   const { t } = useTranslation();
   const { message } = AntdApp.useApp();
-  const { id } = useParams<{ id: string }>();
   const [detail, setDetail] = useState<Detail | null>(null);
   const [loadFailed, setLoadFailed] = useState(false);
   const [generating, setGenerating] = useState(false);
@@ -38,15 +43,19 @@ export default function ProfileDetail() {
 
   // 并发 reload 可能乱序返回:只采用最后一次发起的结果,避免旧 detail 覆盖新的。
   const reloadSeq = useRef(0);
+  const mounted = useRef(false);
   const reload = useCallback(async () => {
-    if (!id) return;
+    if (!mounted.current) return;
     const seq = ++reloadSeq.current;
     try {
       const next = await api<Detail>(`/api/profiles/${id}`);
-      if (seq === reloadSeq.current) setDetail(next);
+      if (mounted.current && seq === reloadSeq.current) {
+        setDetail(next);
+        setLoadFailed(false);
+      }
     } catch {
       // 首屏失败给错误占位(而非白页);已有内容时保留当前页面。
-      if (seq === reloadSeq.current) setLoadFailed(true);
+      if (mounted.current && seq === reloadSeq.current) setLoadFailed(true);
     }
   }, [id]);
 
@@ -57,7 +66,11 @@ export default function ProfileDetail() {
   }, []);
 
   useEffect(() => {
+    mounted.current = true;
     void reload();
+    return () => {
+      mounted.current = false;
+    };
   }, [reload]);
 
   if (!detail) {
@@ -69,7 +82,6 @@ export default function ProfileDetail() {
   }
 
   async function generate() {
-    if (!id) return;
     setGenerating(true);
     setGenErrors([]);
     setGenWarnings([]);
@@ -77,11 +89,13 @@ export default function ProfileDetail() {
       const res = await api<{ ruleset_conflicts?: string[] }>(`/api/profiles/${id}/generate`, {
         method: "POST",
       });
+      if (!mounted.current) return;
       message.success(t("detail.generateSuccess"));
       // 规则集冲突不阻断生成,后端照常产出,这里只作警告横幅展示。
       setGenWarnings(res.ruleset_conflicts ?? []);
       await reload();
     } catch (e) {
+      if (!mounted.current) return;
       if (e instanceof ApiError && e.details?.length) {
         setGenErrors(e.details);
         // 规则行错误只在「规则」tab 内展示(未激活的 tab 不渲染),这里必须给出提示,否则在其他 tab
@@ -94,7 +108,7 @@ export default function ProfileDetail() {
         );
       } else message.error(errorMessage(e, t("detail.generateFailed")));
     } finally {
-      setGenerating(false);
+      if (mounted.current) setGenerating(false);
     }
   }
 

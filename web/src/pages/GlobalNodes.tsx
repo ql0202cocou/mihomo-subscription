@@ -26,7 +26,7 @@ import { api, errorMessage } from "../api";
 import type { CustomNode } from "../types";
 import { useSerialSave } from "../components/useSerialSave";
 import NodeForm, { contentToModel, modelToContent, type NodeModel } from "../components/NodeForm";
-import { NODE_TYPE_LABELS } from "../components/nodeSchema";
+import { nodeTypeLabel } from "../components/nodeSchema";
 import "../components/cards.css";
 
 const EMPTY_MODEL: NodeModel = { name: "", type: "", fields: {} };
@@ -193,7 +193,7 @@ function NodeRow({
       <span className="row-name">{node.name}</span>
       {node.node_type && (
         <span className="tag-mono tag-proto custom">
-          {NODE_TYPE_LABELS[node.node_type] ?? node.node_type}
+          {nodeTypeLabel(node.node_type)}
         </span>
       )}
       <span className="row-actions">

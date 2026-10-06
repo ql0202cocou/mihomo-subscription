@@ -19,7 +19,7 @@ import { CSS } from "@dnd-kit/utilities";
 import { useTranslation } from "react-i18next";
 import { api, errorMessage } from "../../api";
 import type { CustomNode, ProxiesResponse, ProxyPreview, Regenerate } from "../../types";
-import { NODE_TYPE_LABELS } from "../../components/nodeSchema";
+import { nodeTypeLabel } from "../../components/nodeSchema";
 import { useRegenerateNotice } from "../../components/regenerate";
 import { useSerialSave } from "../../components/useSerialSave";
 
@@ -135,7 +135,7 @@ export default function NodesCard({ profileId, profileName, nodes, generatedAt, 
                       <span className="row-name">{p.name}</span>
                       {p.type && (
                         <span className="tag-mono tag-proto">
-                          {NODE_TYPE_LABELS[p.type] ?? p.type}
+                          {nodeTypeLabel(p.type)}
                         </span>
                       )}
                     </div>
@@ -161,7 +161,7 @@ export default function NodesCard({ profileId, profileName, nodes, generatedAt, 
                       <span className="row-name">{n.name}</span>
                       {n.node_type && (
                         <span className="tag-mono tag-proto custom">
-                          {NODE_TYPE_LABELS[n.node_type] ?? n.node_type}
+                          {nodeTypeLabel(n.node_type)}
                         </span>
                       )}
                     </div>

@@ -6,7 +6,7 @@ import {
   commonKeys,
   groupsFor,
   NODE_TYPES,
-  NODE_TYPE_LABELS,
+  nodeTypeLabel,
   type FieldDef,
 } from "./nodeSchema";
 import { AdvancedFields, FieldInput, getPath, isEmptyValue, setPath, advancedEntries } from "./fields";
@@ -123,7 +123,7 @@ export default function NodeForm({ value, onChange }: Props) {
         <Select
           showSearch
           style={{ width: "100%" }}
-          options={NODE_TYPES.map((o) => ({ value: o, label: NODE_TYPE_LABELS[o] ?? o }))}
+          options={NODE_TYPES.map((o) => ({ value: o, label: nodeTypeLabel(o) }))}
           value={value.type || undefined}
           onChange={(s) => onChange({ ...value, type: s })}
           placeholder={t("nodes.typePlaceholder")}

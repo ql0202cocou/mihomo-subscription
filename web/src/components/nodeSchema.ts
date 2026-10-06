@@ -67,6 +67,13 @@ export const NODE_TYPE_LABELS: Record<string, string> = {
   snell: "Snell",
 };
 
+/** 机场/自定义节点类型不可信:只读标签表的自有属性,未知类型按文本展示。 */
+export function nodeTypeLabel(type: string): string {
+  return Object.prototype.hasOwnProperty.call(NODE_TYPE_LABELS, type)
+    ? NODE_TYPE_LABELS[type]
+    : type;
+}
+
 /** 所有类型都显示的字段,排在类型专属字段之前。 */
 export const BASE_FIELDS: FieldDef[] = [
   { key: "server", kind: "text", placeholder: "example.com / 1.2.3.4" },
