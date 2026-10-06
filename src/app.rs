@@ -5,7 +5,8 @@ use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use axum::{
-    extract::DefaultBodyLimit,
+    extract::{DefaultBodyLimit, Request},
+    http::{header, HeaderValue},
     middleware,
     response::IntoResponse,
     routing::{get, post, put},
@@ -44,8 +45,8 @@ pub struct AppState {
     pub fetcher: Arc<dyn RemoteFetcher>,
     /// 生成缓存的 TTL。
     pub cache_ttl: Duration,
-    /// 公开订阅端点两次真实回源刷新之间的最小间隔。间隔内复用最近缓存,避免泄露 token 后被
-    /// 单个客户端高频拉取放大为机场请求压力。
+    /// 公开订阅端点两次回源尝试之间的最小间隔(从完成时间算,成功/失败均计)。间隔内复用
+    /// 最近缓存,无缓存则 503,避免泄露 token 后被单个客户端高频拉取放大为机场请求压力。
     pub public_refresh_min_interval: Duration,
     /// per-profile 的刷新合并。
     pub keyed_lock: KeyedLock,
@@ -75,7 +76,13 @@ impl AppState {
             .as_bytes()
             .ct_eq(self.current_prefix().as_bytes())
             .into();
-        lookup.await.filter(|_| prefix_ok)
+        let found = lookup.await;
+        // 查询会让出执行权,轮换可能发生在其间;返回前再做恒定时间比较。
+        let still_ok: bool = candidate
+            .as_bytes()
+            .ct_eq(self.current_prefix().as_bytes())
+            .into();
+        found.filter(|_| prefix_ok & still_ok)
     }
 
     pub fn set_prefix(&self, prefix: String) {
@@ -241,6 +248,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             )),
         )
         .fallback_service(spa)
+        .layer(middleware::from_fn(frame_protection))
         .layer(
             TraceLayer::new_for_http().make_span_with(|request: &axum::http::Request<_>| {
                 tracing::debug_span!(
@@ -252,6 +260,19 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             }),
         )
         .with_state(state)
+}
+
+/// 所有响应统一禁止嵌入,覆盖 SPA 深链、静态文件及 304；不限制脚本/样式或订阅下载。
+async fn frame_protection(req: Request, next: middleware::Next) -> axum::response::Response {
+    let mut response = next.run(req).await;
+    response
+        .headers_mut()
+        .insert(header::X_FRAME_OPTIONS, HeaderValue::from_static("DENY"));
+    response.headers_mut().insert(
+        header::CONTENT_SECURITY_POLICY,
+        HeaderValue::from_static("frame-ancestors 'none'"),
+    );
+    response
 }
 
 fn redacted_trace_path(path: &str) -> String {

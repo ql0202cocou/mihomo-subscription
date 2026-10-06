@@ -22,12 +22,20 @@ use crate::app::AppState;
 use crate::net;
 
 /// 以任意字符串为 key 的令牌桶限流器。
+const MAX_BUCKETS: usize = 10_000;
+
 pub struct RateLimiter {
-    inner: Mutex<HashMap<String, Bucket>>,
+    inner: Mutex<Buckets>,
+    cleanup_interval: Duration,
     /// 桶容量(突发大小,也是每窗口的稳态上限)。
     capacity: f64,
     /// 每秒补充的令牌数。
     refill_per_sec: f64,
+}
+
+struct Buckets {
+    map: HashMap<String, Bucket>,
+    next_cleanup: Instant,
 }
 
 struct Bucket {
@@ -41,7 +49,13 @@ impl RateLimiter {
         let capacity = max as f64;
         let secs = window.as_secs_f64().max(f64::MIN_POSITIVE);
         Self {
-            inner: Mutex::new(HashMap::new()),
+            inner: Mutex::new(Buckets {
+                map: HashMap::new(),
+                next_cleanup: Instant::now() + window.min(Duration::from_secs(30)),
+            }),
+            cleanup_interval: window
+                .min(Duration::from_secs(30))
+                .max(Duration::from_millis(1)),
             capacity,
             refill_per_sec: capacity / secs,
         }
@@ -49,14 +63,20 @@ impl RateLimiter {
 
     /// 为 `key` 记一次命中;有可用令牌则返回 `true`。
     pub fn try_acquire(&self, key: &str) -> bool {
-        let mut map = self.inner.lock().unwrap();
+        let mut buckets = self.inner.lock().unwrap();
         let now = Instant::now();
-
-        // 机会性清理,以在大量不同 key 下限制内存。已完全补满的桶与新建桶无法区分,故任何空闲
-        // 满一个窗口的桶都可丢弃而不影响限流。
-        if map.len() > 10_000 {
+        // 清理按时间调度,而非达到容量后每个请求都扫描全表。只回收可完全补满的空闲桶。
+        if now >= buckets.next_cleanup {
             let window_secs = self.capacity / self.refill_per_sec;
-            map.retain(|_, b| now.duration_since(b.last).as_secs_f64() < window_secs);
+            buckets
+                .map
+                .retain(|_, b| now.duration_since(b.last).as_secs_f64() < window_secs);
+            buckets.next_cleanup = now + self.cleanup_interval;
+        }
+        let map = &mut buckets.map;
+        // 达到硬上限时拒绝新 key,保留现有 key 的预算,避免通过淘汰活跃桶绕过限流。
+        if map.len() >= MAX_BUCKETS && !map.contains_key(key) {
+            return false;
         }
 
         let bucket = map.entry(key.to_string()).or_insert(Bucket {
@@ -131,6 +151,27 @@ mod tests {
         );
         // A different key has its own bucket.
         assert!(rl.try_acquire("other"));
+    }
+
+    #[test]
+    fn expired_buckets_are_reclaimed_on_scheduled_cleanup() {
+        let rl = RateLimiter::new(1, Duration::from_secs(60));
+        for n in 0..MAX_BUCKETS {
+            assert!(rl.try_acquire(&n.to_string()));
+        }
+        assert!(!rl.try_acquire("new"));
+        {
+            let mut buckets = rl.inner.lock().unwrap();
+            let next_cleanup = buckets.next_cleanup;
+            buckets
+                .map
+                .values_mut()
+                .for_each(|b| b.last = Instant::now() - Duration::from_secs(61));
+            buckets.next_cleanup = Instant::now();
+            assert!(next_cleanup > Instant::now());
+        }
+        assert!(rl.try_acquire("new"));
+        assert_eq!(rl.inner.lock().unwrap().map.len(), 1);
     }
 
     #[test]

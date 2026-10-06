@@ -10,6 +10,7 @@
     "dev": "vite",
     "build": "tsc --noEmit && vite build",
     "typecheck": "tsc --noEmit",
+    "test": "node --test ../tests/web/*.test.cjs",
     "lint": "eslint .",
     "preview": "vite preview"
   },

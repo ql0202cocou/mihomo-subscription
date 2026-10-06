@@ -25,7 +25,7 @@ use crate::error::{ApiError, ApiResult};
 use crate::generate::Regenerated;
 use crate::mask;
 use crate::rulelib::{self, RuleSetBody};
-use crate::util::{is_fresh, now};
+use crate::util::{completed_since, is_fresh, now};
 
 // ─── 行 / 响应 ──────────────────────────────────────────────────────────────────
 
@@ -182,7 +182,7 @@ pub async fn update(
     sqlx::query(
         "UPDATE profile_rule_sets SET name = ?, behavior = ?, format = ?, source = ?, content = ?, \
          rule_count = ?, url = ?, interval_hours = ?, cache = ?, enabled = ?, \
-         cached_body = NULL, cached_at = NULL, last_fetch_status = NULL, updated_at = ?
+         cached_body = NULL, cached_at = NULL, last_fetch_at = NULL, last_fetch_status = NULL, revision = revision + 1, updated_at = ?
          WHERE id = ? AND profile_id = ?",
     )
     .bind(body.name.trim())
@@ -372,6 +372,10 @@ fn normalize_names(names: &[String]) -> Vec<String> {
 #[derive(FromRow)]
 struct ServeRow {
     id: String,
+    name: String,
+    enabled: bool,
+    revision: i64,
+    last_fetch_at: Option<String>,
     behavior: String,
     format: String,
     source: String,
@@ -385,7 +389,7 @@ struct ServeRow {
 
 // 列名常量,仅经 `AssertSqlSafe(format!(..))` 拼入 SQL,不含外部输入。
 const SERVE_COLS: &str =
-    "id, behavior, format, source, content, url, interval_hours, cache, cached_body, cached_at";
+    "id, name, enabled, revision, last_fetch_at, behavior, format, source, content, url, interval_hours, cache, cached_body, cached_at";
 
 /// `GET /:public_path_prefix/api/sub/:token/r/:name/:file` —— 公开托管本订阅的规则集内容。无鉴权;
 /// 按 token→订阅、再按 `(profile_id, name)` 定位,统一 404(前缀错 / token 错 / 名不存在 / 未启用 /
@@ -414,15 +418,33 @@ pub async fn public_serve(
     if file != format!("{}.{}", row.behavior, row.format) {
         return StatusCode::NOT_FOUND.into_response();
     }
-    match row.source.as_str() {
+    let response = match row.source.as_str() {
         "manual" => rulelib::serve_bytes(
             &row.format,
             rulelib::render_manual(&row.content, &row.format).into_bytes(),
         ),
         // remote + cache:面板二次托管;cache 关时不托管(转换时直接注入上游 URL)→ 404。
-        "remote" if row.cache => serve_remote(&state, row).await,
+        "remote" if row.cache => serve_remote(&state, row, &prefix, &token, &name, &file).await,
         _ => StatusCode::NOT_FOUND.into_response(),
+    };
+    // 回源或等锁期间可能发生 token/前缀轮换,交付内容前重新校验。
+    if public_profile(&state, &prefix, &token).await.is_none() {
+        return StatusCode::NOT_FOUND.into_response();
     }
+    response
+}
+
+async fn public_profile(state: &AppState, prefix: &str, token: &str) -> Option<String> {
+    state
+        .public_gate(prefix, async {
+            sqlx::query_scalar::<_, String>("SELECT id FROM profiles WHERE token = ?")
+                .bind(token)
+                .fetch_optional(&state.db)
+                .await
+                .ok()
+                .flatten()
+        })
+        .await
 }
 
 async fn fetch_serve_by_name(
@@ -450,41 +472,66 @@ async fn fetch_serve_by_id(state: &AppState, id: &str) -> ApiResult<Option<Serve
 
 /// 远程镜像的懒刷新托管:单飞合并并发;缓存超 `interval_hours` 才回源拉取(SSRF 安全字节);拉取失败
 /// 回退旧缓存,无缓存则 `503`。作用于 per-profile 表(③);全局库 ② 不再对外托管。
-async fn serve_remote(state: &AppState, row: ServeRow) -> Response {
-    let Some(url) = row.url.clone() else {
-        return StatusCode::NOT_FOUND.into_response();
-    };
-
-    let key = format!("profile-ruleset:{}", row.id);
+async fn serve_remote(
+    state: &AppState,
+    original: ServeRow,
+    prefix: &str,
+    token: &str,
+    name: &str,
+    file: &str,
+) -> Response {
+    let arrived = now();
+    let key = format!("profile-ruleset:{}", original.id);
     state
         .keyed_lock
         .run(&key, async {
-            // 等锁期间可能已被另一个请求刷新过——重读最新行。
-            let Some(mut row) = fetch_serve_by_id(state, &row.id).await.ok().flatten() else {
+            // 在锁内重新读取 URL 和完整托管条件;排队时换源/改名/禁用的请求不能沿用旧快照。
+            let Some(mut row) = fetch_serve_by_id(state, &original.id).await.ok().flatten() else {
+                return StatusCode::NOT_FOUND.into_response();
+            };
+            if !row.enabled
+                || row.name != name
+                || file != format!("{}.{}", row.behavior, row.format)
+                || row.source != "remote"
+                || !row.cache
+                || public_profile(state, prefix, token).await.is_none()
+            {
+                return StatusCode::NOT_FOUND.into_response();
+            }
+            let Some(url) = row.url.as_deref() else {
                 return StatusCode::NOT_FOUND.into_response();
             };
             let fresh = row
                 .cached_at
                 .as_deref()
                 .is_some_and(|at| is_fresh(at, mirror_ttl(row.interval_hours)));
-            if fresh {
-                if let Some(body) = row.cached_body.take() {
-                    return rulelib::serve_bytes(&row.format, body);
-                }
+            // 失败短缓存 30 秒;同批等待者即使等待超过此间隔仍共享已经完成的结果。
+            let recent_attempt = row.last_fetch_at.as_deref().is_some_and(|at| {
+                is_fresh(at, Duration::from_secs(30)) || completed_since(at, &arrived)
+            });
+            if fresh || recent_attempt {
+                return match row.cached_body.take() {
+                    Some(body) => rulelib::serve_bytes(&row.format, body),
+                    None => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+                };
             }
-            match state.fetcher.fetch_bytes(&url).await {
+            match state.fetcher.fetch_bytes(url).await {
                 Ok(bytes) => {
                     let count = rulelib::body_count(&bytes, &row.format);
-                    let _ = persist_remote_cache(state, &row.id, &bytes, count).await;
-                    rulelib::serve_bytes(&row.format, bytes)
-                }
-                Err(e) => {
-                    let _ = update_fetch_status(state, &row.id, &e.status_label()).await;
-                    match row.cached_body {
-                        Some(b) => rulelib::serve_bytes(&row.format, b), // 回退旧缓存
-                        None => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+                    match persist_remote_cache(state, &row, &bytes, count).await {
+                        Ok(true) => rulelib::serve_bytes(&row.format, bytes),
+                        Ok(false) => StatusCode::NOT_FOUND.into_response(), // 定义已变,丢弃旧回源结果
+                        Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
                     }
                 }
+                Err(e) => match update_fetch_status(state, &row, &e.status_label()).await {
+                    Ok(true) => match row.cached_body {
+                        Some(body) => rulelib::serve_bytes(&row.format, body),
+                        None => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+                    },
+                    Ok(false) => StatusCode::NOT_FOUND.into_response(),
+                    Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+                },
             }
         })
         .await
@@ -492,33 +539,27 @@ async fn serve_remote(state: &AppState, row: ServeRow) -> Response {
 
 /// 镜像回源的最小间隔:`interval_hours` 转 `Duration`,下限 1 小时(与校验一致)。
 fn mirror_ttl(interval_hours: i64) -> Duration {
-    Duration::from_secs(interval_hours.max(1) as u64 * 3600)
+    Duration::from_secs((interval_hours.max(1) as u64).saturating_mul(3600))
 }
 
 async fn persist_remote_cache(
     state: &AppState,
-    id: &str,
+    row: &ServeRow,
     bytes: &[u8],
     count: i64,
-) -> ApiResult<()> {
-    sqlx::query(
-        "UPDATE profile_rule_sets SET cached_body = ?, cached_at = ?, last_fetch_status = 'success', \
-         rule_count = ? WHERE id = ?",
+) -> ApiResult<bool> {
+    let completed = now();
+    let result = sqlx::query(
+        "UPDATE profile_rule_sets SET cached_body = ?, cached_at = ?, last_fetch_at = ?, last_fetch_status = 'success', \
+         rule_count = ? WHERE id = ? AND revision = ?",
     )
-    .bind(bytes)
-    .bind(now())
-    .bind(count)
-    .bind(id)
-    .execute(&state.db)
-    .await?;
-    Ok(())
+    .bind(bytes).bind(&completed).bind(&completed).bind(count).bind(&row.id).bind(row.revision)
+    .execute(&state.db).await?;
+    Ok(result.rows_affected() == 1)
 }
 
-async fn update_fetch_status(state: &AppState, id: &str, label: &str) -> ApiResult<()> {
-    sqlx::query("UPDATE profile_rule_sets SET last_fetch_status = ? WHERE id = ?")
-        .bind(label)
-        .bind(id)
-        .execute(&state.db)
-        .await?;
-    Ok(())
+async fn update_fetch_status(state: &AppState, row: &ServeRow, label: &str) -> ApiResult<bool> {
+    let result = sqlx::query("UPDATE profile_rule_sets SET last_fetch_status = ?, last_fetch_at = ? WHERE id = ? AND revision = ?")
+        .bind(label).bind(now()).bind(&row.id).bind(row.revision).execute(&state.db).await?;
+    Ok(result.rows_affected() == 1)
 }

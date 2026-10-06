@@ -333,6 +333,7 @@ CREATE UNIQUE INDEX idx_profiles_name  ON profiles (name);
   `global_nodes.position` 决定。迁移 `0002`。
 - `node_section_order`：两块先后，JSON 两元数组（`["provider","custom"]` 排列，NULL=机场块在前）；
   **仍 per-profile**，由 `PUT .../node-section-order` 写。迁移 `0004`。
+- `public_refresh_at`：最近一次公开刷新完成时间，成功/失败均记录，供节流与合并使用。迁移 `0013`。
 - `group_order`：`proxy-groups` 顺序（分组名数组，NULL=创建序）；生成时快照回写、新增落末尾；
   `PUT .../group-order` 覆盖。迁移 `0003`。
 
@@ -429,6 +430,9 @@ CREATE INDEX idx_rule_sets_position ON rule_sets (position);
 `profile_id` 隔离、去掉无语义的 `position`（rule-providers 是 map）。下发时 `RULE-SET,<name>` 引用按名
 注入本订阅自己的定义；托管在**按订阅 token 隔离**的链接
 `/<prefix>/api/sub/<token>/r/<name>/<behavior>.<format>`，故不同订阅可复用同名而不冲突。
+
+迁移 `0013` 增加 `last_fetch_at`（成功/失败镜像完成时间）与 `revision`（定义更新版本，默认 0），
+用来合并失败重试并阻止换源前的在途请求回写。
 
 ```sql
 CREATE TABLE profile_rule_sets (
@@ -546,6 +550,9 @@ https://<PUBLIC_BASE_URL>/<PUBLIC_PATH_PREFIX>/api/sub/<profile_token>
 
 重置单配置 token、重置全局 `PUBLIC_PATH_PREFIX`（使所有链接失效）均支持；重置后缓存随即离线重生成，
 使其中按 token 隔离的规则集托管链接改用新值。机场变化时链接保持稳定，除非显式重置。
+公开订阅和规则集在入口、拿到刷新锁后、交付响应前重新校验前缀/token，轮换期间排队或回源中的
+旧能力请求返回统一 `404`，不会从新生成的规则集 URL 获得新前缀。前缀比较在 token 查询前后均为
+恒定时间比较，并始终执行查询。管理生成与创建自动生成在锁内重读 token/来源。
 
 ### 管理员认证
 
@@ -557,6 +564,15 @@ https://<PUBLIC_BASE_URL>/<PUBLIC_PATH_PREFIX>/api/sub/<profile_token>
 - **不启用 CORS 层**（SPA 同源；宽松 CORS 会破坏 cookie 同源保护）；状态变更请求必须带同源
   `Origin`，生产环境按 `PUBLIC_BASE_URL` 的完整 origin（scheme + host + port）校验（缺失或不匹配
   均 `403`）。公共链接不需会话。
+- 所有响应统一带 `Content-Security-Policy: frame-ancestors 'none'` 和 `X-Frame-Options: DENY`，
+  禁止管理页面被 iframe 嵌入，包括同站兄弟子域；覆盖 SPA 深链、静态资源与条件请求的 `304`。
+  CSP 仅限制嵌入，不限制前端脚本/动态样式，不改变公共订阅的响应体或下载方式。
+- 前端仅在退出成功或确认会话无效（`401`）后进入已退出状态。退出网络错误或其他失败时保留
+  登录态，明确提示会话可能仍有效、允许重试；退出在途期间阻止重复点击。
+- 节点协议标签只查自有属性，机场提供的未知类型按文本展示（包括 `__proto__` 等特殊键）。
+  管理内容区设渲染错误边界，故障时保留导航和退出入口，切换页面后恢复。
+- 详情组件以订阅 ID 重挂载，切换时立即卸载旧表单、预览和本地状态；卸载后的请求结果不再更新
+  详情或触发旧生成的提示/重载。相同订阅的并发重载仅采纳最后发起的结果。
 
 ### SSRF 保护
 
@@ -580,8 +596,11 @@ https://<PUBLIC_BASE_URL>/<PUBLIC_PATH_PREFIX>/api/sub/<profile_token>
 
 ### 不受信任内容（机场响应即使过 SSRF 也不可信）
 
-- 解析 YAML 用资源限制：**先**扫原文限锚点/别名数（防「十亿笑」），**再**限嵌套深度/节点数；
-  管理员提交的节点/分组 YAML 同等限制；请求体 ≤1MB（超限 `413`）。
+- YAML 原文最多 8 MiB；反序列化构建每个值时限制深度 32、节点总数 10,000（包含映射键、值、
+  tag 名和内部值），展开后的标量总字节最多 8 MiB，且不超过原文的 8 倍（最小预算 1 KiB）。小规模
+  锚点/别名与 tag 仍支持；预算在别名物化过程中扣除，拒绝标量复制与嵌套别名放大。转换后合并的
+  Value 同样检查深度、节点、8 MiB 标量预算，序列化写入最多 16 MiB 输出；超限不更新合法缓存。
+  管理员提交的节点 YAML 同等限制；请求体 ≤1MB（超限 `413`）。
 - `subscription-userinfo` 存/回显前校验格式（仅 `key=value; ...`，拒 CR/LF，防头注入）。
 - 机场节点/分组名视为纯数据，渲染时转义，绝不拼入 HTML / shell。
 
@@ -595,7 +614,9 @@ HTTP trace 只记录脱敏 path，公开订阅/规则集路径中的 `PUBLIC_PAT
 ### 限流与客户端 IP
 
 - 登录按**源 IP**（成功/失败请求均计数）；公共下载按**源 IP**（独立于 token，`404` 也计数）
-  限流，使枚举共享单一预算；首版内存限流。
+  限流，使枚举共享单一预算；首版内存限流。每个限流器最多 10,000 个桶，满时新 IP 返回 `429`，
+  现有 IP 保留独立预算；按 `min(窗口, 30 秒)` 的间隔调度清理已可完全补满的空闲桶，
+  避免每次请求扫描全表。
 - 默认不信任 `X-Forwarded-For`： `TRUSTED_PROXY_HOPS=0`，按 TCP 对端限流。需要按真实客户端 IP
   限流时，必须同时设置受信跳数与 `TRUSTED_PROXY_CIDRS`（逗号分隔的直接反代网段）；只有 TCP 对端
   落在该网段内时才读取 `X-Forwarded-For`，并取**最右**不受信跳（最左可伪造）。头缺失、过短、
@@ -605,10 +626,15 @@ HTTP trace 只记录脱敏 path，公开订阅/规则集路径中的 `PUBLIC_PAT
 
 - 公共端点以 `PUBLIC_REFRESH_MIN_SECONDS`（默认 30 秒）作为每配置最小回源间隔：间隔内复用最近
   `generated_cache`（降低 token 泄露后高频请求对机场的回源放大），间隔外回源拉取并重新生成；
-  拉取失败时用旧缓存兜底（无则 `503`）。`CACHE_TTL_MINUTES`（默认 15，按 `generated_at`）
+  成功/失败均保存公开刷新完成时间 `profiles.public_refresh_at`，失败或转换校验失败同样遵守该间隔，
+  用旧缓存兜底（无则 `503`）。`CACHE_TTL_MINUTES`（默认 15，按 `generated_at`）
   仅管理端 `preview`。
 - **single-flight**：同配置并发刷新在 per-profile 锁后合并为一次上游获取（后到者等待或拿陈旧
-  缓存），防踩踏扇出。
+  缓存），防踩踏扇出；同批等待者共享已完成的成功/失败结果，即使最小间隔设为 0。
+- 远程规则集镜像：成功缓存按 `interval_hours` 复用；失败通过 `last_fetch_at` 短缓存 30 秒，
+  继续提供旧缓存（无则 `503`），同批等待者共享失败。定义每次更新递增 `revision` 并清空缓存和
+  尝试时间；锁内重读 URL、名称、格式、启用和托管条件，回写缓存/失败状态以 revision 作条件，
+  定义已变或删除则丢弃旧在途结果并返回 `404`。
 
 ### 错误处理
 

@@ -47,9 +47,9 @@ compose 的 `environment:` 与代码必须一致。
 | `RUST_LOG` | `info` | 否 | 日志级别 |
 | `FETCH_TIMEOUT_SECONDS` | `15` | 否 | 机场获取总超时（含 DNS 解析与全部重定向）。出站拉取不读取 `HTTP_PROXY`/`HTTPS_PROXY` 等代理变量 |
 | `FETCH_USER_AGENT` | `clash.meta/1.0` | 否 | 机场获取的 `User-Agent`。许多机场按 Clash 家族 UA 限制订阅、对未知客户端返回 `403`/`401`；默认匹配常见 `/clash/i` 检查。仅在面板需要特定客户端 UA 时覆盖（如 Shadowrocket/Stash） |
-| `MAX_SUBSCRIPTION_SIZE_MB` | `8` | 否 | 机场响应大小上限 |
+| `MAX_SUBSCRIPTION_SIZE_MB` | `8` | 否 | 回源响应大小上限（含规则集镜像）；机场 YAML 解析另有固定 8 MiB 原文/展开标量上限，调高此项不会放宽解析预算 |
 | `CACHE_TTL_MINUTES` | `15` | 否 | 仅管理员**预览**缓存 TTL；公共订阅回源节流由 `PUBLIC_REFRESH_MIN_SECONDS` 控制 |
-| `PUBLIC_REFRESH_MIN_SECONDS` | `30` | 否 | 公共订阅同一 profile 两次真实回源刷新之间的最小间隔；间隔内复用最近缓存，降低公开 token 泄露后的上游拉取放大 |
+| `PUBLIC_REFRESH_MIN_SECONDS` | `30` | 否 | 公共订阅同一 profile 两次回源尝试之间的最小间隔（成功/失败均计，按完成时间）；间隔内复用旧缓存，无缓存则 `503` |
 | `TRUSTED_PROXY_HOPS` | `0` | 否 | 派生客户端 IP 时信任的反向代理跳数。`0` 表示忽略 `X-Forwarded-For`，按 TCP 对端限流 |
 | `TRUSTED_PROXY_CIDRS` | 空 | 否 | 允许提供可信 `X-Forwarded-For` 的直接反向代理 CIDR，逗号分隔。为空时即使 `TRUSTED_PROXY_HOPS>0` 也忽略 `X-Forwarded-For` |
 | `SECURE_COOKIES` | `auto` | 否 | 强制 `Secure` 会话 cookie。`auto`（及无法识别值）从 `https://` 的 `PUBLIC_BASE_URL` 推断；经 TLS 终止反代（应用走纯 HTTP）对外 HTTPS 时设 `true`；cookie 最终无 `Secure` 时记 warn |
@@ -71,6 +71,8 @@ compose 的 `environment:` 与代码必须一致。
   `TRUSTED_PROXY_CIDRS` 为反代容器/网关所在网段。
 - 凭据经 `ADMIN_USERNAME`/`ADMIN_PASSWORD` 仅保护管理 UI/API；公共订阅链接仍靠随机路径前缀 +
   per-profile token。
+- 应用统一返回 `Content-Security-Policy: frame-ancestors 'none'` 与 `X-Frame-Options: DENY`，
+  反代应保留这些响应头，不要删除或改成宽松允许嵌入。管理后台不支持放在 iframe 中使用。
 - 容器以 root 启动以便 `docker-entrypoint.sh` chown `${DATA_DIR}`（`./data` 挂载会覆盖构建期 chown，
   否则 SQLite `code 14 (CANTOPEN)`），随后用 `gosu` 降权到 `appuser` 再 exec。
 - 主机若运行 Mihomo/Clash 的 TUN + fake-ip 模式，域名会被解析到 `198.18.0.0/15`。该网段在 SSRF

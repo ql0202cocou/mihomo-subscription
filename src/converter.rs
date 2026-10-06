@@ -184,8 +184,14 @@ pub fn convert(input: ConvertInput) -> Result<(String, Vec<String>), ConvertErro
 
     // 其余所有顶层键(dns、tun…)透传。
 
-    let yaml =
-        serde_yaml::to_string(&Value::Mapping(root)).map_err(|_| ConvertError::OutputSerialize)?;
+    let output = Value::Mapping(root);
+    let limits_error =
+        || ConvertError::Validation(vec!["generated YAML exceeds resource limits".into()]);
+    yaml::check_value(&output).map_err(|_| limits_error())?;
+    let yaml = yaml::serialize_limited(&output).map_err(|error| match error {
+        yaml::YamlError::TooComplex => limits_error(),
+        _ => ConvertError::OutputSerialize,
+    })?;
     Ok((yaml, rule_provider_conflicts))
 }
 

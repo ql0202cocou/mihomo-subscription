@@ -1,5 +1,6 @@
 // 主框架:侧边导航 + 顶栏(当前页标题、主题切换)+ <Outlet/> 内容区。
-import type { ReactNode } from "react";
+import { useRef, useState, type ReactNode } from "react";
+import { App as AntdApp } from "antd";
 import { Link, Outlet, useLocation, useNavigate } from "react-router";
 import { useTranslation } from "react-i18next";
 import {
@@ -12,6 +13,7 @@ import {
 } from "@ant-design/icons";
 import { useAuth } from "../auth";
 import { useTheme } from "../theme";
+import PageErrorBoundary from "./PageErrorBoundary";
 import "./AppLayout.css";
 
 interface NavItem {
@@ -25,9 +27,12 @@ interface NavItem {
 export default function AppLayout() {
   const { t } = useTranslation();
   const { user, logout } = useAuth();
+  const { message } = AntdApp.useApp();
   const { mode, toggle } = useTheme();
   const navigate = useNavigate();
   const { pathname } = useLocation();
+  const [loggingOut, setLoggingOut] = useState(false);
+  const logoutPending = useRef(false);
 
   const items: NavItem[] = [
     {
@@ -64,8 +69,18 @@ export default function AppLayout() {
   const title = items.find((it) => it.match(pathname))?.label ?? t("nav.profiles");
 
   async function onLogout() {
-    await logout();
-    navigate("/login", { replace: true });
+    if (logoutPending.current) return;
+    logoutPending.current = true;
+    setLoggingOut(true);
+    try {
+      await logout();
+      navigate("/login", { replace: true });
+    } catch {
+      message.error(t("nav.logoutFailed"));
+    } finally {
+      logoutPending.current = false;
+      setLoggingOut(false);
+    }
   }
 
   return (
@@ -103,6 +118,8 @@ export default function AppLayout() {
           <button
             className="account-logout"
             onClick={onLogout}
+            disabled={loggingOut}
+            aria-busy={loggingOut}
             title={t("nav.logout")}
             aria-label={t("nav.logout")}
           >
@@ -120,7 +137,12 @@ export default function AppLayout() {
           </button>
         </header>
         <main className="content">
-          <Outlet />
+          <PageErrorBoundary
+            key={pathname}
+            fallback={<div className="page empty-line" role="alert">{t("common.renderFailed")}</div>}
+          >
+            <Outlet />
+          </PageErrorBoundary>
         </main>
       </div>
     </div>

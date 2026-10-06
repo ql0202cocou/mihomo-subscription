@@ -1,20 +1,17 @@
-//! 对不受信任/管理员提交的文档做限界 YAML 解析。
-//!
-//! 按 `docs/architecture.md`「安全设计」,来自信任边界之外的 YAML(此处是管理员的节点/分组 content;
-//! 转换器里是机场内容)必须带资源限制解析:解析后限制嵌套深度与节点数,并在解析 *之前* 限制
-//! 锚点/别名数。
-//!
-//! 锚点/别名上限是对别名扩展(「billion laughs」)的防御:这类输入极小,故大小上限与解析后的检查
-//! 都帮不上忙——`serde_yaml` 已在 `from_str` 内把炸弹展开(并 OOM)了。因此先扫原始文本,拒绝
-//! 锚点/别名数量离谱的文档,把最坏情况的展开规模限制到解析后节点数检查能安全拒绝的大小。
+//! 在构建 Value 的过程中限制不受信任 YAML,包括别名展开、映射键与 tag 的内部值。
 
-use serde_yaml::Value;
+use std::fmt;
+
+use serde::de::{self, DeserializeSeed, EnumAccess, MapAccess, SeqAccess, VariantAccess, Visitor};
+use serde_yaml::{
+    value::{Tag, TaggedValue},
+    Mapping, Value,
+};
 
 const MAX_DEPTH: usize = 32;
 const MAX_NODES: usize = 10_000;
-/// `&anchor` 定义与 `*alias` 引用的合计上限。倍增的别名链每层约用 3 个 token,故 32 把展开
-/// 限制到 ~2^10 个节点。合法的 Mihomo 配置很少或不用锚点。
-const MAX_ANCHORS_ALIASES: usize = 32;
+const MAX_BYTES: usize = 8 * 1024 * 1024;
+const MAX_EXPANSION: usize = 8;
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum YamlError {
@@ -23,72 +20,227 @@ pub enum YamlError {
     NotMapping,
 }
 
-/// 把 `text` 解析为 YAML 值:解析前强制锚点/别名上限,解析后限制深度/节点数。
+struct Budget {
+    nodes: usize,
+    bytes: usize,
+    exceeded: bool,
+}
+
+impl Budget {
+    fn charge<E: de::Error>(&mut self, depth: usize, bytes: usize) -> Result<(), E> {
+        if depth > MAX_DEPTH || self.nodes == 0 || bytes > self.bytes {
+            self.exceeded = true;
+            return Err(E::custom("YAML resource limit exceeded"));
+        }
+        self.nodes -= 1;
+        self.bytes -= bytes;
+        Ok(())
+    }
+}
+
+/// 原文最多 8 MiB;展开后的标量总字节数最多 8 MiB 且不超过原文的 8 倍(最小预算 1 KiB)。
+/// 节点/深度/字节预算在每个值物化之前扣除,而不是先展开整个 Value 再检查。
 pub fn parse_limited(text: &str) -> Result<Value, YamlError> {
-    if count_anchors_aliases(text) > MAX_ANCHORS_ALIASES {
+    if text.len() > MAX_BYTES {
         return Err(YamlError::TooComplex);
     }
-    let value: Value = serde_yaml::from_str(text).map_err(|_| YamlError::Parse)?;
-    let mut nodes = 0usize;
-    check(&value, 1, &mut nodes)?;
-    Ok(value)
-}
-
-/// 统计原始文本中的 YAML 锚点(`&name`)与别名(`*name`)token。为避免把标量内部的 `&`/`*`
-/// 也算进去,只统计前面是空白或流式指示符、后面是名字字符的符号。
-fn count_anchors_aliases(text: &str) -> usize {
-    let bytes = text.as_bytes();
-    let mut count = 0;
-    for i in 0..bytes.len() {
-        let c = bytes[i];
-        if c != b'&' && c != b'*' {
-            continue;
-        }
-        let prev_ok = i == 0
-            || matches!(
-                bytes[i - 1],
-                b' ' | b'\t' | b'\n' | b'\r' | b'[' | b'{' | b','
-            );
-        let next_ok = bytes
-            .get(i + 1)
-            .is_some_and(|n| n.is_ascii_alphanumeric() || *n == b'_' || *n == b'-');
-        if prev_ok && next_ok {
-            count += 1;
-        }
+    let mut budget = Budget {
+        nodes: MAX_NODES,
+        bytes: MAX_BYTES.min(text.len().saturating_mul(MAX_EXPANSION).max(1024)),
+        exceeded: false,
+    };
+    let result = Limited {
+        budget: &mut budget,
+        depth: 1,
     }
-    count
+    .deserialize(serde_yaml::Deserializer::from_str(text));
+    result.map_err(|_| {
+        if budget.exceeded {
+            YamlError::TooComplex
+        } else {
+            YamlError::Parse
+        }
+    })
 }
 
-/// 解析 `text` 并要求顶层是一个映射(如单个 Mihomo proxy 定义)。
-pub fn parse_mapping(text: &str) -> Result<serde_yaml::Mapping, YamlError> {
+pub fn parse_mapping(text: &str) -> Result<Mapping, YamlError> {
     match parse_limited(text)? {
         Value::Mapping(map) => Ok(map),
         _ => Err(YamlError::NotMapping),
     }
 }
 
-fn check(value: &Value, depth: usize, nodes: &mut usize) -> Result<(), YamlError> {
-    if depth > MAX_DEPTH {
-        return Err(YamlError::TooComplex);
+struct Limited<'a> {
+    budget: &'a mut Budget,
+    depth: usize,
+}
+
+impl<'de> DeserializeSeed<'de> for Limited<'_> {
+    type Value = Value;
+
+    fn deserialize<D: de::Deserializer<'de>>(self, deserializer: D) -> Result<Value, D::Error> {
+        self.budget.charge::<D::Error>(self.depth, 0)?;
+        deserializer.deserialize_any(self)
     }
-    *nodes += 1;
-    if *nodes > MAX_NODES {
-        return Err(YamlError::TooComplex);
+}
+
+impl<'de> Visitor<'de> for Limited<'_> {
+    type Value = Value;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+        formatter.write_str("a YAML value within resource limits")
     }
-    match value {
-        Value::Sequence(seq) => {
-            for item in seq {
-                check(item, depth + 1, nodes)?;
+
+    fn visit_bool<E: de::Error>(self, value: bool) -> Result<Value, E> {
+        Ok(Value::Bool(value))
+    }
+    fn visit_i64<E: de::Error>(self, value: i64) -> Result<Value, E> {
+        Ok(Value::Number(value.into()))
+    }
+    fn visit_u64<E: de::Error>(self, value: u64) -> Result<Value, E> {
+        Ok(Value::Number(value.into()))
+    }
+    fn visit_f64<E: de::Error>(self, value: f64) -> Result<Value, E> {
+        Ok(Value::Number(value.into()))
+    }
+    fn visit_unit<E: de::Error>(self) -> Result<Value, E> {
+        Ok(Value::Null)
+    }
+    fn visit_none<E: de::Error>(self) -> Result<Value, E> {
+        Ok(Value::Null)
+    }
+
+    fn visit_str<E: de::Error>(self, value: &str) -> Result<Value, E> {
+        if value.len() > self.budget.bytes {
+            self.budget.exceeded = true;
+            return Err(E::custom("YAML scalar byte limit exceeded"));
+        }
+        self.budget.bytes -= value.len();
+        Ok(Value::String(value.to_owned()))
+    }
+
+    fn visit_seq<A: SeqAccess<'de>>(self, mut data: A) -> Result<Value, A::Error> {
+        let mut items = Vec::new();
+        while let Some(value) = data.next_element_seed(Limited {
+            budget: self.budget,
+            depth: self.depth + 1,
+        })? {
+            items.push(value);
+        }
+        Ok(Value::Sequence(items))
+    }
+
+    fn visit_map<A: MapAccess<'de>>(self, mut data: A) -> Result<Value, A::Error> {
+        let mut map = Mapping::new();
+        while let Some(key) = data.next_key_seed(Limited {
+            budget: self.budget,
+            depth: self.depth + 1,
+        })? {
+            let value = data.next_value_seed(Limited {
+                budget: self.budget,
+                depth: self.depth + 1,
+            })?;
+            if map.insert(key, value).is_some() {
+                return Err(de::Error::custom("duplicate YAML mapping key"));
             }
         }
-        Value::Mapping(map) => {
-            for (_, v) in map {
-                check(v, depth + 1, nodes)?;
-            }
-        }
-        _ => {}
+        Ok(Value::Mapping(map))
     }
-    Ok(())
+
+    fn visit_enum<A: EnumAccess<'de>>(self, data: A) -> Result<Value, A::Error> {
+        // tag 名也走同一个字节预算,tag 包裹的值走同一个深度/节点预算。
+        let (tag, contents) = data.variant_seed(Limited {
+            budget: self.budget,
+            depth: self.depth + 1,
+        })?;
+        let Value::String(tag) = tag else {
+            return Err(de::Error::custom("invalid YAML tag"));
+        };
+        let value = contents.newtype_variant_seed(Limited {
+            budget: self.budget,
+            depth: self.depth + 1,
+        })?;
+        Ok(Value::Tagged(Box::new(TaggedValue {
+            tag: Tag::new(tag),
+            value,
+        })))
+    }
+}
+
+/// 对转换后合并的 Value 应用同等预算,限制多个管理员节点/分组合并后的总规模。
+pub fn check_value(value: &Value) -> Result<(), YamlError> {
+    fn check(value: &Value, depth: usize, budget: &mut Budget) -> Result<(), serde_yaml::Error> {
+        budget.charge::<serde_yaml::Error>(
+            depth,
+            match value {
+                Value::String(s) => s.len(),
+                _ => 0,
+            },
+        )?;
+        match value {
+            Value::Sequence(items) => {
+                for item in items {
+                    check(item, depth + 1, budget)?;
+                }
+            }
+            Value::Mapping(map) => {
+                for (key, value) in map {
+                    check(key, depth + 1, budget)?;
+                    check(value, depth + 1, budget)?;
+                }
+            }
+            Value::Tagged(tagged) => {
+                budget.charge::<serde_yaml::Error>(depth + 1, tagged.tag.to_string().len())?;
+                check(&tagged.value, depth + 1, budget)?;
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+    check(
+        value,
+        1,
+        &mut Budget {
+            nodes: MAX_NODES,
+            bytes: MAX_BYTES,
+            exceeded: false,
+        },
+    )
+    .map_err(|_| YamlError::TooComplex)
+}
+
+/// 序列化时限制输出字节数,避免转义/格式化把小 Value 放大成巨大字符串。
+pub fn serialize_limited(value: &Value) -> Result<String, YamlError> {
+    use std::io::{self, Write};
+    struct LimitedWriter {
+        bytes: Vec<u8>,
+        exceeded: bool,
+    }
+    impl Write for LimitedWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            if buf.len() > 16 * 1024 * 1024 - self.bytes.len() {
+                self.exceeded = true;
+                return Err(io::Error::other("YAML output byte limit exceeded"));
+            }
+            self.bytes.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut writer = LimitedWriter {
+        bytes: Vec::new(),
+        exceeded: false,
+    };
+    serde_yaml::to_writer(&mut writer, value).map_err(|_| {
+        if writer.exceeded {
+            YamlError::TooComplex
+        } else {
+            YamlError::Parse
+        }
+    })?;
+    String::from_utf8(writer.bytes).map_err(|_| YamlError::Parse)
 }
 
 #[cfg(test)]
@@ -97,34 +249,54 @@ mod tests {
 
     #[test]
     fn accepts_a_simple_proxy_mapping() {
-        let yaml = "name: my-ss\ntype: ss\nserver: 1.2.3.4\nport: 8388";
-        assert!(parse_mapping(yaml).is_ok());
+        assert!(parse_mapping("name: my-ss\ntype: ss\nserver: 1.2.3.4\nport: 8388").is_ok());
     }
-
     #[test]
     fn rejects_non_mapping_top_level() {
         assert_eq!(parse_mapping("- a\n- b"), Err(YamlError::NotMapping));
     }
-
     #[test]
     fn rejects_invalid_yaml() {
         assert_eq!(parse_limited(":\n  - ["), Err(YamlError::Parse));
+        assert_eq!(parse_limited("a: 1\na: 2"), Err(YamlError::Parse));
+        assert_eq!(parse_limited("---\na: 1\n---\nb: 2"), Err(YamlError::Parse));
     }
-
     #[test]
     fn allows_light_anchor_use() {
-        let yaml = "defaults: &d { type: ss, port: 8388 }\nnode: { name: a, <<: *d }";
-        assert!(parse_limited(yaml).is_ok());
+        assert!(
+            parse_limited("defaults: &d { type: ss, port: 8388 }\nnode: { name: a, <<: *d }")
+                .is_ok()
+        );
+    }
+    #[test]
+    fn preserves_small_tags_and_complex_keys() {
+        let input = "payload: !opaque [x, y]\n? [a, b]\n: z";
+        assert_eq!(
+            parse_limited(input).unwrap(),
+            serde_yaml::from_str::<Value>(input).unwrap()
+        );
+    }
+    #[test]
+    fn output_escaping_obeys_byte_budget() {
+        // 控制字符序列会被 YAML 转义,最终 Value 在解析字节预算内但输出仍必须有限。
+        let value = Value::String("\u{1}".repeat(5 * 1024 * 1024));
+        assert!(check_value(&value).is_ok());
+        assert!(matches!(
+            serialize_limited(&value),
+            Err(YamlError::TooComplex)
+        ));
+    }
+    #[test]
+    fn many_small_aliases_are_allowed_within_budget() {
+        let input = format!("a: &a x\nb: [{}]", ["*a"; 40].join(","));
+        assert!(parse_limited(&input).is_ok());
     }
 
     #[test]
-    fn rejects_billion_laughs_before_parsing() {
-        // 一个会指数膨胀的小输入;在 serde_yaml 能将其物化之前就被锚点/别名上限拒绝。
+    fn rejects_billion_laughs_during_expansion() {
         let mut yaml = String::from("a: &a [x, x, x, x, x, x, x, x, x, x]\n");
         for (level, prev) in [('b', 'a'), ('c', 'b'), ('d', 'c'), ('e', 'd')] {
-            yaml.push_str(&format!(
-                "{level}: &{level} [*{prev}, *{prev}, *{prev}, *{prev}, *{prev}, *{prev}, *{prev}, *{prev}, *{prev}, *{prev}]\n"
-            ));
+            yaml.push_str(&format!("{level}: &{level} [*{prev}, *{prev}, *{prev}, *{prev}, *{prev}, *{prev}, *{prev}, *{prev}, *{prev}, *{prev}]\n"));
         }
         assert_eq!(parse_limited(&yaml), Err(YamlError::TooComplex));
     }

@@ -6,7 +6,7 @@ import {
   useState,
   type ReactNode,
 } from "react";
-import { api, setUnauthorizedHandler } from "./api";
+import { api, ApiError, setUnauthorizedHandler } from "./api";
 
 interface AuthContextValue {
   user: string | null;
@@ -51,9 +51,11 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   async function logout(): Promise<void> {
     try {
       await api("/api/auth/logout", { method: "POST" });
-    } finally {
-      setUser(null);
+    } catch (e) {
+      // 401 已确认会话无效;网络错误/其他失败无法证明已撤销,交给界面提示重试。
+      if (!(e instanceof ApiError && e.status === 401)) throw e;
     }
+    setUser(null);
   }
 
   return (

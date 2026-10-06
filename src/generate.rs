@@ -21,7 +21,7 @@ use crate::app::AppState;
 use crate::converter::{self, ConvertError, ConvertInput, CustomGroup, CustomNode, RuleProvider};
 use crate::error::{ApiError, ApiResult};
 use crate::profiles;
-use crate::util::{is_fresh, now};
+use crate::util::{completed_since, is_fresh, now};
 
 const UPDATE_INTERVAL_HOURS: u32 = 24;
 
@@ -76,12 +76,11 @@ pub async fn generate(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> ApiResult<impl IntoResponse> {
-    let profile = load_core(&state, &id).await?.ok_or(ApiError::NotFound)?;
-
     // 与公开刷新、离线重生成共用 per-profile 锁:否则并发的一方可能用较旧的机场原文覆盖较新的缓存。
-    let built = state
+    let (profile, built) = state
         .keyed_lock
-        .run(&profile.id, async {
+        .run(&id, async {
+            let profile = load_core(&state, &id).await?.ok_or(ApiError::NotFound)?;
             let built = match fetch_convert_and_record(&state, &profile).await {
                 Ok(b) => b,
                 Err(BuildError::Validation(errors)) => return Err(ApiError::Validation(errors)),
@@ -89,7 +88,7 @@ pub async fn generate(
                 Err(BuildError::Internal) => return Err(ApiError::Internal),
             };
             persist_cache_and_group_order(&state, &profile.id, &built).await?;
-            Ok(built)
+            Ok((profile, built))
         })
         .await?;
     Ok(Json(GenerateResponse {
@@ -102,15 +101,14 @@ pub async fn generate(
 /// 新建订阅后自动拉取一次。尽力而为:拉取/转换失败仅由 `fetch_convert_and_record` 记录 `last_fetch_status`,
 /// 绝不让创建本身失败。供 `profiles::create` 复用,使新订阅立即带有真实拉取状态(无「未拉取」中间态)。
 pub async fn generate_best_effort(state: &AppState, id: &str) {
-    let Some(profile) = load_core(state, id).await.ok().flatten() else {
-        return;
-    };
-    // 同 `generate`,写缓存前持有 per-profile 锁。
     state
         .keyed_lock
-        .run(&profile.id, async {
+        .run(id, async {
+            let Some(profile) = load_core(state, id).await.ok().flatten() else {
+                return;
+            };
             if let Ok(built) = fetch_convert_and_record(state, &profile).await {
-                let _ = persist_cache_and_group_order(state, &profile.id, &built).await;
+                let _ = persist_cache_and_group_order(state, id, &built).await;
             }
         })
         .await;
@@ -183,7 +181,18 @@ pub async fn public_sub(
         None => return StatusCode::NOT_FOUND.into_response(),
     };
 
-    match serve_or_refresh(&state, &profile).await {
+    let served = serve_or_refresh(&state, &profile, &prefix).await;
+    // 锁等待、回源、转换过程中可能已轮换能力;交付前再次校验前缀和 token。
+    if state
+        .public_gate(&prefix, async {
+            load_core_by_token(&state, &token).await.ok().flatten()
+        })
+        .await
+        .is_none()
+    {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    match served {
         Some(served) => public_response(&profile.name, served),
         None => StatusCode::SERVICE_UNAVAILABLE.into_response(),
     }
@@ -196,7 +205,7 @@ struct Served {
     userinfo: Option<String>,
 }
 
-async fn serve_or_refresh(state: &AppState, profile: &ProfileCore) -> Option<Served> {
+async fn serve_or_refresh(state: &AppState, profile: &ProfileCore, prefix: &str) -> Option<Served> {
     // 公开拉取在一个较短的最小刷新间隔内复用最近缓存,避免 token 泄露后被高频请求放大为机场
     // 回源压力;间隔外仍尽力实时回源,失败时用缓存兜底。
     let arrived = now();
@@ -205,17 +214,30 @@ async fn serve_or_refresh(state: &AppState, profile: &ProfileCore) -> Option<Ser
     state
         .keyed_lock
         .run(&profile.id, async {
+            let current = state.public_gate(prefix, async {
+                load_core_by_token(state, &profile.token).await.ok().flatten()
+            }).await?;
+            let profile = &current;
             // 若缓存仍处于公开刷新最小间隔内,直接提供它;否则如果本批里另一个请求在我们等锁期间已刷新过
             // (缓存在我们到达时或之后被重生),也提供它而非再次拉取。
             let cached = load_cache(state, &profile.id).await.ok().flatten();
             let serve_cached = cached.as_ref().is_some_and(|cache| {
                 is_fresh(&cache.generated_at, state.public_refresh_min_interval)
-                    || generated_since(&cache.generated_at, &arrived)
+                    || completed_since(&cache.generated_at, &arrived)
             });
-            if serve_cached {
+            let attempted = sqlx::query_scalar::<_, Option<String>>("SELECT public_refresh_at FROM profiles WHERE id = ?")
+                .bind(&profile.id).fetch_optional(&state.db).await.ok().flatten().flatten();
+            let recent_attempt = attempted.as_deref().is_some_and(|at| {
+                is_fresh(at, state.public_refresh_min_interval) || completed_since(at, &arrived)
+            });
+            if serve_cached || recent_attempt {
                 return cached.map(Served::from);
             }
-            match fetch_convert_and_record(state, profile).await {
+            let result = fetch_convert_and_record(state, profile).await;
+            // 使用完成时间,慢失败后等待者也共享结果;无需改变旧成功缓存的时间戳。
+            let _ = sqlx::query("UPDATE profiles SET public_refresh_at = ? WHERE id = ?")
+                .bind(now()).bind(&profile.id).execute(&state.db).await;
+            match result {
                 Ok(built) => {
                     if persist_cache_and_group_order(state, &profile.id, &built).await.is_err() {
                         tracing::error!(profile = %profile.id, "failed to persist generated cache");
@@ -606,18 +628,6 @@ pub async fn regenerate_all_from_cache(state: &AppState) {
 }
 
 // ─── 辅助 ──────────────────────────────────────────────────────────────────────
-
-/// `generated_at` 是否在 `arrived` 当时或之后——即缓存自本请求开始等待以来被(重新)生成过,故
-/// 另一个并发拉取已刷新它。无法解析的时间戳算作「不在其后」(重新拉取)。
-fn generated_since(generated_at: &str, arrived: &str) -> bool {
-    match (
-        chrono::DateTime::parse_from_rfc3339(generated_at),
-        chrono::DateTime::parse_from_rfc3339(arrived),
-    ) {
-        (Ok(generated), Ok(arrived)) => generated >= arrived,
-        _ => false,
-    }
-}
 
 fn content_hash_of(output_yaml: &str) -> String {
     let mut hasher = Sha256::new();

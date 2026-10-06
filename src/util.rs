@@ -40,3 +40,14 @@ fn random_b64(byte_len: usize) -> String {
     rand::rng().fill_bytes(&mut bytes);
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
 }
+
+/// 同批等待请求共享最近完成的刷新结果(包括失败),即使最小间隔设为零。
+pub fn completed_since(completed_at: &str, arrived: &str) -> bool {
+    match (
+        chrono::DateTime::parse_from_rfc3339(completed_at),
+        chrono::DateTime::parse_from_rfc3339(arrived),
+    ) {
+        (Ok(completed), Ok(arrived)) => completed >= arrived,
+        _ => false,
+    }
+}
