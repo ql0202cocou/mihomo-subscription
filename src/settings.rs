@@ -23,7 +23,9 @@ pub async fn get(State(state): State<Arc<AppState>>) -> ApiResult<impl IntoRespo
 }
 
 /// 重置全局公共路径前缀。所有 profile 的托管链接一次性改变,使全部旧链接失效
-/// (见 `docs/architecture.md`);各缓存随即离线重生成,使其中的规则集托管链接改用新前缀。
+/// (见 `docs/architecture.md`);各缓存随即离线重生成,使其中的规则集托管链接改用新前缀
+/// (规则草稿未通过校验的 profile 回退到最近一份合法规则,仍无法迁移的清空缓存,见
+/// `generate::regenerate_for_rotation`)。
 pub async fn reset_public_path(State(state): State<Arc<AppState>>) -> ApiResult<impl IntoResponse> {
     let prefix = random_path_prefix();
     sqlx::query("UPDATE app_settings SET public_path_prefix = ?, updated_at = ? WHERE id = 1")
@@ -33,7 +35,7 @@ pub async fn reset_public_path(State(state): State<Arc<AppState>>) -> ApiResult<
         .await?;
     // 公开端点校验读的是内存中的前缀,落库后必须同步,使新前缀免重启立即生效。
     state.set_prefix(prefix.clone());
-    crate::generate::regenerate_all_from_cache(&state).await;
+    crate::generate::regenerate_all_for_rotation(&state).await;
     Ok(Json(SettingsResponse {
         public_path_prefix: prefix,
     }))

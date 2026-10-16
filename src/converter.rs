@@ -18,6 +18,31 @@ const BUILTIN_POLICIES: &[&str] = &[
     "GLOBAL",
 ];
 
+/// Mihomo 在解析配置前创建的内置名(内置代理 DIRECT/REJECT/REJECT-DROP/PASS/PASS-RULE/
+/// COMPATIBLE,另有内置分组 GLOBAL):代理与分组共用同一命名空间,自定义节点占用这些名字会让
+/// Mihomo 以 duplicate name 拒绝加载(GLOBAL 节点则会被内置分组静默覆盖)。
+/// 见 mihomo `config/config.go` 的 proxies 初始化与分组重名检查。
+pub(crate) const RESERVED_NODE_NAMES: &[&str] = &[
+    "DIRECT",
+    "REJECT",
+    "REJECT-DROP",
+    "PASS",
+    "PASS-RULE",
+    "COMPATIBLE",
+    "GLOBAL",
+];
+
+/// 自定义分组不得占用的内置名:同 [`RESERVED_NODE_NAMES`],但不含 GLOBAL——上游仅在用户未定义
+/// 时才内置创建 GLOBAL 分组,自定义 GLOBAL 分组是上游支持的用法。
+pub(crate) const RESERVED_GROUP_NAMES: &[&str] = &[
+    "DIRECT",
+    "REJECT",
+    "REJECT-DROP",
+    "PASS",
+    "PASS-RULE",
+    "COMPATIBLE",
+];
+
 pub struct CustomNode {
     pub name: String,
     /// 完整的 Mihomo proxy 映射(YAML 文本)。
@@ -203,6 +228,30 @@ fn validate(
     custom_group_names: &[String],
     errors: &mut Vec<String>,
 ) {
+    // 内置保留名:自定义节点、自定义分组或机场透传代理占用 DIRECT/REJECT 等内置名时,Mihomo
+    // 会以 duplicate name 拒绝加载整个配置,须在校验阶段拦截(GLOBAL 分组是上游支持的用法,放行)。
+    for name in provider_proxies {
+        if RESERVED_NODE_NAMES.contains(&name.as_str()) {
+            errors.push(format!(
+                "provider proxy `{name}` conflicts with a reserved built-in name"
+            ));
+        }
+    }
+    for name in custom_node_names {
+        if RESERVED_NODE_NAMES.contains(&name.as_str()) {
+            errors.push(format!(
+                "custom node `{name}` conflicts with a reserved built-in name"
+            ));
+        }
+    }
+    for name in custom_group_names {
+        if RESERVED_GROUP_NAMES.contains(&name.as_str()) {
+            errors.push(format!(
+                "custom group `{name}` conflicts with a reserved built-in name"
+            ));
+        }
+    }
+
     // 自定义节点名不得与机场代理名冲突(代理仍透传 + 追加)。机场分组已不在输出里(被自定义
     // 分组替换),故不存在分组名冲突。
     for name in custom_node_names {
@@ -253,6 +302,7 @@ fn validate(
 
     // 每条规则的策略目标必须存在。无法可靠解析的高级/逻辑规则透传,不做目标校验。
     // `RULE-SET` 引用的规则集必须存在:本订阅注入的规则集(③,仅已启用者)或机场自带的 rule-providers。
+    // 逻辑规则(AND/OR/NOT/SUB-RULE)内嵌套的 `RULE-SET` 同样会被 Mihomo 解析,一并检查。
     for (lineno, line) in rule_lines(input.rules) {
         if let Some(target) = rule_target(line) {
             if !known(&target) {
@@ -261,13 +311,20 @@ fn validate(
                 ));
             }
         }
-        if let Some(name) = ruleset_name(line) {
-            let injected = input.rule_providers.iter().any(|rp| rp.name == name);
-            if !injected && !provider_rule_providers.iter().any(|n| n == name) {
-                errors.push(format!(
-                    "rules line {lineno} references unknown rule-set `{name}`"
-                ));
+        match ruleset_names_in_line(line) {
+            Ok(names) => {
+                for name in names {
+                    let injected = input.rule_providers.iter().any(|rp| rp.name == name);
+                    if !injected && !provider_rule_providers.iter().any(|n| n == &name) {
+                        errors.push(format!(
+                            "rules line {lineno} references unknown rule-set `{name}`"
+                        ));
+                    }
+                }
             }
+            Err(()) => errors.push(format!(
+                "rules line {lineno} exceeds the supported logic nesting depth"
+            )),
         }
     }
 }
@@ -394,27 +451,138 @@ fn build_rule_provider(rp: &RuleProvider) -> Value {
     Value::Mapping(m)
 }
 
-/// 提取 rules 文本中 `RULE-SET` 规则引用的规则集名(去重、保序)。供 generate 决定要把哪些
-/// 面板托管的规则集注入输出的 `rule-providers:`。
+/// 提取 rules 文本中 `RULE-SET` 规则引用的规则集名(去重、保序),含逻辑规则内嵌套的引用。
+/// 供 generate 决定要把哪些面板托管的规则集注入输出的 `rule-providers:`。
 pub fn ruleset_refs(rules: &str) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     for (_, line) in rule_lines(rules) {
-        if let Some(name) = ruleset_name(line) {
-            if !out.iter().any(|n| n == name) {
-                out.push(name.to_string());
+        let Ok(names) = ruleset_names_in_line(line) else {
+            continue;
+        };
+        for name in names {
+            if !out.iter().any(|n| n == &name) {
+                out.push(name);
             }
         }
     }
     out
 }
 
-/// `RULE-SET,<name>,...` 规则行引用的规则集名;其他规则(含逻辑规则内嵌的 RULE-SET)返回 `None`。
-fn ruleset_name(line: &str) -> Option<&str> {
-    let mut parts = line.split(',').map(str::trim);
-    parts
+/// 逻辑规则(AND/OR/NOT/SUB-RULE)括号嵌套的最大解析深度。Mihomo 本身不限深度;超过此深度
+/// 时面板无法可靠收集内嵌的规则集引用,宁可在校验阶段拒绝也不静默漏注入。
+const MAX_LOGIC_DEPTH: usize = 16;
+
+/// 一行规则引用到的规则集名,含逻辑规则内嵌套的引用;嵌套深度超限返回 `Err(())`。
+///
+/// 镜像 Mihomo 的解析(`rules/common/base.go` 的 `ParseRulePayload` 与 `rules/logic/logic.go`):
+/// 行级按 `,` 朴素切分(每项去空格),逻辑类型的末项是策略目标、中间部分 join 成 payload;
+/// 逻辑 payload 必须是 `(…)` 包裹,括号平衡扫描后只下钻未被其他区间包含的顶层区间,区间内
+/// 按「无目标」格式再解析(`RULE-SET` 的名字在第 2 项);逻辑内部不支持 SUB-RULE/MATCH。
+/// 无法可靠解析的行(括号不平衡、payload 非 `(…)` 包裹等,Mihomo 同样会拒绝)不收集,保持透传。
+fn ruleset_names_in_line(line: &str) -> Result<Vec<String>, ()> {
+    let mut names = Vec::new();
+    let items: Vec<&str> = line.split(',').map(str::trim).collect();
+    let tp = items
+        .first()
+        .map(|s| s.to_ascii_uppercase())
+        .unwrap_or_default();
+    match tp.as_str() {
+        "RULE-SET" => {
+            if let Some(name) = items.get(1).filter(|n| !n.is_empty()) {
+                names.push(name.to_string());
+            }
+        }
+        "AND" | "OR" | "NOT" | "SUB-RULE" => {
+            // 不足 3 项时分不出 payload 与目标,Mihomo 同样拒绝;透传不收集。
+            if items.len() < 3 {
+                return Ok(names);
+            }
+            let payload = items[1..items.len() - 1].join(",");
+            // SUB-RULE 的行级 payload 会被 Mihomo 再包一层括号后按逻辑 payload 解析。
+            let payload = if tp == "SUB-RULE" {
+                format!("({payload})")
+            } else {
+                payload
+            };
+            collect_logic_payload(&payload, 1, &mut names)?;
+        }
+        _ => {}
+    }
+    Ok(names)
+}
+
+/// 逻辑 payload(`(…)` 包裹):对每个顶层区间内的子规则递归收集规则集引用。
+/// payload 非括号包裹或括号不平衡时该行无法可靠解析,放弃下钻(已收集的保留)。
+fn collect_logic_payload(payload: &str, depth: usize, names: &mut Vec<String>) -> Result<(), ()> {
+    if depth > MAX_LOGIC_DEPTH {
+        return Err(());
+    }
+    let Some(ranges) = next_level_ranges(payload) else {
+        return Ok(());
+    };
+    for (start, end) in ranges {
+        let sub = &payload[start + 1..end];
+        let items: Vec<&str> = sub.split(',').map(str::trim).collect();
+        let tp = items
+            .first()
+            .map(|s| s.to_ascii_uppercase())
+            .unwrap_or_default();
+        match tp.as_str() {
+            "RULE-SET" => {
+                if let Some(name) = items.get(1).filter(|n| !n.is_empty()) {
+                    names.push(name.to_string());
+                }
+            }
+            // 逻辑内的逻辑规则没有目标项,payload 是第 2 项起的全部。
+            "AND" | "OR" | "NOT" if items.len() >= 2 => {
+                collect_logic_payload(&items[1..].join(","), depth + 1, names)?;
+            }
+            // 逻辑内部不支持 SUB-RULE/MATCH;普通类型与未知类型不含规则集引用。
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+/// 逻辑 payload 括号平衡扫描后的顶层区间(字节索引,含两端括号)。镜像 Mihomo 的
+/// `format`+`findSubRuleRange`:括号不平衡返回 `None`;跳过恰好覆盖整个 payload 的
+/// 最外层区间(如 `AND,(RULE-SET,ads),DIRECT` 的单括号,Mihomo 同样不下钻),并丢弃
+/// 被已选区间包含的区间。
+fn next_level_ranges(payload: &str) -> Option<Vec<(usize, usize)>> {
+    if !payload.starts_with('(') || !payload.ends_with(')') {
+        return None;
+    }
+    let mut stack: Vec<usize> = Vec::new();
+    let mut ranges: Vec<(usize, usize)> = Vec::new();
+    for (i, c) in payload.char_indices() {
+        match c {
+            '(' => stack.push(i),
+            ')' => ranges.push((stack.pop()?, i)),
+            _ => {}
+        }
+    }
+    if !stack.is_empty() {
+        return None;
+    }
+    ranges.sort_by_key(|r| r.0);
+    let mut top: Vec<(usize, usize)> = Vec::new();
+    for r in ranges {
+        if r.0 == 0 && r.1 == payload.len() - 1 {
+            continue;
+        }
+        if !top.iter().any(|t| t.0 < r.0 && t.1 > r.1) {
+            top.push(r);
+        }
+    }
+    Some(top)
+}
+
+/// 规则行是否是 MATCH 兜底规则(忽略大小写)。导入规则行时据此把新行插到兜底之前:
+/// 客户端按规则顺序匹配,追加在 MATCH 后的规则永远不会命中。
+pub(crate) fn is_match_line(line: &str) -> bool {
+    line.split(',')
         .next()
-        .filter(|k| k.eq_ignore_ascii_case("RULE-SET"))?;
-    parts.next().filter(|name| !name.is_empty())
+        .is_some_and(|k| k.trim().eq_ignore_ascii_case("MATCH"))
 }
 
 /// 遍历非空、非注释的规则行,带其 1-based 行号(按原始文本编号,使消息与编辑器一致)。
@@ -771,6 +939,94 @@ rules:
     }
 
     #[test]
+    fn logic_nested_rule_set_reference_must_exist() {
+        // 逻辑规则内嵌套的 RULE-SET 同样被 Mihomo 解析,引用不存在的规则集须报错。
+        let errs = validation_errors(input(
+            "AND,((RULE-SET,ghost),(NETWORK,tcp)),DIRECT\nMATCH,DIRECT",
+            vec![],
+            vec![],
+        ));
+        assert_eq!(errs.len(), 1);
+        assert!(errs[0].contains("rules line 1"));
+        assert!(errs[0].contains("unknown rule-set `ghost`"));
+    }
+
+    #[test]
+    fn logic_nested_rule_set_may_reference_provider_or_injected() {
+        // `ads` 来自机场 rule-providers,`mine` 来自本订阅注入;多层嵌套也能找到。
+        let mut inp = input(
+            "AND,((OR,((RULE-SET,ads),(RULE-SET,mine))),(NETWORK,tcp)),DIRECT\nMATCH,DIRECT",
+            vec![],
+            vec![],
+        );
+        inp.rule_providers = vec![RuleProvider {
+            name: "mine".into(),
+            behavior: "domain".into(),
+            format: "yaml".into(),
+            url: "https://panel.example/ruleset".into(),
+        }];
+        assert!(convert(inp).is_ok());
+    }
+
+    #[test]
+    fn sub_rule_line_nested_rule_set_reference_must_exist() {
+        let errs = validation_errors(input(
+            "SUB-RULE,(RULE-SET,ghost,DIRECT),sub\nMATCH,DIRECT",
+            vec![],
+            vec![],
+        ));
+        assert!(errs.iter().any(|e| e.contains("unknown rule-set `ghost`")));
+    }
+
+    #[test]
+    fn single_paren_logic_payload_is_not_collected() {
+        // `AND,(RULE-SET,ads),DIRECT`:单括号恰好覆盖整个 payload,Mihomo 不下钻(rules 为空),
+        // 面板同样不收集——不校验、不注入,原样透传。
+        assert!(convert(input(
+            "AND,(RULE-SET,ghost),DIRECT\nMATCH,DIRECT",
+            vec![],
+            vec![]
+        ))
+        .is_ok());
+    }
+
+    #[test]
+    fn unbalanced_logic_line_passes_through_without_collection() {
+        // 括号不平衡:Mihomo 拒绝该行,面板无法可靠解析则透传,不收集其引用。
+        assert!(convert(input(
+            "AND,((RULE-SET,ghost),(NETWORK,tcp),DIRECT\nMATCH,DIRECT",
+            vec![],
+            vec![]
+        ))
+        .is_ok());
+    }
+
+    #[test]
+    fn logic_nesting_depth_over_limit_is_rejected() {
+        // 16 层嵌套 AND(逻辑内子规则不带 target,与 Mihomo 的 needTarget=false 解析一致)
+        // 超过解析上限:宁可校验拒绝也不静默漏注入。
+        let mut inner = String::from("RULE-SET,ghost");
+        for _ in 0..16 {
+            inner = format!("AND,(({inner}))");
+        }
+        let line = format!("AND,(({inner})),DIRECT");
+        let errs = validation_errors(input(&format!("{line}\nMATCH,DIRECT"), vec![], vec![]));
+        assert!(errs
+            .iter()
+            .any(|e| e.contains("exceeds the supported logic nesting depth")));
+    }
+
+    #[test]
+    fn ruleset_refs_collects_logic_nested_names() {
+        let rules = "AND,((RULE-SET,ads),(NETWORK,tcp)),DIRECT\n\
+                     SUB-RULE,(RULE-SET,sub1,DIRECT),s\n\
+                     RULE-SET,top,DIRECT\n\
+                     AND,(RULE-SET,not-collected),DIRECT\n\
+                     MATCH,DIRECT";
+        assert_eq!(ruleset_refs(rules), vec!["ads", "sub1", "top"]);
+    }
+
+    #[test]
     fn group_name_conflicting_with_a_proxy_is_rejected() {
         let groups = vec![group("hk-1", &["DIRECT"]), group("a", &["DIRECT"])];
         let errs = validation_errors(input("MATCH,DIRECT", vec![node("a")], groups));
@@ -796,6 +1052,47 @@ rules:
         assert!(
             !errs.iter().any(|e| e.contains("`Ok`")),
             "引用环但不在环上的分组不报"
+        );
+    }
+
+    #[test]
+    fn reserved_builtin_names_are_rejected_for_nodes_and_groups() {
+        // 自定义节点/分组占用内置名(DIRECT/REJECT/…):Mihomo 会以 duplicate name 拒绝加载。
+        let errs = validation_errors(input("MATCH,hk-1", vec![node("DIRECT")], vec![]));
+        assert!(errs
+            .iter()
+            .any(|e| e.contains("custom node `DIRECT` conflicts with a reserved built-in name")));
+        let errs = validation_errors(input(
+            "MATCH,hk-1",
+            vec![],
+            vec![group("REJECT", &["hk-1"])],
+        ));
+        assert!(errs
+            .iter()
+            .any(|e| e.contains("custom group `REJECT` conflicts with a reserved built-in name")));
+    }
+
+    #[test]
+    fn global_is_allowed_as_a_custom_group_name() {
+        // GLOBAL 分组是上游支持的用法:上游仅在用户未定义时才内置创建 GLOBAL。
+        let root = out(input(
+            "MATCH,GLOBAL",
+            vec![],
+            vec![group("GLOBAL", &["hk-1"])],
+        ));
+        assert_eq!(names_in(root.get("proxy-groups")), vec!["GLOBAL"]);
+    }
+
+    #[test]
+    fn provider_proxy_with_reserved_name_is_rejected() {
+        let mut inp = input("MATCH,hk-1", vec![], vec![]);
+        inp.provider_yaml =
+            "proxies:\n  - { name: DIRECT, type: ss, server: 1.2.3.4, port: 8388 }\n";
+        let errs = validation_errors(inp);
+        assert!(
+            errs.iter()
+                .any(|e| e
+                    .contains("provider proxy `DIRECT` conflicts with a reserved built-in name"))
         );
     }
 

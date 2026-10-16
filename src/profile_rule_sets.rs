@@ -334,10 +334,9 @@ pub async fn import(
         .map(|n| format!("RULE-SET,{n},{policy}"))
         .collect();
     if !lines.is_empty() {
-        if !content.is_empty() && !content.ends_with('\n') {
-            content.push('\n');
-        }
-        content.push_str(&lines.join("\n"));
+        // 客户端按规则顺序匹配:新行必须插到兜底 MATCH 之前(编辑器同样把 MATCH 钉底),
+        // 追加在 MATCH 后的规则永远不会命中。
+        content = insert_before_fallback_match(&content, &lines);
         sqlx::query("UPDATE rulesets SET content = ?, updated_at = ? WHERE profile_id = ?")
             .bind(&content)
             .bind(now())
@@ -352,6 +351,20 @@ pub async fn import(
         imported,
         regenerate,
     }))
+}
+
+/// 把新规则行插到最后一条 MATCH 兜底行之前;没有 MATCH 时追加到末尾。
+fn insert_before_fallback_match(content: &str, new_lines: &[String]) -> String {
+    let mut lines: Vec<&str> = content.lines().collect();
+    let pos = lines
+        .iter()
+        .rposition(|l| {
+            let t = l.trim();
+            !t.is_empty() && !t.starts_with('#') && crate::converter::is_match_line(t)
+        })
+        .unwrap_or(lines.len());
+    lines.splice(pos..pos, new_lines.iter().map(String::as_str));
+    lines.join("\n")
 }
 
 /// trim 每个名字、丢弃空串并保序去重。

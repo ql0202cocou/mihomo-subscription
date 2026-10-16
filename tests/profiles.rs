@@ -169,6 +169,46 @@ async fn group_member_and_options_round_trip() {
 }
 
 #[tokio::test]
+async fn group_names_reserved_builtins_are_rejected_but_global_is_allowed() {
+    let temp = TempDb::new();
+    let app = build_router(test_state(&temp).await);
+    let cookie = login(&app).await;
+    let id = create_profile(&app, &cookie, "p").await["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // 内置名(DIRECT/REJECT/…)占用会让 Mihomo 以 duplicate name 拒绝加载输出:写入时拦截。
+    for name in ["DIRECT", "REJECT", "PASS-RULE"] {
+        let body = format!(r#"{{"name":"{name}","group_type":"select","members":[]}}"#);
+        let resp = send(
+            &app,
+            authed(
+                "POST",
+                &format!("/api/profiles/{id}/groups"),
+                &cookie,
+                &body,
+            ),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "name={name}");
+    }
+
+    // GLOBAL 分组是上游支持的用法(上游仅在用户未定义时才内置创建),放行。
+    let resp = send(
+        &app,
+        authed(
+            "POST",
+            &format!("/api/profiles/{id}/groups"),
+            &cookie,
+            r#"{"name":"GLOBAL","group_type":"select","members":[]}"#,
+        ),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::CREATED);
+}
+
+#[tokio::test]
 async fn reset_token_changes_the_hosted_link() {
     let temp = TempDb::new();
     let app = build_router(test_state(&temp).await);

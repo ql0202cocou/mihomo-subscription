@@ -73,7 +73,7 @@ GET  /api/auth/session -> 200 {username} | 401
 | POST | `/api/profiles/:id/import-provider-groups` | 是 | 导入机场 `proxy-groups` 为可编辑自定义分组（实时，跳过同名/不支持类型） |
 | GET | `/api/profiles/:id/preview` | 是 | 预览生成的 YAML |
 | POST | `/api/profiles/:id/generate` | 是 | 校验并生成 |
-| POST | `/api/profiles/:id/reset-token` | 是 | 重置该配置 token |
+| POST | `/api/profiles/:id/reset-token` | 是 | 重置该配置 token（响应含 `regenerate`，见「Token 轮换」） |
 | GET | `/api/settings` | 是 | 应用设置 |
 | POST | `/api/settings/reset-public-path` | 是 | 重置公共路径前缀 |
 | GET | `/:public_path_prefix/api/sub/:token` | 否 | 公开订阅下载 |
@@ -105,6 +105,10 @@ GET  /api/auth/session -> 200 {username} | 401
   空名 `400`。
 - `source_url` 写时静态校验（http/https、无内嵌凭据、非本地/私有地址），否则 `400`；真正 SSRF
   在拉取时按 DNS 解析 + IP 固定。
+- 更新（`PUT`）改动 `source_url` 即视为换源：递增 `source_revision`、作废旧缓存与刷新观测
+  （不回退到换源前的输出），随后同步触发一次重拉（尽力而为，`PUT` 等待其完成）。拉取观测、公开
+  刷新时间与缓存回写均绑定写入时的 `source_revision`，换源前发起的在途拉取结果一律丢弃；换源
+  期间并发的生成请求可能因此返回 `409`，重试即可。
 - `last_fetch_status`：`success` / `http_error:<code>` / `ssrf_rejected` / `timeout` / `too_large` /
   `provider_parse`（拉取成功但内容不是可解析的 Mihomo YAML），从未拉取为 `null`。
 
@@ -116,7 +120,8 @@ POST /api/profiles/:id/groups { name, group_type, members, options?, enabled? }
 ```
 
 - 节点 `content` 保存时结构校验，生成时并入**每条配置**输出的 `proxies`，其中 `name` 以库内 `name` 为准
-  （覆盖 content 中缺失或不一致的值）；`PUT` 同体整体替换。
+  （覆盖 content 中缺失或不一致的值）；`PUT` 同体整体替换。节点与分组的 `name` 不得占用 Mihomo 内置
+  保留名（见「生成与校验」），否则 `400`。
 - 全局节点为单一共享池：新建落末尾、`name` 全局唯一；增删改在下次生成（公共链接每拉取即重生）
   进入各配置输出，排序见下立即生效。
 
@@ -148,7 +153,7 @@ GET    /api/profiles/:id/rule-sets                     # 列表；每项含 url�
 POST   /api/profiles/:id/rule-sets   { name, behavior, source?, format, ... }   # name 在本订阅内唯一（重名 409）；字段同 ②
 PUT    /api/profiles/:id/rule-sets/:rsid   { ...同上 }
 DELETE /api/profiles/:id/rule-sets/:rsid
-POST   /api/profiles/:id/rule-sets/import  { names: [②规则集名], policy }   # 复制 ② 定义进 ③（含真实远程 URL）+ 为未引用名追加 RULE-SET,<name>,<policy> 行（policy 须为单个非空名字，不含逗号/换行，否则 400 且不写入）；返回 { imported, regenerate }（imported 为实际复制进 ③ 的定义数，已存在同名的不计；regenerate 见「节点/分组预览与排序」，未追加规则行时为 null）
+POST   /api/profiles/:id/rule-sets/import  { names: [②规则集名], policy }   # 复制 ② 定义进 ③（含真实远程 URL）+ 为未引用名插入 RULE-SET,<name>,<policy> 行（插到最后一条非注释 MATCH 兜底行之前，无 MATCH 则追加末尾；policy 须为单个非空名字，不含逗号/换行，否则 400 且不写入）；返回 { imported, regenerate }（imported 为实际复制进 ③ 的定义数，已存在同名的不计；regenerate 见「节点/分组预览与排序」，未插入规则行时为 null）
 ```
 
 - manual / remote 行为与 ② 一致（校验/渲染/镜像同一套逻辑）。托管在按订阅 token 隔离的链接
@@ -204,9 +209,13 @@ PUT /api/profiles/:id/group-order         { order: [分组名] }              # 
   文案）。详情页「原始订阅源」手动刷新复用本端点。
 - `GET .../preview` 是只读版：有新鲜缓存则返回，否则实时拉取生成；不写缓存、不动 `last_*`。
 - 校验：规则引用的分组须存在于已启用自定义分组；`RULE-SET,<name>` 的规则集须存在于本订阅已启用的
-  ③ 或机场自带 `rule-providers`；自定义分组名可与机场分组重名（机场分组整体替换），但不得与任何
-  代理（机场节点/自定义节点）重名；分组成员须引用存在的机场节点（透传）/启用自定义节点/启用自定义
-  分组，且分组间引用不得成环；输出须合法 Mihomo YAML。成功响应 `{ subscription_url, generated_at }`。
+  ③ 或机场自带 `rule-providers`，逻辑规则（`AND`/`OR`/`NOT`/`SUB-RULE`）内嵌套的 `RULE-SET` 引用同样
+  检查（镜像 Mihomo 的括号解析，嵌套超过 16 层报校验错误）；自定义分组名可与机场分组重名（机场分组
+  整体替换），但不得与任何代理（机场节点/自定义节点）重名；分组成员须引用存在的机场节点（透传）/
+  启用自定义节点/启用自定义分组，且分组间引用不得成环；节点（含机场透传代理与自定义节点）与自定义
+  分组名不得占用 Mihomo 内置保留名——节点侧 `DIRECT`/`REJECT`/`REJECT-DROP`/`PASS`/`PASS-RULE`/
+  `COMPATIBLE`/`GLOBAL`，分组侧同列除 `GLOBAL`（自定义 `GLOBAL` 分组是 Mihomo 支持的用法）；输出须
+  合法 Mihomo YAML。成功响应 `{ subscription_url, generated_at }`。
 
 顶层键处理（转换器逐键显式处理）：
 
@@ -215,16 +224,16 @@ PUT /api/profiles/:id/group-order         { order: [分组名] }              # 
 | `proxies` | 机场块（上游序）+ 自定义块（启用全局节点按 `global_nodes.position` 排），按 `node_section_order` 拼接 |
 | `proxy-groups` | 整体替换为启用的自定义分组（机场分组不透传，需「导入机场分组」），按 `group_order` 重排 |
 | `rules` | 整体替换为用户规则 |
-| `rule-providers` | 机场原样透传；另把被 `RULE-SET` 引用、本订阅自有（③）规则集合并在上（同名覆盖，指向按订阅 token 隔离的托管链接） |
+| `rule-providers` | 机场原样透传；另把被 `RULE-SET` 规则（含逻辑规则内嵌套）引用、本订阅自有（③）规则集合并在上（同名覆盖，指向按订阅 token 隔离的托管链接） |
 | `proxy-providers` | **剥离**（会让客户端拉取绕过 SSRF/缓存的 URL，可能暴露机场 URL） |
 | 其余（`port`/`dns`/`tun`/`sniffer`…） | 原样透传（新 Mihomo 选项无需改转换器） |
 
 - `import-provider-groups`：实时拉取机场，把 `proxy-groups` 解析为可编辑自定义分组写入
-  （`name`/`type`/`proxies`→成员，其余→`options`；跳过同名/不支持类型），返回 `{imported,skipped}`；
-  只改 `custom_groups`，需重新生成才进输出；鉴权 + SSRF 同 `provider-rules`。
+  （`name`/`type`/`proxies`→成员，其余→`options`；跳过同名/不支持类型/占用 Mihomo 内置保留名者），
+  返回 `{imported,skipped}`；只改 `custom_groups`，需重新生成才进输出；鉴权 + SSRF 同 `provider-rules`。
 - 规则集：除透传机场自带 `rule-providers` 外，面板按 `RULE-SET,<name>,<policy>` 注入**本订阅自有规则库
-  （③）**中同名条目，指向按订阅 token 隔离的托管链接；`<name>` 也可仍引用机场条目名。
-  全局 ② 库不参与生成。
+  （③）**中同名条目，指向按订阅 token 隔离的托管链接；`<name>` 也可仍引用机场条目名。逻辑规则
+  （`AND`/`OR`/`NOT`/`SUB-RULE`）内嵌套的 `RULE-SET` 引用同样计入注入集合。全局 ② 库不参与生成。
 
 ### 公开订阅端点
 
@@ -334,6 +343,8 @@ CREATE UNIQUE INDEX idx_profiles_name  ON profiles (name);
 - `node_section_order`：两块先后，JSON 两元数组（`["provider","custom"]` 排列，NULL=机场块在前）；
   **仍 per-profile**，由 `PUT .../node-section-order` 写。迁移 `0004`。
 - `public_refresh_at`：最近一次公开刷新完成时间，成功/失败均记录，供节流与合并使用。迁移 `0013`。
+- `source_revision`：`source_url` 的版本号（创建时 0，每次换源 +1）；拉取观测、公开刷新时间与缓存
+  回写均绑定它，换源前的在途拉取结果据此丢弃。迁移 `0015`。
 - `group_order`：`proxy-groups` 顺序（分组名数组，NULL=创建序）；生成时快照回写、新增落末尾；
   `PUT .../group-order` 覆盖。迁移 `0003`。
 
@@ -513,6 +524,8 @@ CREATE TABLE generated_cache (
   `content_hash`：对生成输出（`output_yaml`）的哈希，随缓存保存；目前仅写入、无读取方。
 - `provider_yaml`：本次输出所用的机场原文，供排序/规则编辑与重置 token/前缀后离线重生成（见「节点/分组
   预览与排序」）。迁移 `0012`；之前生成的缓存为 NULL，下次回源后补齐。
+- `rules_snapshot`：产出本缓存时所用的规则文本快照；重置 token/前缀时若当前规则文本已无法通过校验，
+  用它离线重生成，使缓存中的托管链接换绑后仍对应一份可加载的配置。迁移 `0014`。
 
 ### 迁移
 
@@ -549,7 +562,10 @@ https://<PUBLIC_BASE_URL>/<PUBLIC_PATH_PREFIX>/api/sub/<profile_token>
 ### Token 轮换
 
 重置单配置 token、重置全局 `PUBLIC_PATH_PREFIX`（使所有链接失效）均支持；重置后缓存随即离线重生成，
-使其中按 token 隔离的规则集托管链接改用新值。机场变化时链接保持稳定，除非显式重置。
+使其中按 token 隔离的规则集托管链接改用新值。重生成先用当前规则文本；当前文本校验失败时回退到产出
+该缓存时的规则快照（`rules_snapshot`）再试一次；两者都无法产出合法输出时删除缓存，公开链接在下次
+成功回源前按无缓存处理。`reset-token` 响应含 `regenerate`（同「节点/分组预览与排序」），前端据此
+提示缓存是否已换绑。机场变化时链接保持稳定，除非显式重置。
 公开订阅和规则集在入口、拿到刷新锁后、交付响应前重新校验前缀/token，轮换期间排队或回源中的
 旧能力请求返回统一 `404`，不会从新生成的规则集 URL 获得新前缀。前缀比较在 token 查询前后均为
 恒定时间比较，并始终执行查询。管理生成与创建自动生成在锁内重读 token/来源。
