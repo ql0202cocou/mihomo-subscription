@@ -75,6 +75,11 @@ jobs:
       - name: Install
         run: npm ci
 
+      # Advisory check against the lockfile. High/critical findings fail the
+      # build; lower severities are too noisy across the dev dependency tree.
+      - name: Audit dependencies
+        run: npm audit --package-lock-only --audit-level=high
+
       - name: Lint
         run: npm run lint
 
