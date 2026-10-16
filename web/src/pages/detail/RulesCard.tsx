@@ -216,6 +216,14 @@ export default function RulesCard({
   // 服务端最近确认的规则(加载或保存成功时更新):保存失败时回滚到它。不用闭包里的 `rules`,
   // 因为 persist 不依赖它(可能已过期),且连续保存时应回到服务端实际持有的状态。
   const saved = useRef<{ rules: string[]; match: string | null }>({ rules: [], match: null });
+  // 最新规则的 ref 镜像:「先 await、再基于当前规则合并」的异步流程(导入机场规则)从它取基座——
+  // 请求在途期间用户可能已增删规则,闭包里的 state 在 await 返回时早已过期。
+  const rulesRef = useRef(rules);
+  const matchRef = useRef(matchLine);
+  useEffect(() => {
+    rulesRef.current = rules;
+    matchRef.current = matchLine;
+  }, [rules, matchLine]);
 
   useEffect(() => {
     const all = initial.split("\n").map((l) => l.trim()).filter((l) => l !== "");
@@ -451,7 +459,10 @@ export default function RulesCard({
     setImporting(true);
     try {
       const res = await api<ProviderRulesResponse>(`/api/profiles/${profileId}/provider-rules`);
-      const existing = new Set([...rules, ...(matchLine ? [matchLine] : [])]);
+      // 请求在途期间用户可能已增删规则:以最新状态为基座去重合并,不回滚在途编辑。
+      const base = rulesRef.current;
+      const baseMatch = matchRef.current;
+      const existing = new Set([...base, ...(baseMatch ? [baseMatch] : [])]);
       // 丢弃机场规则里的 MATCH(兜底统一由钉底的 matchLine 管理)与本地已有的重复行。
       const incoming = res.rules
         .map((l) => l.trim())
@@ -460,7 +471,7 @@ export default function RulesCard({
         message.info(t("rules.importNone"));
         return;
       }
-      if (await persist([...rules, ...incoming], matchLine)) {
+      if (await persist([...base, ...incoming], baseMatch)) {
         message.success(t("rules.imported", { count: incoming.length }));
       }
     } catch (e) {

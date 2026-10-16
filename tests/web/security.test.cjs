@@ -176,3 +176,134 @@ test('detail reloads accept the newest result and an unmounted generation is ign
   assert.equal(requests.length, 4); // No obsolete reload after navigating away.
   assert.equal(messages.length, 0);
 });
+
+function rulesCardModule(state, api) {
+  const passthrough = ({ children }) => children;
+  const arrayMove = (arr, from, to) => {
+    const next = arr.slice();
+    const [moved] = next.splice(from, 1);
+    next.splice(to, 0, moved);
+    return next;
+  };
+  return load('pages/detail/RulesCard.tsx', {
+    react: state.react,
+    antd: {
+      App: { useApp: () => ({ message: { info: () => {}, success: () => {}, error: () => {} } }) },
+      AutoComplete: 'AutoComplete', Button: 'Button', Checkbox: 'Checkbox',
+      Input: Object.assign(() => null, { TextArea: () => null }),
+      InputNumber: 'InputNumber', Modal: 'Modal', Popconfirm: 'Popconfirm',
+      Segmented: 'Segmented', Select: 'Select', Switch: 'Switch',
+      Typography: { Text: 'Text' },
+    },
+    '@ant-design/icons': icons,
+    '@dnd-kit/core': {
+      DndContext: passthrough, PointerSensor: {}, closestCenter: () => {},
+      useSensor: () => {}, useSensors: () => [],
+    },
+    '@dnd-kit/sortable': {
+      SortableContext: passthrough, arrayMove, verticalListSortingStrategy: {},
+      useSortable: () => ({ attributes: {}, listeners: {}, setNodeRef: () => {} }),
+    },
+    '@dnd-kit/utilities': { CSS: { Transform: { toString: () => undefined } } },
+    'react-i18next': translation,
+    '../../api': { api, errorMessage: () => 'failed' },
+    '../../components/regenerate': { useRegenerateNotice: () => () => {} },
+    '../../components/useSerialSave': { useSerialSave: () => async (run) => {
+      try { return { ok: true, value: await run(), latest: true }; }
+      catch (error) { return { ok: false, error, latest: true }; }
+    } },
+    './groupSchema': { BUILTIN_POLICIES: ['DIRECT', 'REJECT'] },
+    '../../components/fields': { TypeChips: 'TypeChips' },
+    '../../components/ruleSetConstants': {
+      RULE_SET_BEHAVIORS: [], RULE_SET_MANUAL_FORMATS: [],
+      RULE_SET_REMOTE_FORMATS: [], RULE_SET_SOURCES: [],
+    },
+  });
+}
+
+// 「导入机场规则」请求在途期间用户继续编辑(删除/重排):导入完成时必须合并在最新状态上,
+// 不能回滚在途编辑。返回各辅助函数;puts 按顺序记录每次 PUT 提交完整规则文本。
+function rulesCardSession(initial) {
+  const state = hooks();
+  const puts = [];
+  const providerRules = deferred();
+  const api = async (url, options = {}) => {
+    if ((options.method ?? 'GET') === 'PUT') {
+      puts.push(JSON.parse(options.body).content);
+      return { regenerate: { status: 'applied' } };
+    }
+    if (url.endsWith('/provider-rules')) return providerRules.promise;
+    if (url.endsWith('/proxies')) return { proxies: [], groups: [] };
+    return [];
+  };
+  const { default: RulesCard } = rulesCardModule(state, api);
+  const props = {
+    profileId: 'p', initial, nodes: [], groups: [], generatedAt: null, errors: [],
+    onSaved: () => {}, onRegenerate: () => {},
+  };
+  const render = () => state.render(RulesCard, props);
+  return {
+    puts, providerRules,
+    async mount() {
+      render(); state.effects();
+      await tick();
+      render(); state.effects();
+    },
+    render() { const tree = render(); state.effects(); return tree; },
+    startImport(tree) {
+      return find(tree, (e) => e.props?.title === 'rules.importConfirm').props.onConfirm();
+    },
+  };
+}
+
+test('importing provider rules merges onto a deletion made while the request is in flight', async () => {
+  const session = rulesCardSession('DOMAIN,keep.example,DIRECT\nMATCH,DIRECT');
+  await session.mount();
+
+  // 发起「导入机场规则」:GET 挂起。
+  let tree = session.render();
+  const importing = session.startImport(tree);
+  await tick();
+
+  // 请求在途期间,用户删掉唯一的自定义规则。
+  tree = session.render();
+  find(tree, (e) => e.props?.line === 'DOMAIN,keep.example,DIRECT' && e.props?.onRemove)
+    .props.onRemove();
+  session.render();
+  assert.deepEqual(session.puts, ['MATCH,DIRECT']);
+
+  // 机场规则到达:应合并在删除后的最新状态上,不恢复被删的行。
+  session.providerRules.resolve({ rules: ['DOMAIN,incoming.example,DIRECT'] });
+  await importing;
+  session.render();
+  assert.deepEqual(session.puts,
+    ['MATCH,DIRECT', 'DOMAIN,incoming.example,DIRECT\nMATCH,DIRECT']);
+});
+
+test('importing provider rules merges onto a reorder made while the request is in flight', async () => {
+  const session = rulesCardSession('DOMAIN,a.example,DIRECT\nDOMAIN,b.example,DIRECT\nMATCH,DIRECT');
+  await session.mount();
+
+  let tree = session.render();
+  const importing = session.startImport(tree);
+  await tick();
+
+  // 请求在途期间,用户拖拽把 b 排到 a 前。
+  tree = session.render();
+  find(tree, (e) => e.props?.onDragEnd).props.onDragEnd({
+    active: { id: 'DOMAIN,b.example,DIRECT' },
+    over: { id: 'DOMAIN,a.example,DIRECT' },
+  });
+  session.render();
+  assert.deepEqual(session.puts,
+    ['DOMAIN,b.example,DIRECT\nDOMAIN,a.example,DIRECT\nMATCH,DIRECT']);
+
+  // 机场规则到达:追加在新顺序之后,不回滚重排。
+  session.providerRules.resolve({ rules: ['DOMAIN,incoming.example,DIRECT'] });
+  await importing;
+  session.render();
+  assert.deepEqual(session.puts, [
+    'DOMAIN,b.example,DIRECT\nDOMAIN,a.example,DIRECT\nMATCH,DIRECT',
+    'DOMAIN,b.example,DIRECT\nDOMAIN,a.example,DIRECT\nDOMAIN,incoming.example,DIRECT\nMATCH,DIRECT',
+  ]);
+});
