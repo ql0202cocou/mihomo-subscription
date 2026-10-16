@@ -141,3 +141,21 @@ async fn update_and_delete_by_id() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 }
+
+#[tokio::test]
+async fn reserved_builtin_names_are_rejected() {
+    let temp = TempDb::new();
+    let app = build_router(test_state(&temp).await);
+    let cookie = login(&app).await;
+
+    // 内置名(DIRECT/REJECT/…)占用会让 Mihomo 以 duplicate name 拒绝加载输出:写入时拦截。
+    for name in ["DIRECT", "REJECT", "PASS-RULE", "GLOBAL"] {
+        let body = format!(r#"{{"name":"{name}","node_type":"ss","content":"{NODE_CONTENT}"}}"#);
+        let resp = app
+            .clone()
+            .oneshot(authed("POST", "/api/global-nodes", &cookie, &body))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "name={name}");
+    }
+}

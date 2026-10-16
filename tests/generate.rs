@@ -1241,3 +1241,147 @@ async fn admin_generate_waits_for_the_per_profile_lock() {
     let resp = app.oneshot(generate()).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
 }
+
+/// 第二次回源可暂停的 fetcher:第一次(新建自动拉取)立即放行,第二次(在途公开刷新)暂停
+/// 直到显式释放,之后全部放行;按 URL 返回新旧两份机场内容。
+struct SourceSwitcher {
+    calls: AtomicUsize,
+    started: tokio::sync::Semaphore,
+    release: tokio::sync::Semaphore,
+}
+
+#[async_trait::async_trait]
+impl RemoteFetcher for SourceSwitcher {
+    async fn fetch(&self, url: &str) -> Result<Fetched, FetchError> {
+        let count = self.calls.fetch_add(1, Ordering::SeqCst);
+        if count == 1 {
+            self.started.add_permits(1);
+            self.release.acquire().await.unwrap().forget();
+        }
+        let body = if url.contains("new.example") {
+            PROVIDER_YAML.replace("hk-1", "new-1")
+        } else {
+            PROVIDER_YAML.to_string()
+        };
+        Ok(Fetched {
+            body,
+            subscription_userinfo: None,
+        })
+    }
+}
+
+#[tokio::test]
+async fn source_change_discards_old_inflight_fetch_result() {
+    let temp = TempDb::new();
+    let fetcher = Arc::new(SourceSwitcher {
+        calls: AtomicUsize::new(0),
+        started: tokio::sync::Semaphore::new(0),
+        release: tokio::sync::Semaphore::new(0),
+    });
+    let mut state = test_state_with_fetcher(&temp, fetcher.clone()).await;
+    Arc::get_mut(&mut state)
+        .unwrap()
+        .public_refresh_min_interval = Duration::from_secs(3600);
+    let app = build_router(state.clone());
+    let cookie = login(&app).await;
+
+    let resp = app
+        .clone()
+        .oneshot(authed(
+            "POST",
+            "/api/profiles",
+            &cookie,
+            r#"{"name":"P","source_url":"https://old.example/sub"}"#,
+        ))
+        .await
+        .unwrap();
+    let profile = json(resp).await;
+    let id = profile["id"].as_str().unwrap();
+    let sub = sub_path(profile["subscription_url"].as_str().unwrap());
+    // 让缓存过期,使下一次公开拉取回源。
+    sqlx::query("UPDATE generated_cache SET generated_at = '2000-01-01T00:00:00Z'")
+        .execute(&state.db)
+        .await
+        .unwrap();
+
+    // 在途公开刷新:第二次回源被暂停。
+    let inflight_app = app.clone();
+    let inflight_sub = sub.clone();
+    let inflight = tokio::spawn(async move {
+        inflight_app
+            .oneshot(Request::get(&inflight_sub).body(Body::empty()).unwrap())
+            .await
+            .unwrap()
+    });
+    tokio::time::timeout(Duration::from_secs(3), fetcher.started.acquire())
+        .await
+        .unwrap()
+        .unwrap()
+        .forget();
+
+    // 换源(并发发起):PUT 内按新来源自动回源要等 per-profile 锁,而锁被在途刷新持有——
+    // 换源写库(版本递增)先于自动回源,等版本落库后再释放旧在途回源。
+    let put_app = app.clone();
+    let put_cookie = cookie.clone();
+    let put_path = format!("/api/profiles/{id}");
+    let put = tokio::spawn(async move {
+        put_app
+            .oneshot(authed(
+                "PUT",
+                &put_path,
+                &put_cookie,
+                r#"{"source_url":"https://new.example/sub"}"#,
+            ))
+            .await
+            .unwrap()
+    });
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let rev: i64 = sqlx::query_scalar("SELECT source_revision FROM profiles WHERE id = ?")
+                .bind(id)
+                .fetch_one(&state.db)
+                .await
+                .unwrap();
+            if rev == 1 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+
+    // 释放在途请求:它按手中的旧来源结果完成(请求始于换源前),但结果不得写入缓存。
+    fetcher.release.add_permits(1);
+    let resp = put.await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        json(resp).await["source_url_masked"],
+        "https://new.example/sub"
+    );
+    let resp = inflight.await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(text(resp).await.contains("hk-1"));
+
+    // 缓存与新公开拉取都是新来源内容,不再回源旧地址。
+    let resp = app
+        .clone()
+        .oneshot(Request::get(&sub).body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = text(resp).await;
+    assert!(body.contains("new-1") && !body.contains("hk-1"));
+    let provider_yaml: String =
+        sqlx::query_scalar("SELECT provider_yaml FROM generated_cache WHERE profile_id = ?")
+            .bind(id)
+            .fetch_one(&state.db)
+            .await
+            .unwrap();
+    assert!(provider_yaml.contains("new-1"));
+    assert_eq!(
+        fetcher.calls.load(Ordering::SeqCst),
+        3,
+        "新建、在途旧来源、换源后新来源各一次;旧在途结果未覆盖新缓存"
+    );
+}

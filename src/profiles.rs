@@ -318,6 +318,10 @@ pub async fn update(
         None => existing.name,
     };
     // 只写 URL:除非提供非空值,否则保持已存值。
+    let source_changed = body
+        .source_url
+        .as_deref()
+        .is_some_and(|u| !u.trim().is_empty() && u.trim() != existing.source_url);
     let source_url = match body.source_url {
         Some(u) if !u.trim().is_empty() => {
             let trimmed = u.trim();
@@ -326,16 +330,38 @@ pub async fn update(
         }
         _ => existing.source_url,
     };
-    sqlx::query(
-        "UPDATE profiles SET name = ?, source_url = ?, updated_at = ?
-         WHERE id = ?",
-    )
-    .bind(&name)
-    .bind(&source_url)
-    .bind(now())
-    .bind(&id)
-    .execute(&state.db)
-    .await?;
+    if source_changed {
+        // 换源:递增来源版本(在途的旧来源回源结果据此丢弃)、清空旧来源缓存(不做跨换源回退,
+        // 避免界面已显示新来源却仍下发旧节点)、重置公开刷新时间(下一次公开拉取立即回源)。
+        sqlx::query(
+            "UPDATE profiles SET name = ?, source_url = ?, source_revision = source_revision + 1, \
+             public_refresh_at = NULL, updated_at = ? WHERE id = ?",
+        )
+        .bind(&name)
+        .bind(&source_url)
+        .bind(now())
+        .bind(&id)
+        .execute(&state.db)
+        .await?;
+        sqlx::query("DELETE FROM generated_cache WHERE profile_id = ?")
+            .bind(&id)
+            .execute(&state.db)
+            .await?;
+        // 与新建一致:换源后立即按新来源拉取一次,使 last_fetch_* 与缓存尽快反映真实状态。
+        // 尽力而为,拉取失败只记状态、不影响本次保存。
+        crate::generate::generate_best_effort(&state, &id).await;
+    } else {
+        sqlx::query(
+            "UPDATE profiles SET name = ?, source_url = ?, updated_at = ?
+             WHERE id = ?",
+        )
+        .bind(&name)
+        .bind(&source_url)
+        .bind(now())
+        .bind(&id)
+        .execute(&state.db)
+        .await?;
+    }
 
     let row = load_profile_row(&state, &id).await?;
     Ok(Json(detail(&state, row).await?))
@@ -361,10 +387,14 @@ pub async fn delete(
 pub struct TokenResponse {
     token: String,
     subscription_url: String,
+    /// 缓存迁移结果(见 `generate::regenerate_for_rotation`):当前规则草稿未通过校验且无法用
+    /// 最近合法规则迁移时为 `invalid`(缓存已清空),前端据此如实提示。
+    regenerate: Regenerated,
 }
 
 /// 重置订阅 token。旧 token 立即失效(公开端点按 token 查库);缓存随即离线重生成,使其中按 token
-/// 隔离的规则集托管链接改用新 token。
+/// 隔离的规则集托管链接改用新 token。当前规则草稿未通过校验时回退到最近一份合法规则迁移;
+/// 仍无法产出合法输出则清空缓存(下次公开拉取回源重建)。
 pub async fn reset_token(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -377,10 +407,11 @@ pub async fn reset_token(
         .bind(&id)
         .execute(&state.db)
         .await?;
-    regenerate_from_cache(&state, &id).await;
+    let regenerate = crate::generate::regenerate_for_rotation(&state, &id).await;
     Ok(Json(TokenResponse {
         subscription_url: state.subscription_url(&token),
         token,
+        regenerate,
     }))
 }
 
@@ -653,6 +684,14 @@ fn validate_group(body: &GroupBody) -> ApiResult<()> {
     if body.name.trim().is_empty() {
         return Err(ApiError::BadRequest("name is required".into()));
     }
+    // 内置保留名(DIRECT/REJECT/…,GLOBAL 分组除外——上游支持自定义 GLOBAL 分组):占用会让
+    // Mihomo 以 duplicate name 拒绝加载整个输出。
+    if crate::converter::RESERVED_GROUP_NAMES.contains(&body.name.trim()) {
+        return Err(ApiError::BadRequest(format!(
+            "name `{}` conflicts with a reserved built-in name",
+            body.name.trim()
+        )));
+    }
     if !GROUP_TYPES.contains(&body.group_type.as_str()) {
         return Err(ApiError::BadRequest(format!(
             "group_type must be one of {GROUP_TYPES:?}"
@@ -755,6 +794,11 @@ pub async fn import_provider_groups(
             skipped += 1;
             continue;
         };
+        // 内置保留名(DIRECT/REJECT/…)与不支持类型一样跳过:导入后生成会被校验拦截。
+        if crate::converter::RESERVED_GROUP_NAMES.contains(&name.as_str()) {
+            skipped += 1;
+            continue;
+        }
         if !taken_names.insert(name.clone()) {
             skipped += 1; // name already present
             continue;

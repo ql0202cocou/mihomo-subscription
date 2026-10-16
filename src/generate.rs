@@ -33,6 +33,9 @@ struct ProfileCore {
     name: String,
     source_url: String,
     token: String,
+    /// 来源版本(换源时递增):回源状态记录与缓存回写均绑定它,换源前已在途的旧来源
+    /// 回源结果在写入时因版本不符被丢弃。
+    source_revision: i64,
 }
 
 #[derive(FromRow, Clone)]
@@ -47,6 +50,9 @@ struct Built {
     userinfo: Option<String>,
     /// 本次转换所用的机场原文,随缓存保存,供编辑后离线重生成(见 [`regenerate_from_cache`])。
     provider_yaml: String,
+    /// 本次转换所用的规则文本,随缓存保存(快照),供轮换 token/前缀时在当前草稿未通过校验的
+    /// 情况下用最近一份合法规则离线重生成(见 [`regenerate_for_rotation`])。
+    rules: String,
     content_hash: String,
     generated_at: String,
     /// 与机场 `rule-providers` 撞名、已被面板托管版覆盖的自定义规则集名(空表示无冲突)。
@@ -87,7 +93,14 @@ pub async fn generate(
                 Err(BuildError::Upstream(label)) => return Err(ApiError::Upstream(label)),
                 Err(BuildError::Internal) => return Err(ApiError::Internal),
             };
-            persist_cache_and_group_order(&state, &profile.id, &built).await?;
+            // 拉取期间换源:旧来源结果不落缓存,提示重试(重试即按新来源生成)。
+            if !persist_cache_and_group_order(&state, &profile.id, &built, profile.source_revision)
+                .await?
+            {
+                return Err(ApiError::Conflict(
+                    "source_url changed while generating; please retry".into(),
+                ));
+            }
             Ok((profile, built))
         })
         .await?;
@@ -108,7 +121,8 @@ pub async fn generate_best_effort(state: &AppState, id: &str) {
                 return;
             };
             if let Ok(built) = fetch_convert_and_record(state, &profile).await {
-                let _ = persist_cache_and_group_order(state, id, &built).await;
+                let _ =
+                    persist_cache_and_group_order(state, id, &built, profile.source_revision).await;
             }
         })
         .await;
@@ -134,10 +148,10 @@ pub async fn preview(
         .fetch(&profile.source_url)
         .await
         .map_err(|e| ApiError::Upstream(e.status_label()))?;
-    let (yaml, _) = convert(&state, &profile.id, &profile.token, &fetched.body)
+    let out = convert(&state, &profile.id, &profile.token, &fetched.body, None)
         .await?
         .map_err(map_convert_err)?;
-    Ok(yaml_body(yaml))
+    Ok(yaml_body(out.yaml))
 }
 
 #[derive(Serialize)]
@@ -235,12 +249,16 @@ async fn serve_or_refresh(state: &AppState, profile: &ProfileCore, prefix: &str)
             }
             let result = fetch_convert_and_record(state, profile).await;
             // 使用完成时间,慢失败后等待者也共享结果;无需改变旧成功缓存的时间戳。
-            let _ = sqlx::query("UPDATE profiles SET public_refresh_at = ? WHERE id = ?")
-                .bind(now()).bind(&profile.id).execute(&state.db).await;
+            // 绑定来源版本:换源后本次旧来源尝试不再记录,下一次公开拉取立即按新来源重试。
+            let _ = sqlx::query("UPDATE profiles SET public_refresh_at = ? WHERE id = ? AND source_revision = ?")
+                .bind(now()).bind(&profile.id).bind(profile.source_revision).execute(&state.db).await;
             match result {
                 Ok(built) => {
-                    if persist_cache_and_group_order(state, &profile.id, &built).await.is_err() {
-                        tracing::error!(profile = %profile.id, "failed to persist generated cache");
+                    match persist_cache_and_group_order(state, &profile.id, &built, profile.source_revision).await {
+                        Ok(true) => {}
+                        // 换源后丢弃旧来源结果、不落缓存;本次在途请求仍按手中结果返回。
+                        Ok(false) => tracing::warn!(profile = %profile.id, "discarded fetch result: source changed while fetching"),
+                        Err(_) => tracing::error!(profile = %profile.id, "failed to persist generated cache"),
                     }
                     Some(Served {
                         yaml: built.yaml,
@@ -284,60 +302,76 @@ async fn fetch_convert_and_record(
         Ok(f) => f,
         Err(e) => {
             let label = e.status_label();
-            let _ = update_last_fetch(state, &profile.id, &label).await;
+            let _ = update_last_fetch(state, &profile.id, &label, profile.source_revision).await;
             return Err(BuildError::Upstream(label));
         }
     };
-    let _ = update_last_fetch(state, &profile.id, "success").await;
+    let _ = update_last_fetch(state, &profile.id, "success", profile.source_revision).await;
 
-    let converted = convert(state, &profile.id, &profile.token, &fetched.body)
+    let converted = convert(state, &profile.id, &profile.token, &fetched.body, None)
         .await
         // DB 错误已被 `From<sqlx::Error>` 脱敏并记日志;传播为内部错误,不再误报为机场拉取失败。
         .map_err(|_| BuildError::Internal)?;
-    let (yaml, ruleset_conflicts) = match converted {
+    let out = match converted {
         Ok(out) => out,
         Err(ConvertError::Validation(v)) => return Err(BuildError::Validation(v)),
         // 拉取成功但内容不是可解析的 Mihomo YAML(如机场不认 UA 返回的 base64 节点列表):同样是
         // 机场侧问题,覆盖上面刚写入的 `success`,使列表/详情如实反映。
         Err(ConvertError::ProviderParse) => {
             let label = "provider_parse".to_string();
-            let _ = update_last_fetch(state, &profile.id, &label).await;
+            let _ = update_last_fetch(state, &profile.id, &label, profile.source_revision).await;
             return Err(BuildError::Upstream(label));
         }
         Err(ConvertError::OutputSerialize) => return Err(BuildError::Internal),
     };
-    if !ruleset_conflicts.is_empty() {
+    if !out.ruleset_conflicts.is_empty() {
         tracing::warn!(
             profile = %profile.id,
-            conflicts = ?ruleset_conflicts,
+            conflicts = ?out.ruleset_conflicts,
             "custom rule-sets override same-named provider rule-providers",
         );
     }
 
-    let content_hash = content_hash_of(&yaml);
+    let content_hash = content_hash_of(&out.yaml);
     Ok(Built {
-        yaml,
+        yaml: out.yaml,
         userinfo: fetched.subscription_userinfo,
         provider_yaml: fetched.body,
+        rules: out.rules,
         content_hash,
         generated_at: now(),
-        ruleset_conflicts,
+        ruleset_conflicts: out.ruleset_conflicts,
     })
 }
 
+/// 一次成功转换的产出。
+struct Converted {
+    yaml: String,
+    ruleset_conflicts: Vec<String>,
+    /// 本次转换实际使用的规则文本(随缓存快照;轮换 token/前缀时,当前草稿未通过校验则用它
+    /// 离线重生成,见 [`regenerate_for_rotation`])。
+    rules: String,
+}
+
 /// 从 DB 装载转换输入并运行转换器。外层 `ApiResult` 表示 DB 错误;内层 `Result` 是转换器结果。
+/// `rules_override` 取代库中当前规则文本(仅轮换回退使用,见 [`regenerate_for_rotation`])。
 async fn convert(
     state: &AppState,
     profile_id: &str,
     token: &str,
     provider_yaml: &str,
-) -> ApiResult<Result<(String, Vec<String>), ConvertError>> {
-    let rules =
-        sqlx::query_scalar::<_, String>("SELECT content FROM rulesets WHERE profile_id = ?")
-            .bind(profile_id)
-            .fetch_optional(&state.db)
-            .await?
-            .unwrap_or_default();
+    rules_override: Option<&str>,
+) -> ApiResult<Result<Converted, ConvertError>> {
+    let rules = match rules_override {
+        Some(rules) => rules.to_string(),
+        None => {
+            sqlx::query_scalar::<_, String>("SELECT content FROM rulesets WHERE profile_id = ?")
+                .bind(profile_id)
+                .fetch_optional(&state.db)
+                .await?
+                .unwrap_or_default()
+        }
+    };
 
     // 被本 profile `RULE-SET` 规则引用、且启用的 **本订阅自有** 规则集(③)→ 注入输出
     // `rule-providers:`(`url` 指向按订阅 token 隔离的托管链接)。未被引用的不注入;全局 ② 库不参与
@@ -430,6 +464,11 @@ async fn convert(
         node_section_order,
         group_order,
         rule_providers,
+    })
+    .map(|(yaml, ruleset_conflicts)| Converted {
+        yaml,
+        ruleset_conflicts,
+        rules,
     }))
 }
 
@@ -445,7 +484,7 @@ fn map_convert_err(e: ConvertError) -> ApiError {
 
 async fn load_core(state: &AppState, id: &str) -> ApiResult<Option<ProfileCore>> {
     Ok(sqlx::query_as::<_, ProfileCore>(
-        "SELECT id, name, source_url, token FROM profiles WHERE id = ?",
+        "SELECT id, name, source_url, token, source_revision FROM profiles WHERE id = ?",
     )
     .bind(id)
     .fetch_optional(&state.db)
@@ -454,7 +493,7 @@ async fn load_core(state: &AppState, id: &str) -> ApiResult<Option<ProfileCore>>
 
 async fn load_core_by_token(state: &AppState, token: &str) -> ApiResult<Option<ProfileCore>> {
     Ok(sqlx::query_as::<_, ProfileCore>(
-        "SELECT id, name, source_url, token FROM profiles WHERE token = ?",
+        "SELECT id, name, source_url, token, source_revision FROM profiles WHERE token = ?",
     )
     .bind(token)
     .fetch_optional(&state.db)
@@ -470,19 +509,25 @@ async fn load_cache(state: &AppState, profile_id: &str) -> ApiResult<Option<Cach
     .await?)
 }
 
+/// 持久化生成缓存并回写分组顺序快照。缓存回写绑定来源版本:换源前已在途的旧来源结果在
+/// 写入时版本不符(0 行命中)被整体丢弃——既不写入旧来源内容,也不触碰可能已由新来源
+/// 写入的缓存。返回是否真的写入了缓存。
 async fn persist_cache_and_group_order(
     state: &AppState,
     profile_id: &str,
     built: &Built,
-) -> ApiResult<()> {
-    sqlx::query(
-        "INSERT INTO generated_cache (profile_id, content_hash, output_yaml, subscription_userinfo, provider_yaml, generated_at)
-         VALUES (?, ?, ?, ?, ?, ?)
+    source_revision: i64,
+) -> ApiResult<bool> {
+    let result = sqlx::query(
+        "INSERT INTO generated_cache (profile_id, content_hash, output_yaml, subscription_userinfo, provider_yaml, rules_snapshot, generated_at)
+         SELECT ?, ?, ?, ?, ?, ?, ?
+         WHERE (SELECT source_revision FROM profiles WHERE id = ?) = ?
          ON CONFLICT(profile_id) DO UPDATE SET
             content_hash = excluded.content_hash,
             output_yaml = excluded.output_yaml,
             subscription_userinfo = excluded.subscription_userinfo,
             provider_yaml = excluded.provider_yaml,
+            rules_snapshot = excluded.rules_snapshot,
             generated_at = excluded.generated_at",
     )
     .bind(profile_id)
@@ -490,9 +535,15 @@ async fn persist_cache_and_group_order(
     .bind(&built.yaml)
     .bind(&built.userinfo)
     .bind(&built.provider_yaml)
+    .bind(&built.rules)
     .bind(&built.generated_at)
+    .bind(profile_id)
+    .bind(source_revision)
     .execute(&state.db)
     .await?;
+    if result.rows_affected() == 0 {
+        return Ok(false);
+    }
 
     // 把输出的 proxy-group 顺序快照回写,使其在机场刷新间保持稳定:仍存在的分组保住其位置,
     // 新增的落到末尾。之后的手动拖拽会经 `set_group_order` 覆盖本快照。节点顺序是全局的
@@ -503,7 +554,7 @@ async fn persist_cache_and_group_order(
     {
         tracing::warn!(profile = %profile_id, "failed to snapshot group order");
     }
-    Ok(())
+    Ok(true)
 }
 
 /// 把输出的 proxy-group 顺序回写到 `profiles.group_order`(新增分组持久化到末尾)。节点顺序是
@@ -538,13 +589,23 @@ fn order_json(root: &serde_yaml::Value, key: &str, keep: impl Fn(&str) -> bool) 
     }
 }
 
-async fn update_last_fetch(state: &AppState, profile_id: &str, status: &str) -> ApiResult<()> {
-    sqlx::query("UPDATE profiles SET last_fetch_at = ?, last_fetch_status = ? WHERE id = ?")
-        .bind(now())
-        .bind(status)
-        .bind(profile_id)
-        .execute(&state.db)
-        .await?;
+async fn update_last_fetch(
+    state: &AppState,
+    profile_id: &str,
+    status: &str,
+    source_revision: i64,
+) -> ApiResult<()> {
+    // 绑定来源版本:换源后在途的旧来源结果不再落状态(0 行命中,调用方尽力而为忽略)。
+    sqlx::query(
+        "UPDATE profiles SET last_fetch_at = ?, last_fetch_status = ? \
+         WHERE id = ? AND source_revision = ?",
+    )
+    .bind(now())
+    .bind(status)
+    .bind(profile_id)
+    .bind(source_revision)
+    .execute(&state.db)
+    .await?;
     Ok(())
 }
 
@@ -561,7 +622,7 @@ pub enum Regenerated {
 }
 
 /// 用缓存中的机场原文离线重跑完整转换(校验、`rule-providers` 注入、排序),不重拉机场。规则/排序
-/// 编辑与重置 token/前缀后调用,使改动立即反映到所服务的订阅,且与完整生成走同一条路径。
+/// 编辑后调用,使改动立即反映到所服务的订阅,且与完整生成走同一条路径。
 ///
 /// - 校验失败时保留上一份合法输出:编辑已入库,坏配置不会被下发,逐条错误经返回值交给调用方。
 /// - 尚未生成、或升级前生成的缓存(无机场原文)为 no-op,改动在下次回源拉取后生效。
@@ -569,54 +630,128 @@ pub enum Regenerated {
 /// - 与公开刷新共用 per-profile 锁,避免并发刷新用旧输入覆盖本次结果。
 /// - 尽力而为:出错时记日志并返回 `Pending`,绝不让发起的保存请求失败。
 pub async fn regenerate_from_cache(state: &AppState, profile_id: &str) -> Regenerated {
+    state
+        .keyed_lock
+        .run(
+            profile_id,
+            regenerate_locked(state, profile_id, RulesSource::Current),
+        )
+        .await
+        .unwrap_or_else(|_| {
+            tracing::warn!(profile = %profile_id, "failed to regenerate cache");
+            Regenerated::Pending
+        })
+}
+
+/// 离线重生成的规则来源。
+enum RulesSource {
+    /// 库中当前规则(规则/排序编辑后的常规路径)。
+    Current,
+    /// 产出该缓存的最近一份合法规则(随缓存保存的快照;仅轮换回退使用)。
+    Snapshot,
+}
+
+/// [`regenerate_from_cache`] 的锁内实现:按 `source` 选择规则文本离线重跑完整转换。
+async fn regenerate_locked(
+    state: &AppState,
+    profile_id: &str,
+    source: RulesSource,
+) -> ApiResult<Regenerated> {
+    let Some(profile) = load_core(state, profile_id).await? else {
+        return Ok(Regenerated::Pending);
+    };
+    let Some((Some(provider_yaml), userinfo, generated_at, rules_snapshot)) =
+        sqlx::query_as::<_, (Option<String>, Option<String>, String, Option<String>)>(
+            "SELECT provider_yaml, subscription_userinfo, generated_at, rules_snapshot \
+             FROM generated_cache WHERE profile_id = ?",
+        )
+        .bind(profile_id)
+        .fetch_optional(&state.db)
+        .await?
+    else {
+        return Ok(Regenerated::Pending);
+    };
+    let rules_override = match source {
+        RulesSource::Current => None,
+        // 无快照(升级前的缓存)则无法回退重生成。
+        RulesSource::Snapshot => match rules_snapshot {
+            Some(rules) => Some(rules),
+            None => return Ok(Regenerated::Pending),
+        },
+    };
+    let out = match convert(
+        state,
+        profile_id,
+        &profile.token,
+        &provider_yaml,
+        rules_override.as_deref(),
+    )
+    .await?
+    {
+        Ok(out) => out,
+        Err(e) => {
+            tracing::warn!(profile = %profile_id, "edited config is invalid; keeping the last valid cache");
+            return Ok(match e {
+                ConvertError::Validation(errors) => Regenerated::Invalid { errors },
+                _ => Regenerated::Pending,
+            });
+        }
+    };
+    let built = Built {
+        content_hash: content_hash_of(&out.yaml),
+        yaml: out.yaml,
+        userinfo,
+        provider_yaml,
+        rules: out.rules,
+        generated_at,
+        ruleset_conflicts: out.ruleset_conflicts,
+    };
+    // 重生成期间换源:缓存已被换源清空,本次结果随之失效(Pending,待新来源回源重建)。
+    if !persist_cache_and_group_order(state, profile_id, &built, profile.source_revision).await? {
+        return Ok(Regenerated::Pending);
+    }
+    Ok(Regenerated::Applied)
+}
+
+/// 重置 token/公共前缀后的缓存迁移:能力地址已更换,缓存须重生成才能继续下发其中的托管链接。
+///
+/// 当前规则草稿合法时与 [`regenerate_from_cache`] 相同;草稿未通过校验时,改用产出缓存的最近
+/// 一份合法规则重试——草稿保持已存不变,订阅继续下发最后一份合法配置,但其中的规则集托管
+/// 链接迁移到新 token/前缀。两者都无法产出合法输出(含无快照)时,缓存里的托管链接已被撤销、
+/// 继续下发只会指向 404,故清空缓存(下次公开拉取回源重建),并返回草稿的逐条错误供调用方
+/// 提示管理员。
+pub async fn regenerate_for_rotation(state: &AppState, profile_id: &str) -> Regenerated {
     let result: ApiResult<Regenerated> = state
         .keyed_lock
         .run(profile_id, async {
-            let Some(profile) = load_core(state, profile_id).await? else {
-                return Ok(Regenerated::Pending);
-            };
-            let Some((Some(provider_yaml), userinfo, generated_at)) =
-                sqlx::query_as::<_, (Option<String>, Option<String>, String)>(
-                    "SELECT provider_yaml, subscription_userinfo, generated_at \
-                     FROM generated_cache WHERE profile_id = ?",
-                )
+            let draft = regenerate_locked(state, profile_id, RulesSource::Current).await?;
+            if !matches!(draft, Regenerated::Invalid { .. }) {
+                return Ok(draft);
+            }
+            let fallback = regenerate_locked(state, profile_id, RulesSource::Snapshot).await?;
+            if matches!(fallback, Regenerated::Applied) {
+                return Ok(fallback);
+            }
+            sqlx::query("DELETE FROM generated_cache WHERE profile_id = ?")
                 .bind(profile_id)
-                .fetch_optional(&state.db)
-                .await?
-            else {
-                return Ok(Regenerated::Pending);
-            };
-            let (yaml, ruleset_conflicts) =
-                match convert(state, profile_id, &profile.token, &provider_yaml).await? {
-                    Ok(out) => out,
-                    Err(e) => {
-                        tracing::warn!(profile = %profile_id, "edited config is invalid; keeping the last valid cache");
-                        return Ok(match e {
-                            ConvertError::Validation(errors) => Regenerated::Invalid { errors },
-                            _ => Regenerated::Pending,
-                        });
-                    }
-                };
-            let built = Built {
-                content_hash: content_hash_of(&yaml),
-                yaml,
-                userinfo,
-                provider_yaml,
-                generated_at,
-                ruleset_conflicts,
-            };
-            persist_cache_and_group_order(state, profile_id, &built).await?;
-            Ok(Regenerated::Applied)
+                .execute(&state.db)
+                .await?;
+            tracing::warn!(
+                profile = %profile_id,
+                "cleared cached subscription after rotation: draft rules invalid and no valid snapshot to migrate"
+            );
+            // 草稿的逐条错误比快照缺失/同样不合法更有行动价值,返回给管理员。
+            Ok(draft)
         })
         .await;
     result.unwrap_or_else(|_| {
-        tracing::warn!(profile = %profile_id, "failed to regenerate cache");
+        tracing::warn!(profile = %profile_id, "failed to regenerate cache after rotation");
         Regenerated::Pending
     })
 }
 
-/// 对每条 profile 执行 [`regenerate_from_cache`]。用于影响所有 profile 的改动(全局节点排序、重置公共
-/// 路径前缀)。逐 profile 尽力而为:某个失败就让该 profile 在下次生成时再吸收改动。
+/// 对每条 profile 执行 [`regenerate_from_cache`]。用于影响所有 profile 的改动(全局节点排序)。
+/// 逐 profile 尽力而为:某个失败就让该 profile 在下次生成时再吸收改动。
 pub async fn regenerate_all_from_cache(state: &AppState) {
     let ids = sqlx::query_scalar::<_, String>("SELECT id FROM profiles")
         .fetch_all(&state.db)
@@ -624,6 +759,17 @@ pub async fn regenerate_all_from_cache(state: &AppState) {
         .unwrap_or_default();
     for id in ids {
         regenerate_from_cache(state, &id).await;
+    }
+}
+
+/// 对每条 profile 执行 [`regenerate_for_rotation`]。用于重置公共路径前缀。逐 profile 尽力而为。
+pub async fn regenerate_all_for_rotation(state: &AppState) {
+    let ids = sqlx::query_scalar::<_, String>("SELECT id FROM profiles")
+        .fetch_all(&state.db)
+        .await
+        .unwrap_or_default();
+    for id in ids {
+        regenerate_for_rotation(state, &id).await;
     }
 }
 

@@ -266,6 +266,57 @@ async fn referenced_rule_set_injected_with_token_scoped_link() {
 }
 
 #[tokio::test]
+async fn logic_nested_rule_set_reference_is_injected() {
+    let temp = TempDb::new();
+    let app = build_router(test_state_with_fetcher(&temp, Arc::new(FakeFetcher)).await);
+    let cookie = login(&app).await;
+    let (p1, token1, sub_path) = create_profile(&app, &cookie, "P1").await;
+
+    // RULE-SET 嵌套在逻辑规则(AND/SUB-RULE)内,同样要被注入 rule-providers。
+    put_rules(
+        &app,
+        &cookie,
+        &p1,
+        "AND,((RULE-SET,ads),(NETWORK,tcp)),DIRECT\nSUB-RULE,(RULE-SET,sub1,DIRECT),s\nMATCH,DIRECT",
+    )
+    .await;
+    create_rs(
+        &app,
+        &cookie,
+        &p1,
+        r#"{"name":"ads","behavior":"domain","format":"yaml","content":"+.ad.example"}"#,
+    )
+    .await;
+    create_rs(
+        &app,
+        &cookie,
+        &p1,
+        r#"{"name":"sub1","behavior":"classical","format":"text","content":"DOMAIN-SUFFIX,lan"}"#,
+    )
+    .await;
+
+    let resp = app
+        .clone()
+        .oneshot(Request::get(&sub_path).body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = text(resp).await;
+    assert!(
+        body.contains(&format!(
+            "https://sub.example.com/testprefix/api/sub/{token1}/r/ads/domain.yaml"
+        )),
+        "逻辑规则内嵌套引用的规则集也要注入托管链接"
+    );
+    assert!(
+        body.contains(&format!(
+            "https://sub.example.com/testprefix/api/sub/{token1}/r/sub1/classical.text"
+        )),
+        "SUB-RULE 行内嵌套引用的规则集也要注入托管链接"
+    );
+}
+
+#[tokio::test]
 async fn remote_cache_off_injects_upstream_url() {
     let temp = TempDb::new();
     let app = build_router(test_state_with_fetcher(&temp, Arc::new(FakeFetcher)).await);
@@ -436,6 +487,52 @@ async fn import_injects_rule_provider_into_served_cache() {
 }
 
 #[tokio::test]
+async fn import_inserts_rule_before_the_fallback_match() {
+    let temp = TempDb::new();
+    let app = cached_app(&temp).await;
+    let cookie = login(&app).await;
+    let (p1, _, sub_path) = create_profile(&app, &cookie, "P1").await;
+    put_rules(&app, &cookie, &p1, "MATCH,DIRECT").await;
+    app.clone()
+        .oneshot(authed(
+            "POST",
+            "/api/rule-sets",
+            &cookie,
+            r#"{"name":"gads","behavior":"domain","format":"yaml","content":"+.g.example"}"#,
+        ))
+        .await
+        .unwrap();
+    let resp = app
+        .clone()
+        .oneshot(authed(
+            "POST",
+            &format!("/api/profiles/{p1}/rule-sets/import"),
+            &cookie,
+            r#"{"names":["gads"],"policy":"REJECT"}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(json(resp).await["regenerate"]["status"], "applied");
+
+    // 客户端按规则顺序匹配:RULE-SET 必须在兜底 MATCH 之前,否则永远不会命中。
+    let body = get_text(&app, &sub_path).await;
+    let root = mihomo_subscription::yaml::parse_limited(&body).unwrap();
+    let rules = root.get("rules").unwrap().as_sequence().unwrap();
+    assert_eq!(rules[0].as_str(), Some("RULE-SET,gads,REJECT"));
+    assert_eq!(rules[1].as_str(), Some("MATCH,DIRECT"));
+    // 库内文本同样 MATCH 收尾(编辑器钉底显示与后端一致)。
+    let resp = app
+        .clone()
+        .oneshot(authed("GET", &format!("/api/profiles/{p1}"), &cookie, ""))
+        .await
+        .unwrap();
+    assert_eq!(
+        json(resp).await["rules"]["content"],
+        "RULE-SET,gads,REJECT\nMATCH,DIRECT"
+    );
+}
+
+#[tokio::test]
 async fn reset_token_rewrites_hosted_rule_set_links_in_cache() {
     let temp = TempDb::new();
     let app = cached_app(&temp).await;
@@ -504,6 +601,150 @@ async fn reset_public_path_rewrites_hosted_rule_set_links_in_cache() {
         "https://sub.example.com/{prefix}/api/sub/{token1}/r/ads/domain.yaml"
     )));
     assert!(!body.contains("/testprefix/"), "缓存中不再残留旧前缀链接");
+}
+
+#[tokio::test]
+async fn rotation_after_invalid_edit_migrates_links_with_last_valid_rules() {
+    for rotate_prefix in [false, true] {
+        let temp = TempDb::new();
+        let app = cached_app(&temp).await;
+        let cookie = login(&app).await;
+        let (p1, old_token, old_path) = create_profile(&app, &cookie, "P1").await;
+        create_rs(
+            &app,
+            &cookie,
+            &p1,
+            r#"{"name":"ads","behavior":"domain","format":"yaml","content":"+.ad.example"}"#,
+        )
+        .await;
+        put_rules(&app, &cookie, &p1, "RULE-SET,ads,DIRECT\nMATCH,DIRECT").await;
+        // 保存一份未通过校验的规则草稿:编辑入库,缓存保留上一份合法输出。
+        let resp = app
+            .clone()
+            .oneshot(authed(
+                "PUT",
+                &format!("/api/profiles/{p1}/rules"),
+                &cookie,
+                r#"{"content":"MATCH,missing-policy"}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(json(resp).await["regenerate"]["status"], "invalid");
+
+        let (new_token, prefix) = if rotate_prefix {
+            let resp = app
+                .clone()
+                .oneshot(authed(
+                    "POST",
+                    "/api/settings/reset-public-path",
+                    &cookie,
+                    "",
+                ))
+                .await
+                .unwrap();
+            (
+                old_token.clone(),
+                json(resp).await["public_path_prefix"]
+                    .as_str()
+                    .unwrap()
+                    .to_string(),
+            )
+        } else {
+            let resp = app
+                .clone()
+                .oneshot(authed(
+                    "POST",
+                    &format!("/api/profiles/{p1}/reset-token"),
+                    &cookie,
+                    "",
+                ))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            let body = json(resp).await;
+            assert_eq!(body["regenerate"]["status"], "applied");
+            (
+                body["token"].as_str().unwrap().to_string(),
+                "testprefix".to_string(),
+            )
+        };
+        let new_path = format!("/{prefix}/api/sub/{new_token}");
+        assert_ne!(new_path, old_path);
+
+        // 新订阅继续下发最后一份合法配置,其中的托管链接已迁移到新能力地址。
+        let body = get_text(&app, &new_path).await;
+        assert!(body.contains(&format!(
+            "https://sub.example.com/{prefix}/api/sub/{new_token}/r/ads/domain.yaml"
+        )));
+        assert!(
+            !body.contains(&format!("{old_path}/r/ads/")),
+            "缓存中不再残留已撤销的托管链接"
+        );
+        // 规则草稿保持已存(未通过校验),不被回退改写。
+        let resp = app
+            .clone()
+            .oneshot(authed("GET", &format!("/api/profiles/{p1}"), &cookie, ""))
+            .await
+            .unwrap();
+        assert_eq!(json(resp).await["rules"]["content"], "MATCH,missing-policy");
+    }
+}
+
+#[tokio::test]
+async fn rotation_without_valid_rules_clears_cached_subscription() {
+    let temp = TempDb::new();
+    let app = cached_app(&temp).await;
+    let cookie = login(&app).await;
+    let (p1, _, _) = create_profile(&app, &cookie, "P1").await;
+    let rs = create_rs(
+        &app,
+        &cookie,
+        &p1,
+        r#"{"name":"ads","behavior":"domain","format":"yaml","content":"+.ad.example"}"#,
+    )
+    .await;
+    put_rules(&app, &cookie, &p1, "RULE-SET,ads,DIRECT\nMATCH,DIRECT").await;
+    put_rules(&app, &cookie, &p1, "MATCH,missing-policy").await;
+    // 再删掉最近合法规则引用的规则集定义:草稿与快照都无法产出合法输出。
+    let rsid = rs["id"].as_str().unwrap();
+    let resp = app
+        .clone()
+        .oneshot(authed(
+            "DELETE",
+            &format!("/api/profiles/{p1}/rule-sets/{rsid}"),
+            &cookie,
+            "",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+    let resp = app
+        .clone()
+        .oneshot(authed(
+            "POST",
+            &format!("/api/profiles/{p1}/reset-token"),
+            &cookie,
+            "",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = json(resp).await;
+    assert_eq!(body["regenerate"]["status"], "invalid");
+    let new_token = body["token"].as_str().unwrap();
+
+    // 缓存已清空:不再下发含已撤销托管地址的配置;公开拉取回源后校验仍失败 → 503。
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::get(format!("/testprefix/api/sub/{new_token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
 }
 
 #[tokio::test]

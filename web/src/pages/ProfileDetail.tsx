@@ -216,8 +216,15 @@ function HostedLink({ detail, onReset }: { detail: Detail; onReset: () => void }
   async function resetToken() {
     // 重置 token 会更换订阅 URL 并使旧链接立即失效(公开端点按 token 校验),故需 Popconfirm 二次确认。
     try {
-      await api(`/api/profiles/${detail.id}/reset-token`, { method: "POST" });
-      message.success(t("detail.generateSuccess"));
+      const res = await api<{ regenerate?: Regenerate }>(`/api/profiles/${detail.id}/reset-token`, {
+        method: "POST",
+      });
+      // 当前配置未通过校验且无法用最近合法配置迁移时,缓存已清空,如实警告而非笼统成功。
+      if (res.regenerate?.status === "invalid") {
+        message.warning(t("detail.resetTokenInvalid"));
+      } else {
+        message.success(t("detail.generateSuccess"));
+      }
       onReset();
     } catch (e) {
       message.error(errorMessage(e, t("common.saveFailed")));

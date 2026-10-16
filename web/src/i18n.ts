@@ -87,6 +87,7 @@ const zh = {
       back: "返回列表",
       resetToken: "重置 token",
       resetTokenConfirm: "重置后当前配置的旧链接将立即失效,确定继续?",
+      resetTokenInvalid: "已重置,但当前配置未通过校验且无法迁移缓存订阅:订阅缓存已清空,修复配置后将自动重建。",
       alwaysLive: "该链接始终实时:客户端每次拉取都会即时拉取机场最新节点并应用当前配置,无需手动生成。",
       generateSuccess: "已刷新",
       generateFailed: "刷新失败",

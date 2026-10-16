@@ -66,6 +66,13 @@ fn validate_node(body: &NodeBody) -> ApiResult<()> {
             "name and node_type are required".into(),
         ));
     }
+    // 内置保留名(DIRECT/REJECT/…):占用会让 Mihomo 以 duplicate name 拒绝加载整个输出。
+    if crate::converter::RESERVED_NODE_NAMES.contains(&body.name.trim()) {
+        return Err(ApiError::BadRequest(format!(
+            "name `{}` conflicts with a reserved built-in name",
+            body.name.trim()
+        )));
+    }
     // 节点 content 必须是单个合法的 Mihomo proxy 映射。
     yaml::parse_mapping(&body.content)
         .map_err(|_| ApiError::BadRequest("content must be a valid YAML proxy mapping".into()))?;
