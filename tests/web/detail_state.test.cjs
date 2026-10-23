@@ -105,9 +105,10 @@ function detailModule(state, getId, api, messages = []) {
     antd: { App: { useApp: () => ({ message: {
       success: (text) => messages.push(text), error: (text) => messages.push(text),
     } }) }, Button: 'Button', Form: 'Form', Input: 'Input', Modal: 'Modal',
-    Popconfirm: 'Popconfirm', QRCode: 'QRCode', Spin: 'Spin', Tabs: 'Tabs' },
+    Popconfirm: 'Popconfirm', QRCode: 'QRCode', Spin: 'Spin', Switch: 'Switch', Tabs: 'Tabs' },
     '@ant-design/icons': icons,
     '../api': { api, ApiError: class extends Error {}, errorMessage: () => 'failed' },
+    '../components/regenerate': { useRegenerateNotice: () => () => {} },
     './detail/NodesCard': { default: 'NodesCard', __esModule: true },
     './detail/GroupsCard': { default: 'GroupsCard', __esModule: true },
     './detail/RulesCard': { default: 'RulesCard', __esModule: true },
@@ -115,7 +116,8 @@ function detailModule(state, getId, api, messages = []) {
 }
 
 const detail = (id, name = id) => ({ id, name, nodes: [], groups: [], rules: null,
-  subscription_url: `https://sub.example/${id}`, last_generated_at: null });
+  subscription_url: `https://sub.example/${id}`, last_generated_at: null,
+  reality_mlkem: true, reality_fingerprint_risks: [] });
 const tabs = (element) => find(element, (e) => e.type === 'Tabs');
 
 test('switching A to B resets detail immediately; a late A response cannot expose old actions', async () => {

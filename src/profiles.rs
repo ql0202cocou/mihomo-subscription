@@ -36,6 +36,7 @@ struct ProfileRow {
     last_fetch_at: Option<String>,
     last_fetch_status: Option<String>,
     last_generated_at: Option<String>,
+    reality_mlkem: bool,
     created_at: String,
     updated_at: String,
 }
@@ -81,6 +82,8 @@ pub struct ProfileSummary {
     last_fetch_at: Option<String>,
     last_fetch_status: Option<String>,
     last_generated_at: Option<String>,
+    /// 是否为未声明 `support-x25519mlkem768` 的 REALITY 节点自动补开(见 `converter`)。
+    reality_mlkem: bool,
     created_at: String,
     updated_at: String,
 }
@@ -92,6 +95,8 @@ pub struct ProfileDetail {
     rules: Option<Ruleset>,
     nodes: Vec<NodeResponse>,
     groups: Vec<GroupResponse>,
+    /// 当前缓存输出里 ML-KEM 已开启但指纹不是 chrome 的 REALITY 节点名(无缓存或无风险为空)。
+    reality_fingerprint_risks: Vec<String>,
 }
 
 #[derive(Serialize)]
@@ -133,6 +138,7 @@ fn summary(state: &AppState, row: ProfileRow) -> ProfileSummary {
         last_fetch_at: row.last_fetch_at,
         last_fetch_status: row.last_fetch_status,
         last_generated_at: row.last_generated_at,
+        reality_mlkem: row.reality_mlkem,
         created_at: row.created_at,
         updated_at: row.updated_at,
     }
@@ -177,6 +183,8 @@ pub struct UpdateProfile {
     name: Option<String>,
     /// 只写:缺失或为空则保持已存 URL 不变。
     source_url: Option<String>,
+    /// 缺失则保持不变。
+    reality_mlkem: Option<bool>,
 }
 
 /// 读取 profile 行,顺带从 1—1 的 `generated_cache` 子查询出最近生成时间(无缓存则为 NULL)。
@@ -294,11 +302,22 @@ async fn detail(state: &AppState, row: ProfileRow) -> ApiResult<ProfileDetail> {
     .map(group_response)
     .collect();
 
+    let reality_fingerprint_risks = sqlx::query_scalar::<_, Option<String>>(
+        "SELECT reality_fingerprint_risks FROM generated_cache WHERE profile_id = ?",
+    )
+    .bind(&profile_id)
+    .fetch_optional(&state.db)
+    .await?
+    .flatten()
+    .and_then(|risks| serde_json::from_str(&risks).ok())
+    .unwrap_or_default();
+
     Ok(ProfileDetail {
         summary: summary(state, row),
         rules,
         nodes,
         groups,
+        reality_fingerprint_risks,
     })
 }
 
@@ -330,15 +349,19 @@ pub async fn update(
         }
         _ => existing.source_url,
     };
+    let reality_mlkem = body.reality_mlkem.unwrap_or(existing.reality_mlkem);
+    let mut regenerate = None;
     if source_changed {
         // 换源:递增来源版本(在途的旧来源回源结果据此丢弃)、清空旧来源缓存(不做跨换源回退,
         // 避免界面已显示新来源却仍下发旧节点)、重置公开刷新时间(下一次公开拉取立即回源)。
         sqlx::query(
-            "UPDATE profiles SET name = ?, source_url = ?, source_revision = source_revision + 1, \
-             public_refresh_at = NULL, updated_at = ? WHERE id = ?",
+            "UPDATE profiles SET name = ?, source_url = ?, reality_mlkem = ?, \
+             source_revision = source_revision + 1, public_refresh_at = NULL, updated_at = ? \
+             WHERE id = ?",
         )
         .bind(&name)
         .bind(&source_url)
+        .bind(reality_mlkem)
         .bind(now())
         .bind(&id)
         .execute(&state.db)
@@ -352,19 +375,36 @@ pub async fn update(
         crate::generate::generate_best_effort(&state, &id).await;
     } else {
         sqlx::query(
-            "UPDATE profiles SET name = ?, source_url = ?, updated_at = ?
+            "UPDATE profiles SET name = ?, source_url = ?, reality_mlkem = ?, updated_at = ?
              WHERE id = ?",
         )
         .bind(&name)
         .bind(&source_url)
+        .bind(reality_mlkem)
         .bind(now())
         .bind(&id)
         .execute(&state.db)
         .await?;
+        // 切换 ML-KEM 自动开启只影响转换,用缓存的机场原文离线重生成即可立即下发,不重拉机场。
+        if reality_mlkem != existing.reality_mlkem {
+            regenerate = Some(regenerate_from_cache(&state, &id).await);
+        }
     }
 
     let row = load_profile_row(&state, &id).await?;
-    Ok(Json(detail(&state, row).await?))
+    Ok(Json(UpdatedResponse {
+        detail: detail(&state, row).await?,
+        regenerate,
+    }))
+}
+
+/// 更新的响应:最新详情,另在离线重生成过时(切换 `reality_mlkem`)带回其结果。
+#[derive(Serialize)]
+pub struct UpdatedResponse {
+    #[serde(flatten)]
+    detail: ProfileDetail,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    regenerate: Option<Regenerated>,
 }
 
 pub async fn delete(

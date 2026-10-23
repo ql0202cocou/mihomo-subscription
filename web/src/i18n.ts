@@ -94,11 +94,18 @@ const zh = {
       generateFailedRules: "刷新失败:规则中有 {{count}} 处错误,请到「规则」页签查看",
       invalidConfig: "当前配置未通过校验",
       rulesetConflict: "以下规则集与机场同名 rule-provider 冲突,已用面板托管版覆盖",
+      realityFingerprintRisk:
+        "以下 REALITY 节点开启了 X25519MLKEM768,但客户端指纹不是 chrome:该密钥协商不会发出,新版 Xray 服务端会拒绝握手",
     },
     basic: {
       title: "基础信息",
       name: "配置名称",
       edit: "编辑",
+      realityMlkem: "REALITY 自动开启 X25519MLKEM768",
+      realityMlkemHint:
+        "为未显式设置的 REALITY 节点(含机场节点)补开 support-x25519mlkem768,新版 Xray 服务端必需;若机场仍是旧版服务端、开启后 REALITY 节点无法连接,请关闭。",
+      on: "开启",
+      off: "关闭",
     },
     source: {
       url: "订阅 URL(脱敏)",

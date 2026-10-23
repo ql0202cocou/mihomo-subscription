@@ -47,7 +47,8 @@
 
 ### 新增
 
-- 下发订阅为含 `reality-opts` 的节点自动补开 `support-x25519mlkem768`（新版 Xray 服务端必需，显式值不动）；节点表单展示该开关并提示 REALITY 指纹需为 chrome，指纹缺失或非 chrome 时后端记录告警。
+- 下发订阅为 REALITY 节点自动补开 `support-x25519mlkem768`（新版 Xray 服务端必需，显式值不动）；订阅「基础信息」可关闭该行为，供仍在用旧版 REALITY 服务端的机场使用。
+- 开启 ML-KEM 但客户端指纹不是 chrome 的 REALITY 节点会在订阅详情页常驻告警。
 
 ### 变更
 

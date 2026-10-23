@@ -92,6 +92,8 @@ GET  /api/auth/session -> 200 {username} | 401
   "output_type": "mihomo",
   "subscription_url": "https://sub.example.com/<prefix>/api/sub/<token>",
   "last_generated_at": "...", "last_fetch_at": "...", "last_fetch_status": "success",
+  "reality_mlkem": true,
+  "reality_fingerprint_risks": ["vless-hk"],
   "rules": { "content": "...\nMATCH,Proxy", "updated_at": "..." },
   "nodes": [ { "id": "...", "name": "my-ss", "node_type": "ss", "enabled": true } ],
   "groups": [ { "id": "...", "name": "MyGroup", "group_type": "select",
@@ -109,6 +111,11 @@ GET  /api/auth/session -> 200 {username} | 401
   （不回退到换源前的输出），随后同步触发一次重拉（尽力而为，`PUT` 等待其完成）。拉取观测、公开
   刷新时间与缓存回写均绑定写入时的 `source_revision`，换源前发起的在途拉取结果一律丢弃；换源
   期间并发的生成请求可能因此返回 `409`，重试即可。
+- `reality_mlkem`（布尔，可选，缺省保持不变）：是否为未显式设置 `support-x25519mlkem768` 的 REALITY
+  节点自动补开（见「生成与校验」）。未换源时改动它会用缓存的机场原文离线重生成，响应另带
+  `regenerate`（见「节点/分组预览与排序」）；换源时随重拉一并生效。
+- 详情的 `reality_fingerprint_risks`：当前缓存输出里 ML-KEM 已开启但 `client-fingerprint` 不是
+  `chrome` 的 REALITY 节点名（无缓存或无风险为空数组），详情页据此常驻告警。
 - `last_fetch_status`：`success` / `http_error:<code>` / `ssrf_rejected` / `timeout` / `too_large` /
   `provider_parse`（拉取成功但内容不是可解析的 Mihomo YAML），从未拉取为 `null`。
 
@@ -221,7 +228,7 @@ PUT /api/profiles/:id/group-order         { order: [分组名] }              # 
 
 | 键 | 处理 |
 |-----|------|
-| `proxies` | 机场块（上游序）+ 自定义块（启用全局节点按 `global_nodes.position` 排），按 `node_section_order` 拼接；含 `reality-opts` 的节点缺省时自动注入 `support-x25519mlkem768: true`（显式值不动），`client-fingerprint` 缺失或非 `chrome` 时记录告警 |
+| `proxies` | 机场块（上游序）+ 自定义块（启用全局节点按 `global_nodes.position` 排），按 `node_section_order` 拼接；REALITY 节点（`reality-opts.public-key` 非空）未设置 `support-x25519mlkem768`（或值为 null）且订阅 `reality_mlkem` 开启时补 `true`，显式值不动；键名按 mihomo 规则匹配（`_` 视作 `-`、忽略大小写）。ML-KEM 生效而 `client-fingerprint` 缺失或非 `chrome` 的节点名随缓存保存（`generated_cache.reality_fingerprint_risks`），名单变化时记日志 |
 | `proxy-groups` | 整体替换为启用的自定义分组（机场分组不透传，需「导入机场分组」），按 `group_order` 重排 |
 | `rules` | 整体替换为用户规则 |
 | `rule-providers` | 机场原样透传；另把被 `RULE-SET` 规则（含逻辑规则内嵌套）引用、本订阅自有（③）规则集合并在上（同名覆盖，指向按订阅 token 隔离的托管链接） |
@@ -347,6 +354,9 @@ CREATE UNIQUE INDEX idx_profiles_name  ON profiles (name);
   回写均绑定它，换源前的在途拉取结果据此丢弃。迁移 `0015`。
 - `group_order`：`proxy-groups` 顺序（分组名数组，NULL=创建序）；生成时快照回写、新增落末尾；
   `PUT .../group-order` 覆盖。迁移 `0003`。
+- `reality_mlkem`：是否为未显式设置 `support-x25519mlkem768` 的 REALITY 节点补开（默认 1）。新版
+  Xray 服务端要求该密钥协商，旧版 REALITY 服务端却不兼容（mihomo 因此默认关闭）；机场节点无法逐个
+  编辑，故按订阅（= 按机场）取舍。迁移 `0016`。
 
 #### rulesets
 
@@ -526,6 +536,8 @@ CREATE TABLE generated_cache (
   预览与排序」）。迁移 `0012`；之前生成的缓存为 NULL，下次回源后补齐。
 - `rules_snapshot`：产出本缓存时所用的规则文本快照；重置 token/前缀时若当前规则文本已无法通过校验，
   用它离线重生成，使缓存中的托管链接换绑后仍对应一份可加载的配置。迁移 `0014`。
+- `reality_fingerprint_risks`：本缓存输出里 ML-KEM 已开启但指纹不是 chrome 的 REALITY 节点名（JSON
+  数组，无则 NULL）；回源与离线重生成都会刷新，供详情页常驻告警。迁移 `0016`；之前的缓存为 NULL。
 
 ### 迁移
 
