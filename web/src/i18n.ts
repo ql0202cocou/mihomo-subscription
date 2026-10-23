@@ -147,6 +147,7 @@ const zh = {
       remove: "删除",
       keyConflict: "字段名重复或与上方已有字段相同,该行不会保存。",
       kind: { text: "文本", number: "数字", bool: "开关", yaml: "YAML" },
+      tristate: { inherit: "跟随订阅", on: "开启", off: "关闭" },
     },
     nodeFields: {
       server: "服务器地址",
@@ -184,7 +185,7 @@ const zh = {
     },
     nodeHints: {
       "reality-opts":
-        "新版 Xray(25.5.16+)服务端要求 REALITY 客户端指纹为 chrome 且开启 X25519MLKEM768;下发订阅时后者会自动补开,客户端指纹请自行确认。",
+        "X25519MLKEM768 已开启(或跟随订阅自动开启),但客户端指纹不是 chrome:该密钥协商只随 chrome 指纹发出,新版 Xray(25.5.16+)服务端会拒绝握手。",
     },
     groups: {
       title: "分组预览",
