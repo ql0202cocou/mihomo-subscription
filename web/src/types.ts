@@ -7,6 +7,8 @@ export interface ProfileSummary {
   last_fetch_at: string | null;
   last_fetch_status: string | null;
   last_generated_at: string | null;
+  /** 是否为未显式设置的 REALITY 节点自动开启 support-x25519mlkem768。 */
+  reality_mlkem: boolean;
   created_at: string;
   updated_at: string;
 }
@@ -76,6 +78,8 @@ export interface ProfileDetail extends ProfileSummary {
   rules: ProfileRules | null;
   nodes: CustomNode[];
   groups: CustomGroup[];
+  /** 当前缓存输出里 ML-KEM 已开启但指纹不是 chrome 的 REALITY 节点名。 */
+  reality_fingerprint_risks: string[];
 }
 
 /** 全局规则集(「规则托管」,② 用户库 / 导入源)。0.4 起 ② 仅作模板:不再公开托管、不参与生成。 */

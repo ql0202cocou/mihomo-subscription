@@ -83,6 +83,9 @@ pub struct ConvertInput<'a> {
     /// 被本 profile 的 `RULE-SET` 规则引用到的、由面板托管的自定义规则集。合并进输出的
     /// `rule-providers:` map(同名覆盖机场透传条目)。未被引用的规则集不注入。
     pub rule_providers: Vec<RuleProvider>,
+    /// 是否为未声明 `support-x25519mlkem768` 的 REALITY 节点补 `true`(per-profile
+    /// `profiles.reality_mlkem`,见 [`apply_reality_mlkem`])。
+    pub reality_mlkem: bool,
 }
 
 #[derive(Debug)]
@@ -101,7 +104,8 @@ pub struct ConvertOutput {
     pub yaml: String,
     /// 注入的自定义规则集中、覆盖了机场同名 `rule-providers` 条目的名字。
     pub ruleset_conflicts: Vec<String>,
-    /// `client-fingerprint` 缺失或非 `chrome` 的 REALITY 节点名(见 [`inject_reality_compat`])。
+    /// ML-KEM 已开启但 `client-fingerprint` 缺失或非 `chrome` 的 REALITY 节点名(见
+    /// [`apply_reality_mlkem`])。
     pub reality_fingerprint_risks: Vec<String>,
 }
 
@@ -169,7 +173,7 @@ pub fn convert(input: ConvertInput) -> Result<ConvertOutput, ConvertError> {
         &input.node_order,
     );
     let mut proxies = concat_sections(provider_block, custom_block, &input.node_section_order);
-    let reality_fingerprint_risks = inject_reality_compat(&mut proxies);
+    let reality_fingerprint_risks = apply_reality_mlkem(&mut proxies, input.reality_mlkem);
     root.insert(Value::from("proxies"), Value::Sequence(proxies));
 
     // proxy-groups:整体替换为用户的自定义分组(同 `rules`)。机场分组 *不* 透传——管理员经
@@ -427,28 +431,89 @@ fn sequence_of(value: Option<&Value>) -> Vec<Value> {
     }
 }
 
-/// 新版 Xray 服务端(25.5.16 起)要求 REALITY 握手携带 X25519MLKEM768 密钥协商,否则拒绝;
-/// mihomo 需在节点 `reality-opts` 里显式声明 `support-x25519mlkem768`,缺省时补 `true`
-/// (显式写的值不动;对旧服务端向后兼容)。该协商基于 Chrome 指纹实现:`client-fingerprint`
-/// 缺失或非 `chrome` 时 ML-KEM 不会随 ClientHello 发出(缺失时 mihomo 更会直接拒绝 REALITY
-/// 节点)——不代为改动用户指纹,仅返回这些节点名供生成层告警。
-fn inject_reality_compat(proxies: &mut [Value]) -> Vec<String> {
+const MLKEM_KEY: &str = "support-x25519mlkem768";
+
+/// 新版 Xray 服务端(25.5.16 起)要求 REALITY 握手携带 X25519MLKEM768 密钥协商,否则拒绝;旧版
+/// REALITY 服务端却不兼容该协商,故 mihomo 默认关闭,需在 `reality-opts` 里显式声明
+/// `support-x25519mlkem768`。`inject`(per-profile `reality_mlkem`)为真时,为未声明(或值为
+/// null,mihomo 视同未写)的 REALITY 节点补 `true`;显式值不动。只有 `public-key` 非空的
+/// `reality-opts` 才会让 mihomo 启用 REALITY,其余节点不碰。键名按 [`mihomo_key`] 匹配。
+///
+/// 该协商基于 Chrome 指纹实现:ML-KEM 生效而 `client-fingerprint` 缺失或非 `chrome` 时它不会随
+/// ClientHello 发出(缺失时 mihomo 更会直接拒绝 REALITY 节点)——不代为改动用户指纹,仅返回
+/// 这些节点名供生成层告警。
+fn apply_reality_mlkem(proxies: &mut [Value], inject: bool) -> Vec<String> {
     let mut fingerprint_risks = Vec::new();
     for proxy in proxies {
         let Value::Mapping(m) = proxy else {
             continue;
         };
-        let Some(Value::Mapping(opts)) = m.get_mut("reality-opts") else {
+        let Some(opts_key) = mihomo_key(m, "reality-opts") else {
             continue;
         };
-        opts.entry(Value::from("support-x25519mlkem768"))
-            .or_insert(Value::from(true));
-        if m.get("client-fingerprint").and_then(Value::as_str) != Some("chrome") {
+        let Some(Value::Mapping(opts)) = m.get_mut(&opts_key) else {
+            continue;
+        };
+        let has_public_key = mihomo_key(opts, "public-key")
+            .and_then(|k| opts.get(&k))
+            .and_then(Value::as_str)
+            .is_some_and(|s| !s.is_empty());
+        if !has_public_key {
+            continue;
+        }
+        let mlkem_key = mihomo_key(opts, MLKEM_KEY);
+        let explicit = mlkem_key
+            .as_ref()
+            .and_then(|k| opts.get(k))
+            .filter(|v| !v.is_null());
+        let enabled = match explicit {
+            Some(value) => mihomo_bool(value),
+            None => {
+                if inject {
+                    // 值为 null 时原位改写(保留用户的键名写法),缺失时补规范键。
+                    let key = mlkem_key.unwrap_or_else(|| Value::from(MLKEM_KEY));
+                    opts.insert(key, Value::from(true));
+                }
+                inject
+            }
+        };
+        if !enabled {
+            continue;
+        }
+        let fingerprint = mihomo_key(m, "client-fingerprint")
+            .and_then(|k| m.get(&k))
+            .and_then(Value::as_str);
+        if fingerprint != Some("chrome") {
             let name = m.get("name").and_then(Value::as_str).unwrap_or("?");
             fingerprint_risks.push(name.to_string());
         }
     }
     fingerprint_risks
+}
+
+/// 按 mihomo 解码代理字段的规则在映射里定位键 `name`:先精确匹配,再把 `_` 视作 `-` 后忽略大小写
+/// 匹配(见 mihomo `common/structure`)。返回映射里的实际键,供原位读写。
+fn mihomo_key(m: &Mapping, name: &str) -> Option<Value> {
+    if m.contains_key(name) {
+        return Some(Value::from(name));
+    }
+    m.keys()
+        .find(|k| {
+            k.as_str()
+                .is_some_and(|s| s.replace('_', "-").eq_ignore_ascii_case(name))
+        })
+        .cloned()
+}
+
+/// mihomo 解码 bool 字段的取值:布尔原样,整数非零为真;其余类型 mihomo 会拒绝加载该节点,按假处理。
+fn mihomo_bool(value: &Value) -> bool {
+    match value {
+        Value::Bool(b) => *b,
+        Value::Number(n) => {
+            n.as_i64().is_some_and(|i| i != 0) || n.as_u64().is_some_and(|u| u != 0)
+        }
+        _ => false,
+    }
 }
 
 fn build_group(group: CustomGroup) -> Mapping {
@@ -714,6 +779,7 @@ rules:
             node_section_order: Vec::new(),
             group_order: Vec::new(),
             rule_providers: Vec::new(),
+            reality_mlkem: true,
         }
     }
 
@@ -879,6 +945,7 @@ rules:
             node_section_order: Vec::new(),
             group_order: Vec::new(),
             rule_providers: Vec::new(),
+            reality_mlkem: true,
         };
         assert!(matches!(convert(bad), Err(ConvertError::ProviderParse)));
     }
@@ -1192,34 +1259,48 @@ rules:
         );
     }
 
+    /// 转换后按节点名取其 `reality-opts`。
+    fn reality_opts_of(output: &ConvertOutput, name: &str) -> Option<Value> {
+        let root: Mapping = serde_yaml::from_str(&output.yaml).unwrap();
+        root.get("proxies")?
+            .as_sequence()?
+            .iter()
+            .find(|p| p.get("name").and_then(Value::as_str) == Some(name))?
+            .get("reality-opts")
+            .cloned()
+    }
+
     #[test]
     fn reality_nodes_get_mlkem_support_injected() {
-        // 机场与自定义 REALITY 节点缺省 support-x25519mlkem768 → 补 true;显式 false 尊重不动;
-        // 无 reality-opts、或 reality-opts 不是映射的节点不动。指纹缺失或非 chrome 的 REALITY
-        // 节点按输出顺序报出,供生成层告警。
+        // 机场与自定义 REALITY 节点缺省 support-x25519mlkem768 → 补 true;值为 null 视同缺省;
+        // 显式值(含 mihomo 认可的下划线/大小写变体键)尊重不动。无 reality-opts、reality-opts
+        // 不是映射或没有 public-key(mihomo 不会启用 REALITY)的节点不动。ML-KEM 生效且指纹
+        // 缺失或非 chrome 的节点按输出顺序报出;显式关闭 ML-KEM 的不报。
         let nodes = vec![CustomNode {
             name: "my-reality".into(),
             content: "{ type: vless, server: 9.9.9.9, port: 443, tls: true, reality-opts: { public-key: pk } }".into(),
         }];
         let mut inp = input("MATCH,DIRECT", nodes, vec![]);
-        inp.provider_yaml = "proxies:\n  - { name: vless-new, type: vless, server: 1.2.3.4, port: 443, tls: true, client-fingerprint: chrome, reality-opts: { public-key: pk, short-id: ab } }\n  - { name: vless-off, type: vless, server: 1.2.3.5, port: 443, tls: true, client-fingerprint: firefox, reality-opts: { public-key: pk, support-x25519mlkem768: false } }\n  - { name: plain-ss, type: ss, server: 1.2.3.6, port: 8388 }\n  - { name: weird, type: vless, server: 1.2.3.7, port: 443, reality-opts: '' }\n";
+        inp.provider_yaml = "proxies:
+  - { name: vless-new, type: vless, server: 1.2.3.4, port: 443, tls: true, client-fingerprint: chrome, reality-opts: { public-key: pk, short-id: ab } }
+  - { name: vless-off, type: vless, server: 1.2.3.5, port: 443, tls: true, client-fingerprint: firefox, reality-opts: { public-key: pk, support-x25519mlkem768: false } }
+  - { name: vless-null, type: vless, server: 1.2.3.8, port: 443, tls: true, client-fingerprint: chrome, reality-opts: { public-key: pk, support-x25519mlkem768: ~ } }
+  - { name: vless-variant, type: vless, server: 1.2.3.9, port: 443, tls: true, client_fingerprint: firefox, reality_opts: { Public-Key: pk, support_x25519mlkem768: false } }
+  - { name: tls-only, type: vless, server: 1.2.3.10, port: 443, tls: true, client-fingerprint: firefox, reality-opts: { short-id: ab } }
+  - { name: plain-ss, type: ss, server: 1.2.3.6, port: 8388 }
+  - { name: weird, type: vless, server: 1.2.3.7, port: 443, reality-opts: '' }
+";
         let output = convert(inp).expect("conversion succeeds");
         assert_eq!(
             output.reality_fingerprint_risks,
-            vec!["vless-off".to_string(), "my-reality".to_string()]
+            vec!["my-reality".to_string()],
+            "仅 ML-KEM 生效且指纹非 chrome 的 REALITY 节点报出"
         );
-        let root: Mapping = serde_yaml::from_str(&output.yaml).unwrap();
-        let proxies = root.get("proxies").unwrap().as_sequence().unwrap();
-        let reality_opts = |name: &str| {
-            proxies
-                .iter()
-                .find(|p| p.get("name").and_then(Value::as_str) == Some(name))
-                .and_then(|p| p.get("reality-opts"))
-        };
-        let mlkem = |name: &str| reality_opts(name).unwrap().get("support-x25519mlkem768");
-        assert_eq!(mlkem("vless-new"), Some(&Value::from(true)));
+        let opts = |name: &str| reality_opts_of(&output, name);
+        let mlkem = |name: &str| opts(name).unwrap().get(MLKEM_KEY).cloned();
+        assert_eq!(mlkem("vless-new"), Some(Value::from(true)));
         assert_eq!(
-            reality_opts("vless-new")
+            opts("vless-new")
                 .unwrap()
                 .get("public-key")
                 .and_then(Value::as_str),
@@ -1228,22 +1309,57 @@ rules:
         );
         assert_eq!(
             mlkem("vless-off"),
-            Some(&Value::from(false)),
+            Some(Value::from(false)),
             "显式 false 尊重不动"
         );
         assert_eq!(
-            mlkem("my-reality"),
-            Some(&Value::from(true)),
-            "自定义节点同样注入"
-        );
-        assert!(
-            reality_opts("plain-ss").is_none(),
-            "无 reality-opts 的节点不动"
+            mlkem("vless-null"),
+            Some(Value::from(true)),
+            "null 视同缺省"
         );
         assert_eq!(
-            reality_opts("weird"),
-            Some(&Value::from("")),
+            mlkem("my-reality"),
+            Some(Value::from(true)),
+            "自定义节点同样注入"
+        );
+        assert_eq!(mlkem("tls-only"), None, "无 public-key 的不是 REALITY 节点");
+        assert!(opts("plain-ss").is_none(), "无 reality-opts 的节点不动");
+        assert_eq!(
+            opts("weird"),
+            Some(Value::from("")),
             "reality-opts 不是映射时不动"
+        );
+
+        let root: Mapping = serde_yaml::from_str(&output.yaml).unwrap();
+        let variant = root.get("proxies").unwrap().as_sequence().unwrap()[3]
+            .get("reality_opts")
+            .unwrap()
+            .clone();
+        assert_eq!(
+            variant,
+            serde_yaml::from_str::<Value>("{ Public-Key: pk, support_x25519mlkem768: false }")
+                .unwrap(),
+            "变体键上的显式值不被规范键覆盖"
+        );
+    }
+
+    #[test]
+    fn reality_mlkem_off_leaves_unset_nodes_alone() {
+        // 订阅关闭自动开启时不补键;显式开启的节点仍按指纹报出。
+        let mut inp = input("MATCH,DIRECT", vec![], vec![]);
+        inp.reality_mlkem = false;
+        inp.provider_yaml = "proxies:
+  - { name: unset, type: vless, server: 1.2.3.4, port: 443, tls: true, client-fingerprint: firefox, reality-opts: { public-key: pk } }
+  - { name: forced-on, type: vless, server: 1.2.3.5, port: 443, tls: true, client-fingerprint: firefox, reality-opts: { public-key: pk, support-x25519mlkem768: true } }
+";
+        let output = convert(inp).expect("conversion succeeds");
+        assert_eq!(
+            output.reality_fingerprint_risks,
+            vec!["forced-on".to_string()]
+        );
+        assert_eq!(
+            reality_opts_of(&output, "unset").unwrap().get(MLKEM_KEY),
+            None
         );
     }
 }

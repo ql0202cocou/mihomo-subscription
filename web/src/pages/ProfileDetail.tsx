@@ -9,6 +9,7 @@ import {
   Popconfirm,
   QRCode,
   Spin,
+  Switch,
   Tabs,
 } from "antd";
 import {
@@ -19,6 +20,7 @@ import {
 } from "@ant-design/icons";
 import { useTranslation } from "react-i18next";
 import { api, ApiError, errorMessage } from "../api";
+import { useRegenerateNotice } from "../components/regenerate";
 import type { ProfileDetail as Detail, Regenerate } from "../types";
 import NodesCard from "./detail/NodesCard";
 import GroupsCard from "./detail/GroupsCard";
@@ -121,7 +123,13 @@ function ProfileDetailContent({ id }: { id: string }) {
       key: "basic",
       label: t("basic.title"),
       children: (
-        <BasicInfo detail={detail} onRefresh={generate} onSaved={reload} refreshing={generating} />
+        <BasicInfo
+          detail={detail}
+          onRefresh={generate}
+          onSaved={reload}
+          onRegenerate={onRegenerate}
+          refreshing={generating}
+        />
       ),
     },
     {
@@ -204,6 +212,12 @@ function ProfileDetailContent({ id }: { id: string }) {
         </div>
       )}
 
+      {detail.reality_fingerprint_risks.length > 0 && (
+        <div className="warn-banner" style={{ marginBottom: 16 }}>
+          {t("detail.realityFingerprintRisk")}:{detail.reality_fingerprint_risks.join("、")}
+        </div>
+      )}
+
       <Tabs items={tabs} />
     </div>
   );
@@ -273,25 +287,36 @@ function BasicInfo({
   detail,
   onRefresh,
   onSaved,
+  onRegenerate,
   refreshing,
 }: {
   detail: Detail;
   onRefresh: () => void;
   onSaved: () => void;
+  onRegenerate: (r: Regenerate) => void;
   refreshing: boolean;
 }) {
   const { t } = useTranslation();
   const { message } = AntdApp.useApp();
+  const notice = useRegenerateNotice();
   const [editOpen, setEditOpen] = useState(false);
   const [form] = Form.useForm();
 
-  async function saveBasic(values: { name: string; source_url?: string }) {
+  async function saveBasic(values: { name: string; source_url?: string; reality_mlkem: boolean }) {
     // 机场订阅 URL 为写敏感字段(响应恒脱敏、不回显):留空表示保持不变,填入则整体替换。
-    const body: Record<string, unknown> = { name: values.name };
+    const body: Record<string, unknown> = { name: values.name, reality_mlkem: values.reality_mlkem };
     const nextUrl = values.source_url?.trim();
     if (nextUrl) body.source_url = nextUrl;
     try {
-      await api(`/api/profiles/${detail.id}`, { method: "PUT", body: JSON.stringify(body) });
+      // 切换 ML-KEM 自动开启会离线重生成,带回 `regenerate`;未通过校验时如实提示。
+      const res = await api<{ regenerate?: Regenerate }>(`/api/profiles/${detail.id}`, {
+        method: "PUT",
+        body: JSON.stringify(body),
+      });
+      if (res.regenerate) {
+        notice(res.regenerate);
+        onRegenerate(res.regenerate);
+      }
       setEditOpen(false);
       onSaved();
     } catch (e) {
@@ -308,6 +333,7 @@ function BasicInfo({
         ? `${detail.last_fetch_status} · ${detail.last_fetch_at ?? ""}`
         : t("source.never"),
     ],
+    [t("basic.realityMlkem"), detail.reality_mlkem ? t("basic.on") : t("basic.off")],
   ];
 
   return (
@@ -320,6 +346,7 @@ function BasicInfo({
               form.setFieldsValue({
                 name: detail.name,
                 source_url: "",
+                reality_mlkem: detail.reality_mlkem,
               });
               setEditOpen(true);
             }}
@@ -355,6 +382,14 @@ function BasicInfo({
           </Form.Item>
           <Form.Item name="source_url" label={t("source.newUrl")} extra={t("source.urlHint")}>
             <Input placeholder="https://..." />
+          </Form.Item>
+          <Form.Item
+            name="reality_mlkem"
+            label={t("basic.realityMlkem")}
+            extra={t("basic.realityMlkemHint")}
+            valuePropName="checked"
+          >
+            <Switch />
           </Form.Item>
         </Form>
       </Modal>

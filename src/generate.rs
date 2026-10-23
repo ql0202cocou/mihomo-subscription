@@ -18,7 +18,9 @@ use sha2::{Digest, Sha256};
 use sqlx::FromRow;
 
 use crate::app::AppState;
-use crate::converter::{self, ConvertError, ConvertInput, CustomGroup, CustomNode, RuleProvider};
+use crate::converter::{
+    self, ConvertError, ConvertInput, ConvertOutput, CustomGroup, CustomNode, RuleProvider,
+};
 use crate::error::{ApiError, ApiResult};
 use crate::profiles;
 use crate::util::{completed_since, is_fresh, now};
@@ -57,6 +59,8 @@ struct Built {
     generated_at: String,
     /// 与机场 `rule-providers` 撞名、已被面板托管版覆盖的自定义规则集名(空表示无冲突)。
     ruleset_conflicts: Vec<String>,
+    /// ML-KEM 已开启但指纹不是 chrome 的 REALITY 节点名;随缓存保存,供详情页常驻告警。
+    reality_fingerprint_risks: Vec<String>,
 }
 
 /// 一次刷新尝试的结果,用于选择公开响应。
@@ -148,10 +152,10 @@ pub async fn preview(
         .fetch(&profile.source_url)
         .await
         .map_err(|e| ApiError::Upstream(e.status_label()))?;
-    let out = convert(&state, &profile.id, &profile.token, &fetched.body, None)
+    let converted = convert(&state, &profile.id, &profile.token, &fetched.body, None)
         .await?
         .map_err(map_convert_err)?;
-    Ok(yaml_body(out.yaml))
+    Ok(yaml_body(converted.output.yaml))
 }
 
 #[derive(Serialize)]
@@ -312,8 +316,8 @@ async fn fetch_convert_and_record(
         .await
         // DB 错误已被 `From<sqlx::Error>` 脱敏并记日志;传播为内部错误,不再误报为机场拉取失败。
         .map_err(|_| BuildError::Internal)?;
-    let out = match converted {
-        Ok(out) => out,
+    let converted = match converted {
+        Ok(converted) => converted,
         Err(ConvertError::Validation(v)) => return Err(BuildError::Validation(v)),
         // 拉取成功但内容不是可解析的 Mihomo YAML(如机场不认 UA 返回的 base64 节点列表):同样是
         // 机场侧问题,覆盖上面刚写入的 `success`,使列表/详情如实反映。
@@ -324,43 +328,49 @@ async fn fetch_convert_and_record(
         }
         Err(ConvertError::OutputSerialize) => return Err(BuildError::Internal),
     };
-    if !out.ruleset_conflicts.is_empty() {
+    if !converted.output.ruleset_conflicts.is_empty() {
         tracing::warn!(
             profile = %profile.id,
-            conflicts = ?out.ruleset_conflicts,
+            conflicts = ?converted.output.ruleset_conflicts,
             "custom rule-sets override same-named provider rule-providers",
         );
     }
-    if !out.reality_fingerprint_risks.is_empty() {
-        tracing::warn!(
-            profile = %profile.id,
-            nodes = ?out.reality_fingerprint_risks,
-            "REALITY nodes without the chrome client-fingerprint: X25519MLKEM768 key share \
-             is not sent, so recent Xray servers may reject the handshake",
-        );
-    }
 
-    let content_hash = content_hash_of(&out.yaml);
-    Ok(Built {
-        yaml: out.yaml,
-        userinfo: fetched.subscription_userinfo,
-        provider_yaml: fetched.body,
-        rules: out.rules,
-        content_hash,
-        generated_at: now(),
-        ruleset_conflicts: out.ruleset_conflicts,
-    })
+    Ok(converted.into_built(fetched.body, fetched.subscription_userinfo, now()))
 }
 
 /// 一次成功转换的产出。
 struct Converted {
-    yaml: String,
-    ruleset_conflicts: Vec<String>,
-    /// 指纹缺失或非 `chrome` 的 REALITY 节点名;仅回源生成时告警(离线重生成输入未变,不重复记录)。
-    reality_fingerprint_risks: Vec<String>,
+    output: ConvertOutput,
     /// 本次转换实际使用的规则文本(随缓存快照;轮换 token/前缀时,当前草稿未通过校验则用它
     /// 离线重生成,见 [`regenerate_for_rotation`])。
     rules: String,
+}
+
+impl Converted {
+    /// 连同本次所用的机场原文、响应头与生成时间组装成待写入缓存的 [`Built`]。
+    fn into_built(
+        self,
+        provider_yaml: String,
+        userinfo: Option<String>,
+        generated_at: String,
+    ) -> Built {
+        let ConvertOutput {
+            yaml,
+            ruleset_conflicts,
+            reality_fingerprint_risks,
+        } = self.output;
+        Built {
+            content_hash: content_hash_of(&yaml),
+            yaml,
+            userinfo,
+            provider_yaml,
+            rules: self.rules,
+            generated_at,
+            ruleset_conflicts,
+            reality_fingerprint_risks,
+        }
+    }
 }
 
 /// 从 DB 装载转换输入并运行转换器。外层 `ApiResult` 表示 DB 错误;内层 `Result` 是转换器结果。
@@ -454,15 +464,16 @@ async fn convert(
 
     // per-profile 的手动排序(NULL/异常 -> 空 -> 默认):两个节点块的先后(机场/自定义)与
     // proxy-group 顺序。自定义块的内部顺序是全局的(`global_nodes.position`),上面的查询已应用,
-    // 故这里 `node_order` 为空。
-    let (node_section_order, group_order) = sqlx::query_as::<_, (Option<String>, Option<String>)>(
-        "SELECT node_section_order, group_order FROM profiles WHERE id = ?",
-    )
-    .bind(profile_id)
-    .fetch_optional(&state.db)
-    .await?
-    .map(|(s, g)| (profiles::parse_order(s), profiles::parse_order(g)))
-    .unwrap_or_default();
+    // 故这里 `node_order` 为空。另取是否为 REALITY 节点自动开启 ML-KEM(缺省开启)。
+    let (node_section_order, group_order, reality_mlkem) =
+        sqlx::query_as::<_, (Option<String>, Option<String>, bool)>(
+            "SELECT node_section_order, group_order, reality_mlkem FROM profiles WHERE id = ?",
+        )
+        .bind(profile_id)
+        .fetch_optional(&state.db)
+        .await?
+        .map(|(s, g, mlkem)| (profiles::parse_order(s), profiles::parse_order(g), mlkem))
+        .unwrap_or((Vec::new(), Vec::new(), true));
 
     // 转换器在注入自定义规则集时一并报出与机场 `rule-providers` 撞名(覆盖)的名字,无需二次解析。
     Ok(converter::convert(ConvertInput {
@@ -474,13 +485,9 @@ async fn convert(
         node_section_order,
         group_order,
         rule_providers,
+        reality_mlkem,
     })
-    .map(|out| Converted {
-        yaml: out.yaml,
-        ruleset_conflicts: out.ruleset_conflicts,
-        reality_fingerprint_risks: out.reality_fingerprint_risks,
-        rules,
-    }))
+    .map(|output| Converted { output, rules }))
 }
 
 fn map_convert_err(e: ConvertError) -> ApiError {
@@ -529,9 +536,20 @@ async fn persist_cache_and_group_order(
     built: &Built,
     source_revision: i64,
 ) -> ApiResult<bool> {
+    // 指纹风险随缓存保存(无则 NULL)。只在名单变化时记日志:同一批节点在每次刷新、每条订阅里
+    // 重复出现,常驻提示交给详情页。调用方都持有 per-profile 锁,先读后写不会与并发生成交错。
+    let risks = (!built.reality_fingerprint_risks.is_empty())
+        .then(|| serde_json::to_string(&built.reality_fingerprint_risks).unwrap_or_default());
+    let previous_risks = sqlx::query_scalar::<_, Option<String>>(
+        "SELECT reality_fingerprint_risks FROM generated_cache WHERE profile_id = ?",
+    )
+    .bind(profile_id)
+    .fetch_optional(&state.db)
+    .await?
+    .flatten();
     let result = sqlx::query(
-        "INSERT INTO generated_cache (profile_id, content_hash, output_yaml, subscription_userinfo, provider_yaml, rules_snapshot, generated_at)
-         SELECT ?, ?, ?, ?, ?, ?, ?
+        "INSERT INTO generated_cache (profile_id, content_hash, output_yaml, subscription_userinfo, provider_yaml, rules_snapshot, reality_fingerprint_risks, generated_at)
+         SELECT ?, ?, ?, ?, ?, ?, ?, ?
          WHERE (SELECT source_revision FROM profiles WHERE id = ?) = ?
          ON CONFLICT(profile_id) DO UPDATE SET
             content_hash = excluded.content_hash,
@@ -539,6 +557,7 @@ async fn persist_cache_and_group_order(
             subscription_userinfo = excluded.subscription_userinfo,
             provider_yaml = excluded.provider_yaml,
             rules_snapshot = excluded.rules_snapshot,
+            reality_fingerprint_risks = excluded.reality_fingerprint_risks,
             generated_at = excluded.generated_at",
     )
     .bind(profile_id)
@@ -547,6 +566,7 @@ async fn persist_cache_and_group_order(
     .bind(&built.userinfo)
     .bind(&built.provider_yaml)
     .bind(&built.rules)
+    .bind(&risks)
     .bind(&built.generated_at)
     .bind(profile_id)
     .bind(source_revision)
@@ -554,6 +574,14 @@ async fn persist_cache_and_group_order(
     .await?;
     if result.rows_affected() == 0 {
         return Ok(false);
+    }
+    if risks.is_some() && risks != previous_risks {
+        tracing::warn!(
+            profile = %profile_id,
+            nodes = ?built.reality_fingerprint_risks,
+            "REALITY nodes with X25519MLKEM768 enabled but no chrome client-fingerprint: \
+             the key share is not sent, so recent Xray servers may reject the handshake",
+        );
     }
 
     // 把输出的 proxy-group 顺序快照回写,使其在机场刷新间保持稳定:仍存在的分组保住其位置,
@@ -708,15 +736,7 @@ async fn regenerate_locked(
             });
         }
     };
-    let built = Built {
-        content_hash: content_hash_of(&out.yaml),
-        yaml: out.yaml,
-        userinfo,
-        provider_yaml,
-        rules: out.rules,
-        generated_at,
-        ruleset_conflicts: out.ruleset_conflicts,
-    };
+    let built = out.into_built(provider_yaml, userinfo, generated_at);
     // 重生成期间换源:缓存已被换源清空,本次结果随之失效(Pending,待新来源回源重建)。
     if !persist_cache_and_group_order(state, profile_id, &built, profile.source_revision).await? {
         return Ok(Regenerated::Pending);

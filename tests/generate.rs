@@ -1386,20 +1386,52 @@ async fn source_change_discards_old_inflight_fetch_result() {
     );
 }
 
+const REALITY_PROVIDER: &str = "proxies:\n  - { name: reality-chrome, type: vless, server: 1.2.3.4, port: 443, tls: true, client-fingerprint: chrome, reality-opts: { public-key: pk, short-id: ab } }\n  - { name: reality-firefox, type: vless, server: 1.2.3.5, port: 443, tls: true, client-fingerprint: firefox, reality-opts: { public-key: pk } }\n";
+
 #[tokio::test]
-async fn reality_node_gets_mlkem_support_in_public_output() {
-    // 新版 Xray 服务端要求 REALITY 握手携带 X25519MLKEM768;下发的订阅须为缺省的
-    // reality-opts 自动补 support-x25519mlkem768: true。
+async fn reality_mlkem_switch_controls_injection_and_risks() {
+    // 新建订阅默认为 REALITY 节点补开 support-x25519mlkem768,指纹非 chrome 的节点随缓存保存并在
+    // 详情常驻展示;关闭开关后离线重生成立即生效(不重拉机场),风险随之清空。
     let temp = TempDb::new();
-    let fetcher = Arc::new(BodyFetcher(
-        "proxies:\n  - { name: vless-reality, type: vless, server: 1.2.3.4, port: 443, tls: true, client-fingerprint: chrome, reality-opts: { public-key: pk, short-id: ab } }\n",
-    ));
-    let app = build_router(test_state_with_fetcher(&temp, fetcher).await);
+    let mut state = test_state_with_fetcher(&temp, Arc::new(BodyFetcher(REALITY_PROVIDER))).await;
+    Arc::get_mut(&mut state)
+        .unwrap()
+        .public_refresh_min_interval = Duration::from_secs(3600);
+    let app = build_router(state);
     let cookie = login(&app).await;
 
     let profile = create_profile(&app, &cookie).await;
+    let id = profile["id"].as_str().unwrap();
+    assert_eq!(profile["reality_mlkem"], true);
+    assert_eq!(
+        profile["reality_fingerprint_risks"],
+        serde_json::json!(["reality-firefox"])
+    );
     let sub = sub_path(profile["subscription_url"].as_str().unwrap());
-    assert!(get_text(&app, &sub)
+    assert_eq!(
+        get_text(&app, &sub)
+            .await
+            .matches("support-x25519mlkem768: true")
+            .count(),
+        2
+    );
+
+    let resp = app
+        .clone()
+        .oneshot(authed(
+            "PUT",
+            &format!("/api/profiles/{id}"),
+            &cookie,
+            r#"{"reality_mlkem":false}"#,
+        ))
         .await
-        .contains("support-x25519mlkem768: true"));
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let updated = json(resp).await;
+    assert_eq!(updated["reality_mlkem"], false);
+    assert_eq!(updated["regenerate"]["status"], "applied");
+    assert_eq!(updated["reality_fingerprint_risks"], serde_json::json!([]));
+    assert!(!get_text(&app, &sub)
+        .await
+        .contains("support-x25519mlkem768"));
 }

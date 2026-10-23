@@ -31,6 +31,7 @@ fn conversion(provider: &str) -> ConvertInput<'_> {
         node_section_order: vec![],
         group_order: vec![],
         rule_providers: vec![],
+        reality_mlkem: true,
     }
 }
 
