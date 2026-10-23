@@ -9,6 +9,7 @@ import {
   Divider,
   Input,
   InputNumber,
+  Radio,
   Select,
   Space,
   Switch,
@@ -59,6 +60,7 @@ export function FieldInput({
   value: unknown;
   onChange: (v: unknown) => void;
 }) {
+  const { t } = useTranslation();
   switch (def.kind) {
     case "number":
       return (
@@ -70,9 +72,26 @@ export function FieldInput({
         />
       );
     case "switch":
+      return <Switch checked={value === true} onChange={(c) => onChange(c)} />;
+    case "tristate": {
+      // 未设置(含 null)= 跟随订阅,选它即删除该键;其余非布尔值不选中任何一项。
+      const current =
+        value == null ? "inherit" : value === true ? "on" : value === false ? "off" : undefined;
       return (
-        <Switch checked={(value ?? def.defaultChecked) === true} onChange={(c) => onChange(c)} />
+        <Radio.Group
+          optionType="button"
+          size="small"
+          value={current}
+          onChange={(e) =>
+            onChange(e.target.value === "inherit" ? undefined : e.target.value === "on")
+          }
+          options={(["inherit", "on", "off"] as const).map((v) => ({
+            value: v,
+            label: t(`fields.tristate.${v}`),
+          }))}
+        />
       );
+    }
     case "password":
       return (
         <Input.Password

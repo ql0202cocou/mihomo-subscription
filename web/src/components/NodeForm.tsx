@@ -154,27 +154,28 @@ export default function NodeForm({ value, onChange }: Props) {
         .filter((group) => !group.showWhen || group.showWhen(value.fields))
         .map((group) => {
           const nested = (value.fields[group.key] ?? {}) as Record<string, unknown>;
-          const hint = t(`nodeHints.${group.key}`, "");
           return (
             <div className="modal-block" key={group.key}>
               <div className="modal-block-title">{t(`nodeGroups.${group.key}`, group.key)}</div>
-              {hint && (
+              {group.hintWhen?.(value.fields) && (
                 <Typography.Paragraph
                   type="warning"
                   style={{ marginTop: -4, marginBottom: 12, fontSize: 12 }}
                 >
-                  {hint}
+                  {t(`nodeHints.${group.key}`)}
                 </Typography.Paragraph>
               )}
-              {group.fields.map((sub) => (
-                <Form.Item key={sub.key} label={fieldLabel(sub)} style={{ marginBottom: 12 }}>
-                  <FieldInput
-                    def={sub}
-                    value={getPath(nested, sub.key)}
-                    onChange={(v) => setGroupField(group.key, sub.key, v)}
-                  />
-                </Form.Item>
-              ))}
+              {group.fields
+                .filter((sub) => !sub.showWhen || sub.showWhen(value.fields))
+                .map((sub) => (
+                  <Form.Item key={sub.key} label={fieldLabel(sub)} style={{ marginBottom: 12 }}>
+                    <FieldInput
+                      def={sub}
+                      value={getPath(nested, sub.key)}
+                      onChange={(v) => setGroupField(group.key, sub.key, v)}
+                    />
+                  </Form.Item>
+                ))}
             </div>
           );
         })}

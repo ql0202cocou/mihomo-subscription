@@ -3,7 +3,8 @@
 // ws-opts / grpc-opts 等嵌套选项块),其余 key 一律用高级键值行编辑,这样常规场景下
 // 管理员永远不必手写 YAML。
 
-export type FieldKind = "text" | "password" | "number" | "switch" | "select" | "tags";
+/** `tristate`:布尔字段的「跟随订阅(不写入)/ 开启 / 关闭」三态,未设置时由后端按订阅设置决定。 */
+export type FieldKind = "text" | "password" | "number" | "switch" | "tristate" | "select" | "tags";
 
 export interface FieldDef {
   key: string;
@@ -11,9 +12,7 @@ export interface FieldDef {
   /** `select`/`tags` 字段的候选建议(仍允许自由输入)。 */
   options?: string[];
   placeholder?: string;
-  /** `switch` 字段未设置时展示的状态(仅展示,不写入;对应后端下发时的缺省补值)。 */
-  defaultChecked?: boolean;
-  /** 仅当谓词对当前字段成立时才显示该字段。 */
+  /** 仅当谓词对当前(顶层)字段成立时才显示该字段;嵌套分组内的字段同样接收顶层字段。 */
   showWhen?: (fields: Record<string, unknown>) => boolean;
 }
 
@@ -23,6 +22,8 @@ export interface GroupDef {
   key: string;
   fields: FieldDef[];
   showWhen?: (fields: Record<string, unknown>) => boolean;
+  /** 谓词成立时在分组标题下展示提示 `nodeHints.<key>`。 */
+  hintWhen?: (fields: Record<string, unknown>) => boolean;
 }
 
 interface TypeSchema {
@@ -32,6 +33,17 @@ interface TypeSchema {
 
 // ─── 条件显示用的谓词 ─────────────────────────────────────────────────────────
 const tlsOn = (f: Record<string, unknown>) => f.tls === true;
+const realityOpts = (f: Record<string, unknown>) => {
+  const opts = f["reality-opts"];
+  return opts && typeof opts === "object" && !Array.isArray(opts)
+    ? (opts as Record<string, unknown>)
+    : {};
+};
+// 与后端一致:只有 public-key 非空时 mihomo 才启用 REALITY。
+const realityOn = (f: Record<string, unknown>) => {
+  const key = realityOpts(f)["public-key"];
+  return tlsOn(f) && typeof key === "string" && key !== "";
+};
 const networkIs =
   (...nets: string[]) =>
   (f: Record<string, unknown>) =>
@@ -108,15 +120,19 @@ const GRPC_OPTS: GroupDef = {
   showWhen: networkIs("grpc"),
   fields: [{ key: "grpc-service-name", kind: "text" }],
 };
-// REALITY:基于服务端提供的 public-key + short-id 的 TLS。support-x25519mlkem768 缺省时
-// 后端下发自动补 true(新版 Xray 服务端必需),开关缺省即显示为开;指纹要求见分组提示。
+// REALITY:基于服务端提供的 public-key + short-id 的 TLS。support-x25519mlkem768 未设置时
+// 跟随订阅的「REALITY 自动开启 X25519MLKEM768」开关下发;可能开启而指纹不是 chrome 时提示。
 const REALITY_OPTS: GroupDef = {
   key: "reality-opts",
   showWhen: tlsOn,
+  hintWhen: (f) =>
+    realityOn(f) &&
+    f["client-fingerprint"] !== "chrome" &&
+    realityOpts(f)["support-x25519mlkem768"] !== false,
   fields: [
     { key: "public-key", kind: "text" },
     { key: "short-id", kind: "text" },
-    { key: "support-x25519mlkem768", kind: "switch", defaultChecked: true },
+    { key: "support-x25519mlkem768", kind: "tristate", showWhen: realityOn },
   ],
 };
 
