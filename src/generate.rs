@@ -331,6 +331,14 @@ async fn fetch_convert_and_record(
             "custom rule-sets override same-named provider rule-providers",
         );
     }
+    if !out.reality_fingerprint_risks.is_empty() {
+        tracing::warn!(
+            profile = %profile.id,
+            nodes = ?out.reality_fingerprint_risks,
+            "REALITY nodes without the chrome client-fingerprint: X25519MLKEM768 key share \
+             is not sent, so recent Xray servers may reject the handshake",
+        );
+    }
 
     let content_hash = content_hash_of(&out.yaml);
     Ok(Built {
@@ -348,6 +356,8 @@ async fn fetch_convert_and_record(
 struct Converted {
     yaml: String,
     ruleset_conflicts: Vec<String>,
+    /// 指纹缺失或非 `chrome` 的 REALITY 节点名;仅回源生成时告警(离线重生成输入未变,不重复记录)。
+    reality_fingerprint_risks: Vec<String>,
     /// 本次转换实际使用的规则文本(随缓存快照;轮换 token/前缀时,当前草稿未通过校验则用它
     /// 离线重生成,见 [`regenerate_for_rotation`])。
     rules: String,
@@ -465,9 +475,10 @@ async fn convert(
         group_order,
         rule_providers,
     })
-    .map(|(yaml, ruleset_conflicts)| Converted {
-        yaml,
-        ruleset_conflicts,
+    .map(|out| Converted {
+        yaml: out.yaml,
+        ruleset_conflicts: out.ruleset_conflicts,
+        reality_fingerprint_risks: out.reality_fingerprint_risks,
         rules,
     }))
 }

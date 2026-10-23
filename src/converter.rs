@@ -95,9 +95,18 @@ pub enum ConvertError {
     Validation(Vec<String>),
 }
 
-/// 把机场 YAML 转换为 Mihomo 配置字符串。返回 `(yaml, conflicts)`,`conflicts` 为注入的自定义
-/// 规则集中、覆盖了机场同名 `rule-providers` 条目的名字(供生成层告警;无撞名则为空)。
-pub fn convert(input: ConvertInput) -> Result<(String, Vec<String>), ConvertError> {
+/// 一次成功转换的产出:输出 YAML 与供生成层告警的附带信息(均可为空)。
+#[derive(Debug)]
+pub struct ConvertOutput {
+    pub yaml: String,
+    /// 注入的自定义规则集中、覆盖了机场同名 `rule-providers` 条目的名字。
+    pub ruleset_conflicts: Vec<String>,
+    /// `client-fingerprint` 缺失或非 `chrome` 的 REALITY 节点名(见 [`inject_reality_compat`])。
+    pub reality_fingerprint_risks: Vec<String>,
+}
+
+/// 把机场 YAML 转换为 Mihomo 配置字符串(见 [`ConvertOutput`])。
+pub fn convert(input: ConvertInput) -> Result<ConvertOutput, ConvertError> {
     let mut root =
         yaml::parse_mapping(input.provider_yaml).map_err(|_| ConvertError::ProviderParse)?;
 
@@ -159,7 +168,8 @@ pub fn convert(input: ConvertInput) -> Result<(String, Vec<String>), ConvertErro
         |item| item.get("name").and_then(Value::as_str),
         &input.node_order,
     );
-    let proxies = concat_sections(provider_block, custom_block, &input.node_section_order);
+    let mut proxies = concat_sections(provider_block, custom_block, &input.node_section_order);
+    let reality_fingerprint_risks = inject_reality_compat(&mut proxies);
     root.insert(Value::from("proxies"), Value::Sequence(proxies));
 
     // proxy-groups:整体替换为用户的自定义分组(同 `rules`)。机场分组 *不* 透传——管理员经
@@ -217,7 +227,11 @@ pub fn convert(input: ConvertInput) -> Result<(String, Vec<String>), ConvertErro
         yaml::YamlError::TooComplex => limits_error(),
         _ => ConvertError::OutputSerialize,
     })?;
-    Ok((yaml, rule_provider_conflicts))
+    Ok(ConvertOutput {
+        yaml,
+        ruleset_conflicts: rule_provider_conflicts,
+        reality_fingerprint_risks,
+    })
 }
 
 fn validate(
@@ -411,6 +425,30 @@ fn sequence_of(value: Option<&Value>) -> Vec<Value> {
         Some(Value::Sequence(items)) => items.clone(),
         _ => Vec::new(),
     }
+}
+
+/// 新版 Xray 服务端(25.5.16 起)要求 REALITY 握手携带 X25519MLKEM768 密钥协商,否则拒绝;
+/// mihomo 需在节点 `reality-opts` 里显式声明 `support-x25519mlkem768`,缺省时补 `true`
+/// (显式写的值不动;对旧服务端向后兼容)。该协商基于 Chrome 指纹实现:`client-fingerprint`
+/// 缺失或非 `chrome` 时 ML-KEM 不会随 ClientHello 发出(缺失时 mihomo 更会直接拒绝 REALITY
+/// 节点)——不代为改动用户指纹,仅返回这些节点名供生成层告警。
+fn inject_reality_compat(proxies: &mut [Value]) -> Vec<String> {
+    let mut fingerprint_risks = Vec::new();
+    for proxy in proxies {
+        let Value::Mapping(m) = proxy else {
+            continue;
+        };
+        let Some(Value::Mapping(opts)) = m.get_mut("reality-opts") else {
+            continue;
+        };
+        opts.entry(Value::from("support-x25519mlkem768"))
+            .or_insert(Value::from(true));
+        if m.get("client-fingerprint").and_then(Value::as_str) != Some("chrome") {
+            let name = m.get("name").and_then(Value::as_str).unwrap_or("?");
+            fingerprint_risks.push(name.to_string());
+        }
+    }
+    fingerprint_risks
 }
 
 fn build_group(group: CustomGroup) -> Mapping {
@@ -630,12 +668,16 @@ mod tests {
 
         let mut collide = input("MATCH,DIRECT", vec![], vec![]);
         collide.rule_providers = vec![rp("ads")];
-        let (_, conflicts) = convert(collide).expect("conversion succeeds");
+        let conflicts = convert(collide)
+            .expect("conversion succeeds")
+            .ruleset_conflicts;
         assert_eq!(conflicts, vec!["ads".to_string()]);
 
         let mut distinct = input("MATCH,DIRECT", vec![], vec![]);
         distinct.rule_providers = vec![rp("MyAdBlock")];
-        let (_, conflicts) = convert(distinct).expect("conversion succeeds");
+        let conflicts = convert(distinct)
+            .expect("conversion succeeds")
+            .ruleset_conflicts;
         assert!(conflicts.is_empty());
     }
 
@@ -676,7 +718,7 @@ rules:
     }
 
     fn out(input: ConvertInput) -> Mapping {
-        let (yaml, _) = convert(input).expect("conversion succeeds");
+        let yaml = convert(input).expect("conversion succeeds").yaml;
         serde_yaml::from_str(&yaml).unwrap()
     }
 
@@ -1147,6 +1189,61 @@ rules:
             out_group.get("url").and_then(Value::as_str),
             Some("http://x/generate_204"),
             "其余选项照常合并"
+        );
+    }
+
+    #[test]
+    fn reality_nodes_get_mlkem_support_injected() {
+        // 机场与自定义 REALITY 节点缺省 support-x25519mlkem768 → 补 true;显式 false 尊重不动;
+        // 无 reality-opts、或 reality-opts 不是映射的节点不动。指纹缺失或非 chrome 的 REALITY
+        // 节点按输出顺序报出,供生成层告警。
+        let nodes = vec![CustomNode {
+            name: "my-reality".into(),
+            content: "{ type: vless, server: 9.9.9.9, port: 443, tls: true, reality-opts: { public-key: pk } }".into(),
+        }];
+        let mut inp = input("MATCH,DIRECT", nodes, vec![]);
+        inp.provider_yaml = "proxies:\n  - { name: vless-new, type: vless, server: 1.2.3.4, port: 443, tls: true, client-fingerprint: chrome, reality-opts: { public-key: pk, short-id: ab } }\n  - { name: vless-off, type: vless, server: 1.2.3.5, port: 443, tls: true, client-fingerprint: firefox, reality-opts: { public-key: pk, support-x25519mlkem768: false } }\n  - { name: plain-ss, type: ss, server: 1.2.3.6, port: 8388 }\n  - { name: weird, type: vless, server: 1.2.3.7, port: 443, reality-opts: '' }\n";
+        let output = convert(inp).expect("conversion succeeds");
+        assert_eq!(
+            output.reality_fingerprint_risks,
+            vec!["vless-off".to_string(), "my-reality".to_string()]
+        );
+        let root: Mapping = serde_yaml::from_str(&output.yaml).unwrap();
+        let proxies = root.get("proxies").unwrap().as_sequence().unwrap();
+        let reality_opts = |name: &str| {
+            proxies
+                .iter()
+                .find(|p| p.get("name").and_then(Value::as_str) == Some(name))
+                .and_then(|p| p.get("reality-opts"))
+        };
+        let mlkem = |name: &str| reality_opts(name).unwrap().get("support-x25519mlkem768");
+        assert_eq!(mlkem("vless-new"), Some(&Value::from(true)));
+        assert_eq!(
+            reality_opts("vless-new")
+                .unwrap()
+                .get("public-key")
+                .and_then(Value::as_str),
+            Some("pk"),
+            "原有 reality-opts 键保留"
+        );
+        assert_eq!(
+            mlkem("vless-off"),
+            Some(&Value::from(false)),
+            "显式 false 尊重不动"
+        );
+        assert_eq!(
+            mlkem("my-reality"),
+            Some(&Value::from(true)),
+            "自定义节点同样注入"
+        );
+        assert!(
+            reality_opts("plain-ss").is_none(),
+            "无 reality-opts 的节点不动"
+        );
+        assert_eq!(
+            reality_opts("weird"),
+            Some(&Value::from("")),
+            "reality-opts 不是映射时不动"
         );
     }
 }
