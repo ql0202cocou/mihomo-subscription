@@ -1,4 +1,4 @@
-import { Form, Input, Select } from "antd";
+import { Form, Input, Select, Typography } from "antd";
 import { useTranslation } from "react-i18next";
 import { parse as parseYaml, stringify as stringifyYaml } from "yaml";
 import {
@@ -154,9 +154,18 @@ export default function NodeForm({ value, onChange }: Props) {
         .filter((group) => !group.showWhen || group.showWhen(value.fields))
         .map((group) => {
           const nested = (value.fields[group.key] ?? {}) as Record<string, unknown>;
+          const hint = t(`nodeHints.${group.key}`, "");
           return (
             <div className="modal-block" key={group.key}>
               <div className="modal-block-title">{t(`nodeGroups.${group.key}`, group.key)}</div>
+              {hint && (
+                <Typography.Paragraph
+                  type="warning"
+                  style={{ marginTop: -4, marginBottom: 12, fontSize: 12 }}
+                >
+                  {hint}
+                </Typography.Paragraph>
+              )}
               {group.fields.map((sub) => (
                 <Form.Item key={sub.key} label={fieldLabel(sub)} style={{ marginBottom: 12 }}>
                   <FieldInput
