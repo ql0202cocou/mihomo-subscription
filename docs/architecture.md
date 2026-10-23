@@ -221,7 +221,7 @@ PUT /api/profiles/:id/group-order         { order: [分组名] }              # 
 
 | 键 | 处理 |
 |-----|------|
-| `proxies` | 机场块（上游序）+ 自定义块（启用全局节点按 `global_nodes.position` 排），按 `node_section_order` 拼接 |
+| `proxies` | 机场块（上游序）+ 自定义块（启用全局节点按 `global_nodes.position` 排），按 `node_section_order` 拼接；含 `reality-opts` 的节点缺省时自动注入 `support-x25519mlkem768: true`（显式值不动），`client-fingerprint` 缺失或非 `chrome` 时记录告警 |
 | `proxy-groups` | 整体替换为启用的自定义分组（机场分组不透传，需「导入机场分组」），按 `group_order` 重排 |
 | `rules` | 整体替换为用户规则 |
 | `rule-providers` | 机场原样透传；另把被 `RULE-SET` 规则（含逻辑规则内嵌套）引用、本订阅自有（③）规则集合并在上（同名覆盖，指向按订阅 token 隔离的托管链接） |

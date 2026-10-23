@@ -1168,7 +1168,7 @@ async fn legacy_cache_without_provider_original_is_left_untouched() {
     );
 }
 
-/// 返回固定正文的 fetcher,用于模拟机场返回非 YAML 内容。
+/// 返回固定正文的 fetcher。
 struct BodyFetcher(&'static str);
 
 #[async_trait::async_trait]
@@ -1384,4 +1384,22 @@ async fn source_change_discards_old_inflight_fetch_result() {
         3,
         "新建、在途旧来源、换源后新来源各一次;旧在途结果未覆盖新缓存"
     );
+}
+
+#[tokio::test]
+async fn reality_node_gets_mlkem_support_in_public_output() {
+    // 新版 Xray 服务端要求 REALITY 握手携带 X25519MLKEM768;下发的订阅须为缺省的
+    // reality-opts 自动补 support-x25519mlkem768: true。
+    let temp = TempDb::new();
+    let fetcher = Arc::new(BodyFetcher(
+        "proxies:\n  - { name: vless-reality, type: vless, server: 1.2.3.4, port: 443, tls: true, client-fingerprint: chrome, reality-opts: { public-key: pk, short-id: ab } }\n",
+    ));
+    let app = build_router(test_state_with_fetcher(&temp, fetcher).await);
+    let cookie = login(&app).await;
+
+    let profile = create_profile(&app, &cookie).await;
+    let sub = sub_path(profile["subscription_url"].as_str().unwrap());
+    assert!(get_text(&app, &sub)
+        .await
+        .contains("support-x25519mlkem768: true"));
 }
