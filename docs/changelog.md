@@ -47,7 +47,7 @@
 
 ### 新增
 
-- 
+- 下发订阅为含 `reality-opts` 的节点自动补开 `support-x25519mlkem768`（新版 Xray 服务端必需，显式值不动）；节点表单展示该开关并提示 REALITY 指纹需为 chrome，指纹缺失或非 chrome 时后端记录告警。
 
 ### 变更
 

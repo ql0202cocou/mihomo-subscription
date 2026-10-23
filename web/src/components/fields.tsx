@@ -70,7 +70,9 @@ export function FieldInput({
         />
       );
     case "switch":
-      return <Switch checked={value === true} onChange={(c) => onChange(c)} />;
+      return (
+        <Switch checked={(value ?? def.defaultChecked) === true} onChange={(c) => onChange(c)} />
+      );
     case "password":
       return (
         <Input.Password

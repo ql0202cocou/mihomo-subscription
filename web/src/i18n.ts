@@ -159,6 +159,7 @@ const zh = {
       "client-fingerprint": "客户端指纹 (Fingerprint)",
       "public-key": "REALITY 公钥 (public-key)",
       "short-id": "REALITY short-id",
+      "support-x25519mlkem768": "支持 X25519MLKEM768",
       path: "路径 (path)",
       "grpc-service-name": "gRPC 服务名",
       "congestion-controller": "拥塞控制",
@@ -173,6 +174,10 @@ const zh = {
       "reality-opts": "REALITY 选项",
       "ws-opts": "WebSocket 选项",
       "grpc-opts": "gRPC 选项",
+    },
+    nodeHints: {
+      "reality-opts":
+        "新版 Xray(25.5.16+)服务端要求 REALITY 客户端指纹为 chrome 且开启 X25519MLKEM768;下发订阅时后者会自动补开,客户端指纹请自行确认。",
     },
     groups: {
       title: "分组预览",

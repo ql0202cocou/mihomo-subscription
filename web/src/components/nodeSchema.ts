@@ -11,6 +11,8 @@ export interface FieldDef {
   /** `select`/`tags` 字段的候选建议(仍允许自由输入)。 */
   options?: string[];
   placeholder?: string;
+  /** `switch` 字段未设置时展示的状态(仅展示,不写入;对应后端下发时的缺省补值)。 */
+  defaultChecked?: boolean;
   /** 仅当谓词对当前字段成立时才显示该字段。 */
   showWhen?: (fields: Record<string, unknown>) => boolean;
 }
@@ -106,13 +108,15 @@ const GRPC_OPTS: GroupDef = {
   showWhen: networkIs("grpc"),
   fields: [{ key: "grpc-service-name", kind: "text" }],
 };
-// REALITY:基于服务端提供的 public-key + short-id 的 TLS。
+// REALITY:基于服务端提供的 public-key + short-id 的 TLS。support-x25519mlkem768 缺省时
+// 后端下发自动补 true(新版 Xray 服务端必需),开关缺省即显示为开;指纹要求见分组提示。
 const REALITY_OPTS: GroupDef = {
   key: "reality-opts",
   showWhen: tlsOn,
   fields: [
     { key: "public-key", kind: "text" },
     { key: "short-id", kind: "text" },
+    { key: "support-x25519mlkem768", kind: "switch", defaultChecked: true },
   ],
 };
 
