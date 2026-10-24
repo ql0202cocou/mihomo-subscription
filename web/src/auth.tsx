@@ -21,13 +21,16 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const [user, setUser] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
 
-  // 探活当前会话;任何失败(未登录、会话过期、网络错误)都按未登录处理。
-  async function refresh(): Promise<void> {
+  // 探活当前会话;启动时的失败(未登录、会话过期、网络错误)按未登录处理。
+  // strict 模式(登录成功后的会话确认)只容忍 401:其余失败如实抛回调用方,
+  // 不能静默清空用户后当作成功。
+  async function refresh(options?: { strict?: boolean }): Promise<void> {
     try {
       const session = await api<{ username: string }>("/api/auth/session");
       setUser(session.username);
-    } catch {
+    } catch (e) {
       setUser(null);
+      if (options?.strict && !(e instanceof ApiError && e.status === 401)) throw e;
     } finally {
       setLoading(false);
     }
@@ -45,7 +48,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       method: "POST",
       body: JSON.stringify({ username, password }),
     });
-    await refresh();
+    await refresh({ strict: true });
   }
 
   async function logout(): Promise<void> {

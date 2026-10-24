@@ -12,6 +12,10 @@ export interface FieldDef {
   /** `select`/`tags` 字段的候选建议(仍允许自由输入)。 */
   options?: string[];
   placeholder?: string;
+  /** `number` 字段的下限/上限/小数精度(缺省不限制)。 */
+  min?: number;
+  max?: number;
+  precision?: number;
   /** 仅当谓词对当前(顶层)字段成立时才显示该字段;嵌套分组内的字段同样接收顶层字段。 */
   showWhen?: (fields: Record<string, unknown>) => boolean;
 }
@@ -91,7 +95,7 @@ export function nodeTypeLabel(type: string): string {
 /** 所有类型都显示的字段,排在类型专属字段之前。 */
 export const BASE_FIELDS: FieldDef[] = [
   { key: "server", kind: "text", placeholder: "example.com / 1.2.3.4" },
-  { key: "port", kind: "number" },
+  { key: "port", kind: "number", min: 1, max: 65535, precision: 0 },
 ];
 
 const SS_CIPHERS = [
@@ -148,7 +152,7 @@ const TYPE_SCHEMA: Record<string, TypeSchema> = {
   vmess: {
     fields: [
       { key: "uuid", kind: "text" },
-      { key: "alterId", kind: "number" },
+      { key: "alterId", kind: "number", min: 0, precision: 0 },
       { key: "cipher", kind: "select", options: VMESS_CIPHERS },
       { key: "udp", kind: "switch" },
       { key: "network", kind: "select", options: NETWORKS },

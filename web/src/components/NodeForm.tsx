@@ -1,4 +1,4 @@
-import { Form, Input, Select, Typography } from "antd";
+import { AutoComplete, Form, Input, Typography } from "antd";
 import { useTranslation } from "react-i18next";
 import { parse as parseYaml, stringify as stringifyYaml } from "yaml";
 import {
@@ -18,7 +18,8 @@ export interface NodeModel {
   fields: Record<string, unknown>;
 }
 
-/** 把存储的代理 YAML 解析成编辑器模型;容忍非法输入。 */
+/** 把存储的代理 YAML 解析成编辑器模型;容忍非法输入。
+ *  键名来自外部数据,用无原型对象累积,`__proto__` 这类键也能原样保留。 */
 export function contentToModel(content: string): NodeModel {
   let parsed: Record<string, unknown> = {};
   try {
@@ -31,7 +32,7 @@ export function contentToModel(content: string): NodeModel {
   }
   let name = "";
   let type = "";
-  const fields: Record<string, unknown> = {};
+  const fields: Record<string, unknown> = Object.create(null);
   for (const [k, v] of Object.entries(parsed)) {
     if (k === "name") name = typeof v === "string" ? v : String(v ?? "");
     else if (k === "type") type = typeof v === "string" ? v : String(v ?? "");
@@ -42,7 +43,7 @@ export function contentToModel(content: string): NodeModel {
 
 /** 把编辑器模型序列化回 Mihomo 代理 YAML 映射。 */
 export function modelToContent(m: NodeModel): string {
-  const obj: Record<string, unknown> = {};
+  const obj: Record<string, unknown> = Object.create(null);
   if (m.name) obj.name = m.name;
   if (m.type) obj.type = m.type;
   for (const [k, v] of Object.entries(m.fields)) {
@@ -95,11 +96,11 @@ export default function NodeForm({ value, onChange }: Props) {
   }
 
   // 高级行用有序数组保存,这样重命名某个 key 不会打乱周围字段的顺序。
-  // 每次编辑都会把它们合并回 `fields`。
+  // 每次编辑都会把它们合并回 `fields`;键名由用户输入,用无原型对象累积。
   const advanced = advancedEntries(value.fields, known);
 
   function setAdvanced(next: [string, unknown][]) {
-    const fields: Record<string, unknown> = {};
+    const fields: Record<string, unknown> = Object.create(null);
     for (const [k, v] of Object.entries(value.fields)) {
       if (known.has(k)) fields[k] = v;
     }
@@ -120,13 +121,13 @@ export default function NodeForm({ value, onChange }: Props) {
         />
       </Form.Item>
       <Form.Item label={t("nodes.type")} required>
-        <Select
-          showSearch
+        <AutoComplete
           style={{ width: "100%" }}
           options={NODE_TYPES.map((o) => ({ value: o, label: nodeTypeLabel(o) }))}
-          value={value.type || undefined}
+          value={value.type}
           onChange={(s) => onChange({ ...value, type: s })}
           placeholder={t("nodes.typePlaceholder")}
+          allowClear
           filterOption={(input, opt) => {
             // 按全称或字面量过滤,输入「shadow」或「ss」都能搜到;底层值仍是字面量。
             const q = input.toLowerCase();

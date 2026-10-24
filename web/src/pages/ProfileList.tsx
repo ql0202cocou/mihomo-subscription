@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Link } from "react-router";
 import { App as AntdApp, Button, Form, Input, Modal } from "antd";
 import { CopyOutlined, PlusOutlined, RightOutlined } from "@ant-design/icons";
@@ -12,14 +12,19 @@ export default function ProfileList() {
   const { message } = AntdApp.useApp();
   const [profiles, setProfiles] = useState<ProfileSummary[]>([]);
   const [loading, setLoading] = useState(true);
+  const [loadFailed, setLoadFailed] = useState(false);
   const [creating, setCreating] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const savePending = useRef(false);
   const [form] = Form.useForm();
 
   const load = useCallback(async () => {
     setLoading(true);
     try {
       setProfiles(await api<ProfileSummary[]>("/api/profiles"));
+      setLoadFailed(false);
     } catch {
+      setLoadFailed(true);
       message.error(t("common.loadFailed"));
     } finally {
       setLoading(false);
@@ -31,6 +36,10 @@ export default function ProfileList() {
   }, [load]);
 
   async function onCreate(values: { name: string; source_url: string }) {
+    // ref 同步挡重入(state 生效前的连续提交),state 驱动 Modal 的 confirmLoading。
+    if (savePending.current) return;
+    savePending.current = true;
+    setSaving(true);
     try {
       await api<ProfileSummary>("/api/profiles", {
         method: "POST",
@@ -41,6 +50,9 @@ export default function ProfileList() {
       await load();
     } catch (e) {
       message.error(errorMessage(e, t("profiles.createFailed")));
+    } finally {
+      savePending.current = false;
+      setSaving(false);
     }
   }
 
@@ -104,6 +116,13 @@ export default function ProfileList() {
             </div>
           ))}
         </div>
+      ) : loadFailed && profiles.length === 0 ? (
+        <div className="list-empty">
+          {t("common.loadFailed")}{" "}
+          <Button size="small" onClick={() => void load()}>
+            {t("common.retry")}
+          </Button>
+        </div>
       ) : profiles.length === 0 ? (
         <div className="list-empty">{t("profiles.empty")}</div>
       ) : (
@@ -120,6 +139,7 @@ export default function ProfileList() {
         open={creating}
         onCancel={() => setCreating(false)}
         onOk={() => form.submit()}
+        confirmLoading={saving}
         okText={t("common.create")}
         cancelText={t("common.cancel")}
         destroyOnHidden

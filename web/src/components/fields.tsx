@@ -50,6 +50,14 @@ export function TypeChips({
   );
 }
 
+function normalizeNumber(def: FieldDef, value: number | null): number | null {
+  if (value === null) return null;
+  let next = def.precision === undefined ? value : Number(value.toFixed(def.precision));
+  if (def.min !== undefined) next = Math.max(def.min, next);
+  if (def.max !== undefined) next = Math.min(def.max, next);
+  return next;
+}
+
 /** 单个已知字段的带类型输入框。标签由调用方负责。 */
 export function FieldInput({
   def,
@@ -67,8 +75,20 @@ export function FieldInput({
         <InputNumber
           style={{ width: "100%" }}
           value={typeof value === "number" ? value : undefined}
-          onChange={(n) => onChange(n)}
+          onChange={(n) => onChange(normalizeNumber(def, n))}
+          // 越界输入在打字阶段不会触发 onChange;用原始文本补齐归一化,空文本才清空。
+          onInput={(text) => {
+            if (text.trim() === "") {
+              onChange(null);
+              return;
+            }
+            const parsed = Number(text);
+            if (Number.isFinite(parsed)) onChange(normalizeNumber(def, parsed));
+          }}
           placeholder={def.placeholder}
+          min={def.min}
+          max={def.max}
+          precision={def.precision}
         />
       );
     case "switch":
@@ -146,6 +166,9 @@ interface AdvancedRow {
   key: string;
   kind: AdvancedKind;
   value: unknown;
+  /** yaml 行的当前文本草稿:输入中途解析失败时只保留草稿,不写回 value;
+   *  切换类型时以草稿为准。未编辑过为 undefined(展示时由 value 序列化)。 */
+  draft?: string;
 }
 
 function kindOf(v: unknown): AdvancedKind {
@@ -173,18 +196,9 @@ function skippedRows(rows: AdvancedRow[], reserved: Set<string>): Set<number> {
   return skipped;
 }
 
-/** 切换行类型时尽量保留已填的值。 */
-function convertValue(value: unknown, kind: AdvancedKind): unknown {
+/** 切换行类型(目标非 YAML)时尽量保留已填的值。 */
+function convertValue(value: unknown, kind: Exclude<AdvancedKind, "yaml">): unknown {
   switch (kind) {
-    case "yaml":
-      // 先填文本再切到 YAML 时,用户的本意是把这段文本当 YAML;解析失败则保留原文交给用户修正。
-      if (typeof value !== "string") return value;
-      if (value.trim() === "") return null;
-      try {
-        return parseYaml(value);
-      } catch {
-        return value;
-      }
     case "bool":
       return value === true || value === "true";
     case "number": {
@@ -199,6 +213,24 @@ function convertValue(value: unknown, kind: AdvancedKind): unknown {
           : String(value);
     default:
       return value;
+  }
+}
+
+/** 切换行类型:以当前草稿(YAML 行)或值为源。切到 YAML 时,源文本先作为草稿,
+ *  能解析则同时更新值;解析失败只留草稿待用户修正,非法 YAML 不写回父级 fields。 */
+function convertKind(row: AdvancedRow, kind: AdvancedKind): Partial<AdvancedRow> {
+  const current = row.kind === "yaml" && row.draft !== undefined ? row.draft : row.value;
+  if (kind !== "yaml") return { kind, value: convertValue(current, kind), draft: undefined };
+  const text =
+    typeof current === "string"
+      ? current
+      : current == null
+        ? ""
+        : stringifyYaml(current).trimEnd();
+  try {
+    return { kind, value: parseYaml(text), draft: text };
+  } catch {
+    return { kind, draft: text };
   }
 }
 
@@ -241,6 +273,18 @@ export function AdvancedFields({
     update(rows.map((r) => (r.id === id ? { ...r, ...change } : r)));
   }
 
+  /** YAML 行的文本编辑:草稿总是跟进;只有解析成功才更新值,非法 YAML 不写回父级。 */
+  function patchYaml(id: number, text: string) {
+    let parsed: unknown;
+    let ok = true;
+    try {
+      parsed = parseYaml(text);
+    } catch {
+      ok = false;
+    }
+    update(rows.map((r) => (r.id === id ? { ...r, draft: text, ...(ok ? { value: parsed } : {}) } : r)));
+  }
+
   const kindOptions = (["text", "number", "bool", "yaml"] as const).map((k) => ({
     value: k,
     label: t(`fields.kind.${k}`),
@@ -270,12 +314,14 @@ export function AdvancedFields({
                 style={{ width: 84 }}
                 value={r.kind}
                 options={kindOptions}
-                onChange={(kind) => patch(r.id, { kind, value: convertValue(r.value, kind) })}
+                onChange={(kind) => patch(r.id, convertKind(r, kind))}
               />
               <AdvancedValue
                 kind={r.kind}
                 value={r.value}
+                draft={r.draft}
                 onChange={(value) => patch(r.id, { value })}
+                onDraft={(text) => patchYaml(r.id, text)}
               />
               <Button danger onClick={() => update(rows.filter((x) => x.id !== r.id))}>
                 {t("fields.remove")}
@@ -303,16 +349,22 @@ export function AdvancedFields({
 function AdvancedValue({
   kind,
   value,
+  draft,
   onChange,
+  onDraft,
 }: {
   kind: AdvancedKind;
   value: unknown;
+  /** 仅 yaml 行:当前文本草稿(见 AdvancedRow.draft)。 */
+  draft?: string;
   onChange: (v: unknown) => void;
+  onDraft: (text: string) => void;
 }) {
   switch (kind) {
     case "bool":
       return <Switch checked={value === true} onChange={onChange} />;
     case "number":
+      // 通用高级数字不设上下限/精度:任意数值都允许。
       return (
         <InputNumber
           style={{ width: 220 }}
@@ -321,7 +373,7 @@ function AdvancedValue({
         />
       );
     case "yaml":
-      return <ObjectField value={value} onChange={onChange} />;
+      return <ObjectField value={value} draft={draft} onDraft={onDraft} />;
     default:
       return (
         <Input
@@ -333,31 +385,24 @@ function AdvancedValue({
   }
 }
 
-/** 嵌套对象/数组的高级值,用一小段 YAML 编辑。 */
+/** 嵌套对象/数组的高级值,用一小段 YAML 编辑;文本草稿由父级按行保存。 */
 function ObjectField({
   value,
-  onChange,
+  draft,
+  onDraft,
 }: {
   value: unknown;
-  onChange: (v: unknown) => void;
+  draft: string | undefined;
+  onDraft: (text: string) => void;
 }) {
-  // 字符串只来自「文本切到 YAML 且解析失败」:原样显示,交给用户修正;其余值序列化为 YAML。
-  const [text, setText] = useState(() =>
-    typeof value === "string" ? value : value == null ? "" : stringifyYaml(value).trimEnd(),
-  );
+  // 无草稿时由当前值序列化;有草稿(含解析失败的中途文本)时原样显示,交给用户修正。
+  const text = draft ?? (value == null ? "" : stringifyYaml(value).trimEnd());
   return (
     <Input.TextArea
       style={{ width: 220, fontFamily: "monospace" }}
       autoSize={{ minRows: 2, maxRows: 8 }}
       value={text}
-      onChange={(e) => {
-        setText(e.target.value);
-        try {
-          onChange(parseYaml(e.target.value));
-        } catch {
-          // YAML 编辑中途解析失败时,保留上一次有效的解析结果。
-        }
-      }}
+      onChange={(e) => onDraft(e.target.value)}
     />
   );
 }

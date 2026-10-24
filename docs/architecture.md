@@ -165,7 +165,7 @@ GET    /api/profiles/:id/rule-sets                     # 列表；每项含 url�
 POST   /api/profiles/:id/rule-sets   { name, behavior, source?, format, ... }   # name 在本订阅内唯一（重名 409）；字段同 ②。新建/更新响应为最新定义，改动影响所服务输出时另带 regenerate 字段
 PUT    /api/profiles/:id/rule-sets/:rsid   { ...同上 }
 DELETE /api/profiles/:id/rule-sets/:rsid
-POST   /api/profiles/:id/rule-sets/import  { names: [②规则集名], policy }   # names 最多 1000 个（逐个 trim、去空、按规则集名同一约束校验、保序去重，超限或含非法名 400）。在 per-profile 锁内以单个 BEGIN IMMEDIATE 事务复制 ② 定义进 ③（含真实远程 URL）+ 为导入后本订阅实际存在定义且尚未引用的名插入 RULE-SET,<name>,<policy> 行（插到最后一条非注释 MATCH 兜底行之前，无 MATCH 则追加末尾；② 中不存在、未能复制的名字不追加；policy 须为单个非空名字，不含逗号/换行，否则 400 且不写入）；规则文本以读取时的旧内容为条件写回（CAS），并发规则编辑导致冲突时整体回滚、返回 409（重试即可）；返回 { imported, regenerate }（imported 为实际复制进 ③ 的定义数，已存在同名的不计；复制了定义或新增了规则行都会触发离线重生成，都没有时 regenerate 为 null）
+POST   /api/profiles/:id/rule-sets/import  { names: [②规则集名], policy }   # names 最多 1000 个（逐个 trim、去空、按规则集名同一约束校验、保序去重，超限或含非法名 400）。在 per-profile 锁内以单个 BEGIN IMMEDIATE 事务复制 ② 定义进 ③（含真实远程 URL）+ 为导入后本订阅实际存在定义且尚未引用的名插入 RULE-SET,<name>,<policy> 行（插到最后一条非注释 MATCH 兜底行之前，无 MATCH 则追加末尾；② 中不存在、未能复制的名字不追加；policy 须为单个非空名字，不含逗号/换行，否则 400 且不写入）；规则文本以读取时的旧内容为条件写回（CAS），并发规则编辑导致冲突时整体回滚、返回 409（重试即可）；返回 { imported, regenerate, rules_content }（imported 为实际复制进 ③ 的定义数，已存在同名的不计；复制了定义或新增了规则行都会触发离线重生成，都没有时 regenerate 为 null；rules_content 为导入提交后的完整规则文本，无改动时保留原文，供前端同步编辑状态）
 ```
 
 - manual / remote 行为与 ② 一致（校验/渲染/镜像同一套逻辑）。托管在按订阅 token 隔离的链接
@@ -213,7 +213,11 @@ PUT /api/profiles/:id/group-order         { order: [分组名] }              # 
   机场**，改动**立即生效**（预览与公共链接随即反映）；全局排序重生成**每条配置**缓存，无缓存者
   首次生成时生效。
 - 规则拖拽同理：规则顺序即语义（命中即止），存为 `rulesets.content` 有序文本，前端经
-  `PUT .../rules` 整体保存，同样离线重生成、立即生效，响应同上。
+  `PUT .../rules` 整体保存，同样离线重生成、立即生效，响应同上。编辑器将最后一条 `MATCH` 钉底，
+  较早的 `MATCH` 保留在普通列表中，不在加载时归并或丢弃。
+- 前端 `RULE-SET` 编辑器默认只保存引用；显式开启本地定义维护并新建或修改定义字段时才写入 ③。
+  托管导入与规则保存共用前端串行队列，导入期间暂停其他规则编辑，完成后按响应的 `rules_content`
+  同步本地规则，避免在途完整保存覆盖导入结果。
 - 离线重生成与 `generate` 走同一转换器（含校验与 `rule-providers` 注入）；所有写缓存的路径（生成、新建时的
   自动拉取、公开刷新、离线重生成）共用 per-profile 锁；保留 `generated_at`（回源节奏不变）。
 - per-profile 的保存接口（`rules`、`node-section-order`、`group-order`、`rule-sets/import`）在响应的

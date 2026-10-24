@@ -3,6 +3,7 @@ import { App as AntdApp, Button, Form, Input, Modal, Popconfirm, Select } from "
 import { DeleteOutlined, EditOutlined, HolderOutlined, PlusOutlined } from "@ant-design/icons";
 import {
   DndContext,
+  KeyboardSensor,
   PointerSensor,
   closestCenter,
   useSensor,
@@ -12,6 +13,7 @@ import {
 import {
   SortableContext,
   arrayMove,
+  sortableKeyboardCoordinates,
   useSortable,
   verticalListSortingStrategy,
 } from "@dnd-kit/sortable";
@@ -114,8 +116,14 @@ export default function GroupsCard({
   const [orderNames, setOrderNames] = useState<string[]>([]);
   const [rows, setRows] = useState<GroupRow[]>([]);
   const [importing, setImporting] = useState(false);
+  const importPending = useRef(false);
+  const [saving, setSaving] = useState(false);
+  const savePending = useRef(false);
 
-  const sensors = useSensors(useSensor(PointerSensor, { activationConstraint: { distance: 4 } }));
+  const sensors = useSensors(
+    useSensor(PointerSensor, { activationConstraint: { distance: 4 } }),
+    useSensor(KeyboardSensor, { coordinateGetter: sortableKeyboardCoordinates }),
+  );
 
   const loadGeneratedPreview = useCallback(async () => {
     try {
@@ -170,6 +178,8 @@ export default function GroupsCard({
   }
 
   async function importProviderGroups() {
+    if (importPending.current) return;
+    importPending.current = true;
     setImporting(true);
     try {
       const res = await api<{ imported: number; skipped: number }>(
@@ -182,6 +192,7 @@ export default function GroupsCard({
     } catch (e) {
       message.error(errorMessage(e, t("groups.importFailed")));
     } finally {
+      importPending.current = false;
       setImporting(false);
     }
   }
@@ -211,10 +222,11 @@ export default function GroupsCard({
     setOptions(next);
   }
 
-  /** 整体替换高级行:保留当前类型已知字段的已有值,未知键只来自高级行。 */
+  /** 整体替换高级行:保留当前类型已知字段的已有值,未知键只来自高级行。
+   *  键名由用户输入,用无原型对象累积,`__proto__` 这类键也能原样保存。 */
   function setAdvancedOptions(advRows: [string, unknown][]) {
     const known = groupOptionKeys(groupType);
-    const next: Options = {};
+    const next: Options = Object.create(null);
     for (const [k, v] of Object.entries(options)) if (known.has(k)) next[k] = v;
     for (const [k, v] of advRows) next[k] = v;
     setOptions(next);
@@ -225,7 +237,10 @@ export default function GroupsCard({
       message.error(t("groups.nameRequired"));
       return;
     }
-    const cleaned: Options = {};
+    if (savePending.current) return;
+    savePending.current = true;
+    setSaving(true);
+    const cleaned: Options = Object.create(null);
     for (const [k, v] of Object.entries(options)) {
       if (k.trim() === "" || v === "" || v === undefined || v === null) continue;
       cleaned[k] = v;
@@ -246,6 +261,9 @@ export default function GroupsCard({
       onSaved();
     } catch (e) {
       message.error(errorMessage(e, t("common.saveFailed")));
+    } finally {
+      savePending.current = false;
+      setSaving(false);
     }
   }
 
@@ -306,6 +324,7 @@ export default function GroupsCard({
         open={open}
         onCancel={() => setOpen(false)}
         onOk={save}
+        confirmLoading={saving}
         width={960}
         okText={t("common.save")}
         cancelText={t("common.cancel")}

@@ -397,6 +397,8 @@ pub struct ImportResult {
     imported: usize,
     /// 离线重生成结果;复制了定义或新增了规则行时触发,两者都未发生(无实际改动)时为 `null`。
     regenerate: Option<Regenerated>,
+    /// 导入提交后的完整规则文本,供前端同步本地编辑状态。
+    rules_content: String,
 }
 
 /// 从全局 ② 库复制一行所需的字段(含 `rule_count`,直接沿用,免重算)。
@@ -527,11 +529,15 @@ pub async fn import(
             .filter(|n| !referenced.iter().any(|r| r.as_str() == **n))
             .map(|n| format!("RULE-SET,{n},{policy}"))
             .collect();
-        let mut rules_changed = false;
-        if !lines.is_empty() {
+        let content = if lines.is_empty() {
+            old_content.clone()
+        } else {
             // 客户端按规则顺序匹配:新行必须插到兜底 MATCH 之前(编辑器同样把 MATCH 钉底),
             // 追加在 MATCH 后的规则永远不会命中。
-            let content = insert_before_fallback_match(&old_content, &lines);
+            insert_before_fallback_match(&old_content, &lines)
+        };
+        let rules_changed = !lines.is_empty();
+        if rules_changed {
             // 带旧内容的 CAS:规则被并发修改过时整体回滚(定义复制一并撤销),调用方重试即可。
             let updated = sqlx::query(
                 "UPDATE rulesets SET content = ?, updated_at = ? WHERE profile_id = ? AND content = ?",
@@ -547,7 +553,6 @@ pub async fn import(
                     "rules were changed concurrently; please retry".into(),
                 ));
             }
-            rules_changed = true;
         }
         tx.commit().await?;
 
@@ -561,6 +566,7 @@ pub async fn import(
         Ok(Json(ImportResult {
             imported,
             regenerate,
+            rules_content: content,
         }))
     })
     .await

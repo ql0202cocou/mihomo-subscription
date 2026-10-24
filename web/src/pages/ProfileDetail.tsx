@@ -61,10 +61,13 @@ function ProfileDetailContent({ id }: { id: string }) {
     }
   }, [id]);
 
-  // 保存类接口带回的离线重生成结果:校验错误与「刷新」的错误同处展示;已应用则清掉过时的错误。
+  // 保存类接口带回的离线重生成结果:校验错误与「刷新」的错误同处展示。
   const onRegenerate = useCallback((r: Regenerate) => {
+    // 新编辑已落库;无论已应用还是暂未重生成,之前的校验错误都不再代表当前状态。
     if (r.status === "invalid") setGenErrors(r.errors ?? []);
-    else if (r.status === "applied") setGenErrors([]);
+    else setGenErrors([]);
+    // 任何配置变更落库后,上一次手动刷新产生的冲突警告都已过时。
+    setGenWarnings([]);
   }, []);
 
   useEffect(() => {
@@ -226,9 +229,15 @@ function ProfileDetailContent({ id }: { id: string }) {
 function HostedLink({ detail, onReset }: { detail: Detail; onReset: () => void }) {
   const { t } = useTranslation();
   const { message } = AntdApp.useApp();
+  const [resetting, setResetting] = useState(false);
+  const resetPending = useRef(false);
 
   async function resetToken() {
-    // 重置 token 会更换订阅 URL 并使旧链接立即失效(公开端点按 token 校验),故需 Popconfirm 二次确认。
+    // 重置 token 会更换订阅 URL 并使旧链接立即失效(公开端点按 token 校验),故需 Popconfirm 二次确认;
+    // ref 同步挡重入,避免双击发出两次重置。
+    if (resetPending.current) return;
+    resetPending.current = true;
+    setResetting(true);
     try {
       const res = await api<{ regenerate?: Regenerate }>(`/api/profiles/${detail.id}/reset-token`, {
         method: "POST",
@@ -236,12 +245,17 @@ function HostedLink({ detail, onReset }: { detail: Detail; onReset: () => void }
       // 当前配置未通过校验且无法用最近合法配置迁移时,缓存已清空,如实警告而非笼统成功。
       if (res.regenerate?.status === "invalid") {
         message.warning(t("detail.resetTokenInvalid"));
+      } else if (res.regenerate?.status === "pending") {
+        message.info(t("regenerate.pending"));
       } else {
         message.success(t("detail.generateSuccess"));
       }
       onReset();
     } catch (e) {
       message.error(errorMessage(e, t("common.saveFailed")));
+    } finally {
+      resetPending.current = false;
+      setResetting(false);
     }
   }
 
@@ -268,8 +282,14 @@ function HostedLink({ detail, onReset }: { detail: Detail; onReset: () => void }
           <Button type="primary" icon={<CopyOutlined />} onClick={copyUrl}>
             {t("detail.copy")}
           </Button>
-          <Popconfirm title={t("detail.resetTokenConfirm")} onConfirm={resetToken}>
-            <Button danger>{t("detail.resetToken")}</Button>
+          <Popconfirm
+            title={t("detail.resetTokenConfirm")}
+            onConfirm={resetToken}
+            okButtonProps={{ loading: resetting }}
+          >
+            <Button danger loading={resetting}>
+              {t("detail.resetToken")}
+            </Button>
           </Popconfirm>
         </div>
       </div>

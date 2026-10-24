@@ -1,7 +1,7 @@
 import {
   createContext,
   useContext,
-  useEffect,
+  useLayoutEffect,
   useMemo,
   useState,
   type ReactNode,
@@ -66,16 +66,26 @@ interface ThemeContextValue {
 const ThemeContext = createContext<ThemeContextValue | null>(null);
 
 function initialMode(): ThemeMode {
-  const saved = localStorage.getItem(STORAGE_KEY);
-  return saved === "dark" || saved === "light" ? saved : "light";
+  try {
+    const saved = localStorage.getItem(STORAGE_KEY);
+    return saved === "dark" || saved === "light" ? saved : "light";
+  } catch {
+    // 存储不可用(隐私模式、禁用 Cookie 等)时退回默认亮色
+    return "light";
+  }
 }
 
 export function ThemeProvider({ children }: { children: ReactNode }) {
   const [mode, setMode] = useState<ThemeMode>(initialMode);
 
-  useEffect(() => {
+  // useLayoutEffect:绘制前同步设置 dataset,避免首帧先亮后暗(或相反)的闪烁。
+  useLayoutEffect(() => {
     document.documentElement.dataset.theme = mode;
-    localStorage.setItem(STORAGE_KEY, mode);
+    try {
+      localStorage.setItem(STORAGE_KEY, mode);
+    } catch {
+      // 存储不可用时主题只在当前会话生效
+    }
   }, [mode]);
 
   const value = useMemo<ThemeContextValue>(

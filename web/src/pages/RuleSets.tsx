@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { App as AntdApp, Button, Input, InputNumber, Modal, Popconfirm, Switch } from "antd";
 import {
   DeleteOutlined,
@@ -8,6 +8,7 @@ import {
 } from "@ant-design/icons";
 import {
   DndContext,
+  KeyboardSensor,
   PointerSensor,
   closestCenter,
   useSensor,
@@ -17,6 +18,7 @@ import {
 import {
   SortableContext,
   arrayMove,
+  sortableKeyboardCoordinates,
   useSortable,
   verticalListSortingStrategy,
 } from "@dnd-kit/sortable";
@@ -65,17 +67,34 @@ export default function RuleSets() {
   const { message } = AntdApp.useApp();
   const saveInOrder = useSerialSave();
   const [rows, setRows] = useState<RuleSet[]>([]);
+  const [loaded, setLoaded] = useState(false);
+  const [loadFailed, setLoadFailed] = useState(false);
   const [open, setOpen] = useState(false);
   const [editing, setEditing] = useState<RuleSet | null>(null);
   const [form, setForm] = useState<FormState>(EMPTY);
+  const [saving, setSaving] = useState(false);
+  const savePending = useRef(false);
+  // 并发 load 只采用最后一次发起的结果;排序开始时递增序号,使在途的旧读取失效。
+  const loadSeq = useRef(0);
 
-  const sensors = useSensors(useSensor(PointerSensor, { activationConstraint: { distance: 4 } }));
+  const sensors = useSensors(
+    useSensor(PointerSensor, { activationConstraint: { distance: 4 } }),
+    useSensor(KeyboardSensor, { coordinateGetter: sortableKeyboardCoordinates }),
+  );
 
   const load = useCallback(async () => {
+    const seq = ++loadSeq.current;
     try {
-      setRows(await api<RuleSet[]>("/api/rule-sets"));
+      const next = await api<RuleSet[]>("/api/rule-sets");
+      if (seq !== loadSeq.current) return;
+      setRows(next);
+      setLoadFailed(false);
+      setLoaded(true);
     } catch {
       // 瞬时错误时保留当前列表
+      if (seq !== loadSeq.current) return;
+      setLoadFailed(true);
+      setLoaded(true);
     }
   }, []);
 
@@ -117,6 +136,9 @@ export default function RuleSets() {
     const name = form.name.trim();
     if (!name) return message.error(t("ruleSets.nameRequired"));
     if (!NAME_RE.test(name)) return message.error(t("ruleSets.nameInvalid"));
+    if (savePending.current) return;
+    savePending.current = true;
+    setSaving(true);
     const base = {
       name,
       behavior: form.behavior,
@@ -141,6 +163,9 @@ export default function RuleSets() {
       await load();
     } catch (e) {
       message.error(errorMessage(e, t("common.saveFailed")));
+    } finally {
+      savePending.current = false;
+      setSaving(false);
     }
   }
 
@@ -161,6 +186,7 @@ export default function RuleSets() {
     const newIndex = rows.findIndex((n) => n.name === over.id);
     if (oldIndex < 0 || newIndex < 0) return;
     const next = arrayMove(rows, oldIndex, newIndex);
+    loadSeq.current += 1; // 在途的旧读取结果作废,避免覆盖乐观顺序
     setRows(next); // 乐观更新
     const res = await saveInOrder(() =>
       api("/api/rule-sets/order", {
@@ -195,8 +221,19 @@ export default function RuleSets() {
           </Button>
         </div>
 
-        {rows.length === 0 ? (
-          <div className="empty-line">{t("ruleSets.empty")}</div>
+        {!loaded ? (
+          <div className="empty-line">{t("common.loading")}</div>
+        ) : rows.length === 0 ? (
+          loadFailed ? (
+            <div className="empty-line">
+              {t("common.loadFailed")}{" "}
+              <Button size="small" onClick={() => void load()}>
+                {t("common.retry")}
+              </Button>
+            </div>
+          ) : (
+            <div className="empty-line">{t("ruleSets.empty")}</div>
+          )
         ) : (
           <DndContext sensors={sensors} collisionDetection={closestCenter} onDragEnd={onDragEnd}>
             <SortableContext items={rows.map((n) => n.name)} strategy={verticalListSortingStrategy}>
@@ -205,6 +242,14 @@ export default function RuleSets() {
               ))}
             </SortableContext>
           </DndContext>
+        )}
+        {loaded && loadFailed && rows.length > 0 && (
+          <div className="dcard-note">
+            {t("common.refreshFailed")}{" "}
+            <Button size="small" type="link" onClick={() => void load()}>
+              {t("common.retry")}
+            </Button>
+          </div>
         )}
         <div className="dcard-note">{t("ruleSets.dragHint")}</div>
       </div>
@@ -215,6 +260,7 @@ export default function RuleSets() {
         open={open}
         onCancel={() => setOpen(false)}
         onOk={save}
+        confirmLoading={saving}
         width={960}
         okText={t("common.save")}
         cancelText={t("common.cancel")}

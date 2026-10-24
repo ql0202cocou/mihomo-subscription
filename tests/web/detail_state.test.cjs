@@ -199,22 +199,21 @@ function rulesCardModule(state, api) {
     },
     '@ant-design/icons': icons,
     '@dnd-kit/core': {
-      DndContext: passthrough, PointerSensor: {}, closestCenter: () => {},
+      DndContext: passthrough, PointerSensor: {}, KeyboardSensor: {}, closestCenter: () => {},
       useSensor: () => {}, useSensors: () => [],
     },
     '@dnd-kit/sortable': {
-      SortableContext: passthrough, arrayMove, verticalListSortingStrategy: {},
+      SortableContext: passthrough, arrayMove, sortableKeyboardCoordinates: () => {},
+      verticalListSortingStrategy: {},
       useSortable: () => ({ attributes: {}, listeners: {}, setNodeRef: () => {} }),
     },
     '@dnd-kit/utilities': { CSS: { Transform: { toString: () => undefined } } },
     'react-i18next': translation,
     '../../api': { api, errorMessage: () => 'failed' },
     '../../components/regenerate': { useRegenerateNotice: () => () => {} },
-    '../../components/useSerialSave': { useSerialSave: () => async (run) => {
-      try { return { ok: true, value: await run(), latest: true }; }
-      catch (error) { return { ok: false, error, latest: true }; }
-    } },
+    '../../components/useSerialSave': load('components/useSerialSave.ts', { react: state.react }),
     './groupSchema': { BUILTIN_POLICIES: ['DIRECT', 'REJECT'] },
+    './ruleRefs': load('pages/detail/ruleRefs.ts'),
     '../../components/fields': { TypeChips: 'TypeChips' },
     '../../components/ruleSetConstants': {
       RULE_SET_BEHAVIORS: [], RULE_SET_MANUAL_FORMATS: [],
@@ -271,6 +270,7 @@ test('importing provider rules merges onto a deletion made while the request is 
   tree = session.render();
   find(tree, (e) => e.props?.line === 'DOMAIN,keep.example,DIRECT' && e.props?.onRemove)
     .props.onRemove();
+  await tick(); // 真实串行队列在微任务里执行保存
   session.render();
   assert.deepEqual(session.puts, ['MATCH,DIRECT']);
 
@@ -296,6 +296,7 @@ test('importing provider rules merges onto a reorder made while the request is i
     active: { id: 'DOMAIN,b.example,DIRECT' },
     over: { id: 'DOMAIN,a.example,DIRECT' },
   });
+  await tick(); // 真实串行队列在微任务里执行保存
   session.render();
   assert.deepEqual(session.puts,
     ['DOMAIN,b.example,DIRECT\nDOMAIN,a.example,DIRECT\nMATCH,DIRECT']);

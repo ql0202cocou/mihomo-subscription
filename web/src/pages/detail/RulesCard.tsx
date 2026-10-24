@@ -24,6 +24,7 @@ import {
 } from "@ant-design/icons";
 import {
   DndContext,
+  KeyboardSensor,
   PointerSensor,
   closestCenter,
   useSensor,
@@ -33,6 +34,7 @@ import {
 import {
   SortableContext,
   arrayMove,
+  sortableKeyboardCoordinates,
   useSortable,
   verticalListSortingStrategy,
 } from "@dnd-kit/sortable";
@@ -49,6 +51,7 @@ import type {
   RuleSet,
 } from "../../types";
 import { BUILTIN_POLICIES } from "./groupSchema";
+import { ruleSetRefs } from "./ruleRefs";
 import { TypeChips } from "../../components/fields";
 import { useRegenerateNotice } from "../../components/regenerate";
 import { useSerialSave } from "../../components/useSerialSave";
@@ -66,7 +69,7 @@ interface Props {
   groups: CustomGroup[];
   generatedAt: string | null;
   errors: string[];
-  onSaved: () => void;
+  onSaved: () => void | Promise<void>;
   /** 保存带回的离线重生成结果,交给父组件展示校验错误。 */
   onRegenerate: (r: Regenerate) => void;
 }
@@ -126,6 +129,9 @@ interface RuleModel {
   rsContent: string;
   rsUrl: string;
   rsInterval: number;
+  rsManage: boolean;
+  rsDirty: boolean;
+  rsLoadedName: string;
 }
 
 const RS_DEFAULTS = {
@@ -135,6 +141,9 @@ const RS_DEFAULTS = {
   rsContent: "",
   rsUrl: "",
   rsInterval: 24,
+  rsManage: false,
+  rsDirty: false,
+  rsLoadedName: "",
 } as const;
 
 const DEFAULT_RULE: RuleModel = {
@@ -144,6 +153,21 @@ const DEFAULT_RULE: RuleModel = {
   noResolve: false,
   ...RS_DEFAULTS,
 };
+
+function withRuleSetDefinition(model: RuleModel, rs: ProfileRuleSet): RuleModel {
+  return {
+    ...model,
+    rsBehavior: rs.behavior,
+    rsFormat: rs.format,
+    rsSource: rs.source,
+    rsContent: rs.content,
+    rsUrl: "",
+    rsInterval: rs.interval_hours,
+    rsManage: true,
+    rsDirty: false,
+    rsLoadedName: rs.name,
+  };
+}
 
 const isComment = (line: string) => line.startsWith("#");
 const isMatchLine = (line: string) =>
@@ -174,7 +198,23 @@ function serializeRule(r: RuleModel): string {
   return r.noResolve ? `${base},no-resolve` : base;
 }
 
-// 编辑目标:null = 新增;数字 = 编辑该条非 MATCH 规则;"match" = 编辑钉底的 MATCH。
+function splitRules(content: string): { rules: string[]; match: string | null } {
+  const all = content.split("\n").map((line) => line.trim()).filter((line) => line !== "");
+  let matchIndex = -1;
+  for (let i = 0; i < all.length; i++) {
+    if (isMatchLine(all[i])) matchIndex = i;
+  }
+  return {
+    rules: all.filter((_, index) => index !== matchIndex),
+    match: matchIndex >= 0 ? all[matchIndex] : null,
+  };
+}
+
+function rulesContent(rules: string[], match: string | null): string {
+  return [...rules, ...(match ? [match] : [])].join("\n");
+}
+
+// 编辑目标:null = 新增;数字 = 编辑列表行(含较早的 MATCH);"match" = 编辑钉底的 MATCH。
 type EditTarget = number | "match" | null;
 
 export default function RulesCard({
@@ -191,27 +231,33 @@ export default function RulesCard({
   const { message } = AntdApp.useApp();
   const saveInOrder = useSerialSave();
   const notice = useRegenerateNotice();
-  // MATCH 钉在底部(锁定)。`rules` 按序保存其余所有行;`matchLine` 保存唯一的 MATCH 兜底
-  // (或 null)。
+  // 最后一条 MATCH 钉底;较早的 MATCH 与其余行一样保留在 `rules` 中。
   const [rules, setRules] = useState<string[]>([]);
   const [matchLine, setMatchLine] = useState<string | null>(null);
   const [modalOpen, setModalOpen] = useState(false);
   const [editing, setEditing] = useState<EditTarget>(null);
   const [model, setModel] = useState<RuleModel>(DEFAULT_RULE);
+  const [submitting, setSubmitting] = useState(false);
+  const submitPending = useRef(false);
   // 策略候选拆成两类(输出中的代理 / 输出中的分组——生成时机场分组已被自定义分组整体替换),
   // 以便在编辑弹窗按设计稿分组展示。
   const [proxyNames, setProxyNames] = useState<string[]>([]);
   const [outputGroupNames, setOutputGroupNames] = useState<string[]>([]);
   const [ruleSets, setRuleSets] = useState<RuleSet[]>([]);
-  // 本订阅自有规则集(③):RULE-SET 编辑器据此预填,保存时 upsert。
+  // 本订阅自有规则集(③):RULE-SET 编辑器据此预填,仅显式编辑时 upsert。
   const [profileRuleSets, setProfileRuleSets] = useState<ProfileRuleSet[]>([]);
   const [importing, setImporting] = useState(false);
   // 「导入托管规则」弹窗:勾选全局规则集 → 以 RULE-SET 引用进本订阅。
   const [importHostedOpen, setImportHostedOpen] = useState(false);
+  const [hostedImporting, setHostedImporting] = useState(false);
+  const hostedImportPending = useRef(false);
   const [picked, setPicked] = useState<Set<string>>(new Set());
   const [importPolicy, setImportPolicy] = useState("DIRECT");
 
-  const sensors = useSensors(useSensor(PointerSensor, { activationConstraint: { distance: 4 } }));
+  const sensors = useSensors(
+    useSensor(PointerSensor, { activationConstraint: { distance: 4 } }),
+    useSensor(KeyboardSensor, { coordinateGetter: sortableKeyboardCoordinates }),
+  );
 
   // 服务端最近确认的规则(加载或保存成功时更新):保存失败时回滚到它。不用闭包里的 `rules`,
   // 因为 persist 不依赖它(可能已过期),且连续保存时应回到服务端实际持有的状态。
@@ -226,19 +272,21 @@ export default function RulesCard({
   }, [rules, matchLine]);
 
   useEffect(() => {
-    const all = initial.split("\n").map((l) => l.trim()).filter((l) => l !== "");
-    // 最后一条 MATCH 作为兜底,钉底保留;其余行原样留在列表。
-    let match: string | null = null;
-    const rest: string[] = [];
-    for (const line of all) {
-      if (isMatchLine(line)) match = line;
-      else rest.push(line);
+    // 导入完成前后的旧 reload 不得覆盖刚确认的服务端文本;本次导入触发的最新 reload 除外。
+    if (
+      hostedImportPending.current &&
+      initial !== rulesContent(saved.current.rules, saved.current.match)
+    ) {
+      return;
     }
+    const { rules: rest, match } = splitRules(initial);
     // 本组件保存后 reload 带回的正是刚保存的规则:列表未变、编辑下标仍有效,不打断正在编辑的弹窗。
     const echoed =
       match === saved.current.match && rest.join("\n") === saved.current.rules.join("\n");
     setRules(rest);
     setMatchLine(match);
+    rulesRef.current = rest;
+    matchRef.current = match;
     saved.current = { rules: rest, match };
     if (echoed) return;
     setModalOpen(false);
@@ -289,9 +337,12 @@ export default function RulesCard({
   // 「已应用到订阅」的成功文案(见 useRegenerateNotice)。
   const persist = useCallback(
     async (nextRules: string[], nextMatch: string | null, appliedText?: string): Promise<boolean> => {
+      if (hostedImportPending.current) return false;
       setRules(nextRules);
       setMatchLine(nextMatch);
-      const content = [...nextRules, ...(nextMatch ? [nextMatch] : [])].join("\n");
+      rulesRef.current = nextRules;
+      matchRef.current = nextMatch;
+      const content = rulesContent(nextRules, nextMatch);
       const res = await saveInOrder(() =>
         api<{ regenerate: Regenerate }>(`/api/profiles/${profileId}/rules`, {
           method: "PUT",
@@ -309,6 +360,8 @@ export default function RulesCard({
       } else {
         setRules(saved.current.rules);
         setMatchLine(saved.current.match);
+        rulesRef.current = saved.current.rules;
+        matchRef.current = saved.current.match;
         message.error(errorMessage(res.error, t("common.saveFailed")));
       }
       return res.ok;
@@ -327,6 +380,7 @@ export default function RulesCard({
   }, [rules]);
 
   async function onDragEnd(event: DragEndEvent) {
+    if (hostedImportPending.current) return;
     const { active, over } = event;
     if (!over || active.id === over.id) return;
     const oldIndex = ruleIds.indexOf(String(active.id));
@@ -338,29 +392,25 @@ export default function RulesCard({
   }
 
   function openEdit(index: number) {
-    const m = parseRule(rules[index]);
+    if (hostedImportPending.current) return;
+    let m = parseRule(rules[index]);
     // RULE-SET:用本订阅已有的 ③ 定义预填(远程 URL 已脱敏不回显,留空表示保持不变)。
     if (m.type.trim().toUpperCase() === "RULE-SET") {
       const rs = profileRuleSets.find((r) => r.name === m.payload.trim());
-      if (rs) {
-        m.rsBehavior = rs.behavior;
-        m.rsFormat = rs.format;
-        m.rsSource = rs.source;
-        m.rsContent = rs.content;
-        m.rsUrl = "";
-        m.rsInterval = rs.interval_hours;
-      }
+      if (rs) m = withRuleSetDefinition(m, rs);
     }
     setEditing(index);
     setModel(m);
     setModalOpen(true);
   }
   function openAdd() {
+    if (hostedImportPending.current) return;
     setEditing(null);
     setModel(DEFAULT_RULE);
     setModalOpen(true);
   }
   function openEditMatch() {
+    if (hostedImportPending.current) return;
     setEditing("match");
     setModel(matchLine ? parseRule(matchLine) : { ...DEFAULT_RULE, type: "MATCH" });
     setModalOpen(true);
@@ -371,7 +421,7 @@ export default function RulesCard({
     setModel(DEFAULT_RULE);
   }
 
-  // 把 RULE-SET 的内联 provider 定义 upsert 到本订阅 ③ 库(按名 POST 新建 / PUT 更新)。
+  // 把显式编辑的 RULE-SET 定义 upsert 到本订阅 ③ 库(按名 POST 新建 / PUT 更新)。
   // 表单不编辑 cache / enabled:更新时沿用已有值(PUT 整体替换,缺省会被后端当作 true),新建时启用并缓存。
   async function upsertRuleSet(m: RuleModel) {
     const name = m.payload.trim();
@@ -407,48 +457,73 @@ export default function RulesCard({
   }
 
   async function submit() {
-    const upperType = model.type.trim().toUpperCase();
-    const isMatch = upperType === "MATCH";
-    const isRuleSet = upperType === "RULE-SET";
-    if (!model.type.trim() || !model.policy.trim() || (!isMatch && !model.payload.trim())) {
-      message.error(t("rules.incomplete"));
-      return;
-    }
-    // RULE-SET:新建远程定义必须给 URL(编辑保留可留空);保存前先 upsert ③ 定义。
-    if (isRuleSet) {
-      const existing = profileRuleSets.find((r) => r.name === model.payload.trim());
-      if (model.rsSource === "remote" && !model.rsUrl.trim() && !existing) {
-        message.error(t("rules.ruleSetUrlRequired"));
+    if (submitPending.current || hostedImportPending.current) return;
+    submitPending.current = true;
+    setSubmitting(true);
+    try {
+      const upperType = model.type.trim().toUpperCase();
+      const isMatch = upperType === "MATCH";
+      const isRuleSet = upperType === "RULE-SET";
+      if (!model.type.trim() || !model.policy.trim() || (!isMatch && !model.payload.trim())) {
+        message.error(t("rules.incomplete"));
         return;
       }
-      try {
-        await upsertRuleSet(model);
-        await loadProfileRuleSets();
-      } catch (e) {
-        message.error(errorMessage(e, t("common.saveFailed")));
+      const multiline =
+        /[\r\n]/.test(model.type) ||
+        /[\r\n]/.test(model.policy) ||
+        (!isMatch && /[\r\n]/.test(model.payload));
+      if (multiline) {
+        message.error(t("rules.singleLine"));
         return;
       }
+      if (isRuleSet) {
+        const existing = profileRuleSets.find((r) => r.name === model.payload.trim());
+        const shouldUpsert = model.rsManage && (!existing || model.rsDirty);
+        if (shouldUpsert) {
+          if (model.rsSource === "remote" && !model.rsUrl.trim() && !existing) {
+            message.error(t("rules.ruleSetUrlRequired"));
+            return;
+          }
+          try {
+            await upsertRuleSet(model);
+            await loadProfileRuleSets();
+          } catch (e) {
+            message.error(errorMessage(e, t("common.saveFailed")));
+            return;
+          }
+        }
+      }
+      const line = serializeRule(model);
+      closeModal();
+      if (isMatch) {
+        if (editing === "match") {
+          void persist(rules, line);
+        } else if (typeof editing === "number" && isMatchLine(rules[editing])) {
+          // 较早的 MATCH 仍是普通列表行,编辑它时保留当前钉底行。
+          void persist(rules.map((l, i) => (i === editing ? line : l)), matchLine);
+        } else {
+          // 新增或普通行改为 MATCH:移除原行,用新行替换钉底兜底。
+          const next = typeof editing === "number" ? rules.filter((_, i) => i !== editing) : rules;
+          void persist(next, line);
+        }
+        return;
+      }
+      if (editing === "match") {
+        // 在编辑钉底行时把类型改成了非 MATCH:将其落入列表,并清空钉底的 MATCH。
+        void persist([...rules, line], null);
+        return;
+      }
+      if (editing === null) {
+        // 「添加规则」:新非 MATCH 规则追加到列表末尾(MATCH 仍钉底)。
+        void persist([...rules, line], matchLine);
+        return;
+      }
+      const next = rules.map((l, i) => (i === editing ? line : l));
+      void persist(next, matchLine);
+    } finally {
+      submitPending.current = false;
+      setSubmitting(false);
     }
-    const line = serializeRule(model);
-    closeModal();
-    if (isMatch) {
-      // 任何 MATCH(新增或编辑)都成为唯一的钉底兜底。
-      void persist(rules, line);
-      return;
-    }
-    if (editing === "match") {
-      // 在编辑钉底行时把类型改成了非 MATCH:将其落入列表,并清空钉底的 MATCH。
-      void persist([...rules, line], null);
-      return;
-    }
-    if (editing === null) {
-      // 「添加规则」:新非 MATCH 规则追加到列表末尾(MATCH 仍钉底)。
-      void persist([...rules, line], matchLine);
-      return;
-    }
-    // 走到这里 editing 为被编辑行的下标。
-    const next = rules.map((l, i) => (i === editing ? line : l));
-    void persist(next, matchLine);
   }
 
   function remove(index: number) {
@@ -456,6 +531,7 @@ export default function RulesCard({
   }
 
   async function importProviderRules() {
+    if (hostedImportPending.current || importing) return;
     setImporting(true);
     try {
       const res = await api<ProviderRulesResponse>(`/api/profiles/${profileId}/provider-rules`);
@@ -508,17 +584,17 @@ export default function RulesCard({
     return out;
   }, [policyGrouped]);
 
-  // 当前规则里已被 RULE-SET 引用的规则集名(导入弹窗据此标记「已引用」)。
+  // 当前规则里已被 RULE-SET 引用的规则集名,包含逻辑规则内的嵌套引用。
   const referenced = useMemo(() => {
     const set = new Set<string>();
     for (const line of rules) {
-      const parts = line.split(",").map((p) => p.trim());
-      if (parts[0]?.toUpperCase() === "RULE-SET" && parts[1]) set.add(parts[1]);
+      for (const name of ruleSetRefs(line)) set.add(name);
     }
     return set;
   }, [rules]);
 
   function openImportHosted() {
+    if (hostedImportPending.current) return;
     setPicked(new Set());
     setImportPolicy("DIRECT");
     setImportHostedOpen(true);
@@ -534,27 +610,54 @@ export default function RulesCard({
   }
 
   async function doImportHosted() {
+    if (hostedImportPending.current) return;
     const names = ruleSets
       .map((r) => r.name)
       .filter((n) => picked.has(n) && !referenced.has(n));
     setImportHostedOpen(false);
     if (names.length === 0) {
-      message.info(t("rules.importNone"));
+      message.info(t("rules.importHostedNone"));
       return;
     }
+    const previousContent = rulesContent(rulesRef.current, matchRef.current);
+    hostedImportPending.current = true;
+    setHostedImporting(true);
     try {
-      // 后端把 ② 定义复制进本订阅 ③(含真实远程 URL)并追加 RULE-SET 规则行,随后离线重生成缓存。
-      const res = await api<{ imported: number; regenerate: Regenerate | null }>(
-        `/api/profiles/${profileId}/rule-sets/import`,
-        { method: "POST", body: JSON.stringify({ names, policy: importPolicy }) },
+      // 与规则保存共用队列;响应带回服务端最新文本,避免在途完整保存覆盖导入结果。
+      const res = await saveInOrder(() =>
+        api<{ imported: number; regenerate: Regenerate | null; rules_content: string }>(
+          `/api/profiles/${profileId}/rule-sets/import`,
+          { method: "POST", body: JSON.stringify({ names, policy: importPolicy }) },
+        ),
       );
+      if (!res.ok) {
+        message.error(errorMessage(res.error, t("rules.importFailed")));
+        return;
+      }
+      const result = res.value;
+      const latest = splitRules(result.rules_content);
+      setRules(latest.rules);
+      setMatchLine(latest.match);
+      rulesRef.current = latest.rules;
+      matchRef.current = latest.match;
+      saved.current = latest;
       await loadProfileRuleSets();
-      onSaved();
-      message.success(t("rules.importHostedDone", { count: res.imported }));
-      notice(res.regenerate);
-      if (res.regenerate) onRegenerate(res.regenerate);
-    } catch (e) {
-      message.error(errorMessage(e, t("rules.importFailed")));
+      if (result.imported > 0) {
+        message.success(t("rules.importHostedDone", { count: result.imported }));
+      } else if (result.rules_content !== previousContent) {
+        message.success(t("rules.importHostedReferenced"));
+      } else {
+        message.info(t("rules.importHostedNone"));
+      }
+      notice(result.regenerate);
+      if (result.regenerate) onRegenerate(result.regenerate);
+    } finally {
+      try {
+        await onSaved();
+      } finally {
+        hostedImportPending.current = false;
+        setHostedImporting(false);
+      }
     }
   }
 
@@ -569,11 +672,15 @@ export default function RulesCard({
           {t("rules.title")} <span className="row-sub">{t("rules.count", { count: total })}</span>
         </span>
         <div className="dcard-actions">
-          <Button onClick={openImportHosted}>{t("rules.importHosted")}</Button>
+          <Button onClick={openImportHosted} loading={hostedImporting}>
+            {t("rules.importHosted")}
+          </Button>
           <Popconfirm title={t("rules.importConfirm")} onConfirm={importProviderRules}>
-            <Button loading={importing}>{t("rules.importProvider")}</Button>
+            <Button loading={importing} disabled={hostedImporting}>
+              {t("rules.importProvider")}
+            </Button>
           </Popconfirm>
-          <Button type="primary" icon={<PlusOutlined />} onClick={openAdd}>
+          <Button type="primary" icon={<PlusOutlined />} onClick={openAdd} disabled={hostedImporting}>
             {t("rules.add")}
           </Button>
         </div>
@@ -599,13 +706,16 @@ export default function RulesCard({
                   key={ruleIds[index]}
                   id={ruleIds[index]}
                   line={line}
+                  disabled={hostedImporting}
                   onEdit={() => openEdit(index)}
                   onRemove={() => remove(index)}
                 />
               ))}
             </SortableContext>
           </DndContext>
-          {matchLine && <MatchRow line={matchLine} onEdit={openEditMatch} />}
+          {matchLine && (
+            <MatchRow line={matchLine} onEdit={openEditMatch} disabled={hostedImporting} />
+          )}
         </>
       )}
       <div className="dcard-note">{t("rules.dragHint")}</div>
@@ -616,6 +726,7 @@ export default function RulesCard({
         title={editing === null ? t("rules.add") : t("rules.edit")}
         onOk={submit}
         onCancel={closeModal}
+        confirmLoading={submitting}
         okText={t("common.save")}
         cancelText={t("common.cancel")}
         destroyOnHidden
@@ -624,6 +735,7 @@ export default function RulesCard({
           model={model}
           onChange={setModel}
           policyOptions={policyGrouped}
+          ruleSets={profileRuleSets}
         />
       </Modal>
 
@@ -692,16 +804,21 @@ export default function RulesCard({
 function SortableRuleRow({
   id,
   line,
+  disabled,
   onEdit,
   onRemove,
 }: {
   id: string;
   line: string;
+  disabled: boolean;
   onEdit: () => void;
   onRemove: () => void;
 }) {
   const { t } = useTranslation();
-  const { attributes, listeners, setNodeRef, transform, transition, isDragging } = useSortable({ id });
+  const { attributes, listeners, setNodeRef, transform, transition, isDragging } = useSortable({
+    id,
+    disabled,
+  });
   const style: React.CSSProperties = {
     transform: CSS.Transform.toString(transform),
     transition,
@@ -729,12 +846,12 @@ function SortableRuleRow({
       )}
       <span className="row-actions">
         {!comment && (
-          <button className="icon-btn" onClick={onEdit} aria-label={t("basic.edit")}>
+          <button className="icon-btn" onClick={onEdit} disabled={disabled} aria-label={t("basic.edit")}>
             <EditOutlined />
           </button>
         )}
-        <Popconfirm title={t("rules.deleteConfirm")} onConfirm={onRemove}>
-          <button className="icon-btn danger" aria-label={t("rules.delete")}>
+        <Popconfirm title={t("rules.deleteConfirm")} onConfirm={onRemove} disabled={disabled}>
+          <button className="icon-btn danger" disabled={disabled} aria-label={t("rules.delete")}>
             <DeleteOutlined />
           </button>
         </Popconfirm>
@@ -744,7 +861,15 @@ function SortableRuleRow({
 }
 
 // 钉底的兜底行:锁在底部,仅可编辑(不可拖拽、不可删除)。
-function MatchRow({ line, onEdit }: { line: string; onEdit: () => void }) {
+function MatchRow({
+  line,
+  disabled,
+  onEdit,
+}: {
+  line: string;
+  disabled: boolean;
+  onEdit: () => void;
+}) {
   const { t } = useTranslation();
   const r = parseRule(line);
   return (
@@ -757,7 +882,7 @@ function MatchRow({ line, onEdit }: { line: string; onEdit: () => void }) {
       <ArrowRightOutlined className="rule-arrow" style={{ fontSize: 11 }} />
       <span className="tag-mono tag-policy">{r.policy}</span>
       <span className="row-actions">
-        <button className="icon-btn" onClick={onEdit} aria-label={t("basic.edit")}>
+        <button className="icon-btn" onClick={onEdit} disabled={disabled} aria-label={t("basic.edit")}>
           <EditOutlined />
         </button>
         {/* MATCH 钉底不可删除:灰色禁用的删除图标 + 斜杠,与其它行图标列对齐 */}
@@ -778,9 +903,10 @@ interface ComposerProps {
   model: RuleModel;
   onChange: (m: RuleModel) => void;
   policyOptions: PolicyGroup[];
+  ruleSets: ProfileRuleSet[];
 }
 
-function RuleComposer({ model, onChange, policyOptions }: ComposerProps) {
+function RuleComposer({ model, onChange, policyOptions, ruleSets }: ComposerProps) {
   const { t } = useTranslation();
   const upperType = model.type.trim().toUpperCase();
   const isMatch = upperType === "MATCH";
@@ -905,7 +1031,7 @@ function RuleComposer({ model, onChange, policyOptions }: ComposerProps) {
       {isMatch ? (
         <div className="rule-match-note">{t("rules.matchHint")}</div>
       ) : isRuleSet ? (
-        <RuleSetDefBlock model={model} onChange={onChange} />
+        <RuleSetDefBlock model={model} onChange={onChange} ruleSets={ruleSets} />
       ) : (
         <div>
           <Typography.Text type="secondary">{content.label}</Typography.Text>
@@ -946,23 +1072,48 @@ function RuleComposer({ model, onChange, policyOptions }: ComposerProps) {
   );
 }
 
-// RULE-SET 内联 rule-provider 定义(设计稿):规则集名 + behavior/format/来源 + 远程 URL/间隔 或
-// 手动 payload。保存进本订阅 ③ 库。
+// RULE-SET 引用与本地定义分离:默认只保存引用;显式开启后才编辑本订阅 ③ 的定义。
 function RuleSetDefBlock({
   model,
   onChange,
+  ruleSets,
 }: {
   model: RuleModel;
   onChange: (m: RuleModel) => void;
+  ruleSets: ProfileRuleSet[];
 }) {
   const { t } = useTranslation();
   const formats = (model.rsSource === "remote" ? RS_REMOTE_FORMATS : RS_MANUAL_FORMATS).filter(
     (format) => model.rsBehavior !== "classical" || format !== "mrs",
   );
+  const existing = ruleSets.find((rs) => rs.name === model.payload.trim());
+
+  function changeDefinition(change: Partial<RuleModel>) {
+    onChange({ ...model, ...change, rsDirty: true });
+  }
+
+  function changeName(payload: string) {
+    const name = payload.trim();
+    const target = ruleSets.find((rs) => rs.name === name);
+    if (target && target.name !== model.rsLoadedName) {
+      onChange(withRuleSetDefinition({ ...model, payload }, target));
+      return;
+    }
+    if (!target && model.rsLoadedName && name !== model.rsLoadedName) {
+      onChange(
+        model.rsDirty
+          ? { ...model, payload, rsLoadedName: "" }
+          : { ...model, payload, ...RS_DEFAULTS },
+      );
+      return;
+    }
+    onChange({ ...model, payload });
+  }
+
   // 切来源时纠正不兼容 format(手动不支持 mrs)。
   function setSource(rsSource: "manual" | "remote") {
     const rsFormat = rsSource === "manual" && model.rsFormat === "mrs" ? "yaml" : model.rsFormat;
-    onChange({ ...model, rsSource, rsFormat });
+    changeDefinition({ rsSource, rsFormat });
   }
   return (
     <div className="modal-block">
@@ -971,73 +1122,88 @@ function RuleSetDefBlock({
       <Input
         style={{ width: "100%", marginBottom: 12 }}
         value={model.payload}
-        onChange={(e) => onChange({ ...model, payload: e.target.value })}
+        onChange={(e) => changeName(e.target.value)}
         placeholder={t("rules.ruleSetPayloadHint")}
       />
-      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12, marginBottom: 12 }}>
-        <div>
-          <Typography.Text type="secondary">{t("ruleSets.behavior")}</Typography.Text>
-          <TypeChips
-            options={RS_BEHAVIORS}
-            value={model.rsBehavior}
-            onChange={(v) =>
-              onChange({
-                ...model,
-                rsBehavior: v as RuleModel["rsBehavior"],
-                rsFormat: v === "classical" && model.rsFormat === "mrs" ? "yaml" : model.rsFormat,
-              })
-            }
-          />
-        </div>
-        <div>
-          <Typography.Text type="secondary">{t("ruleSets.format")}</Typography.Text>
-          <TypeChips
-            options={formats}
-            value={model.rsFormat}
-            onChange={(v) => onChange({ ...model, rsFormat: v as RuleModel["rsFormat"] })}
-          />
-        </div>
+      <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 12 }}>
+        <Switch
+          size="small"
+          checked={model.rsManage}
+          onChange={(rsManage) => onChange({ ...model, rsManage })}
+        />
+        <Typography.Text type="secondary">{t("rules.ruleSetManage")}</Typography.Text>
       </div>
-      <Typography.Text type="secondary">{t("ruleSets.source")}</Typography.Text>
-      <TypeChips
-        options={RS_SOURCES}
-        value={model.rsSource}
-        onChange={(v) => setSource(v as "manual" | "remote")}
-        labels={{ manual: t("ruleSets.sourceManual"), remote: t("ruleSets.sourceRemote") }}
-      />
-      {model.rsSource === "remote" ? (
-        <div style={{ marginTop: 12 }}>
-          <Typography.Text type="secondary">{t("ruleSets.remoteUrl")}</Typography.Text>
-          <Input
-            style={{ width: "100%", fontFamily: "var(--font-mono)" }}
-            value={model.rsUrl}
-            onChange={(e) => onChange({ ...model, rsUrl: e.target.value })}
-            placeholder={t("rules.ruleSetUrlPlaceholder")}
-          />
-          <div style={{ marginTop: 12, width: 180 }}>
-            <Typography.Text type="secondary">{t("rules.ruleSetInterval")}</Typography.Text>
-            <InputNumber
-              min={1}
-              precision={0}
-              style={{ width: "100%" }}
-              value={model.rsInterval}
-              onChange={(v) => onChange({ ...model, rsInterval: v ?? 24 })}
-            />
-          </div>
-          <span className="composer-hint">{t("rules.ruleSetRemoteHint")}</span>
-        </div>
+      {!model.rsManage ? (
+        <span className="composer-hint">
+          {t(existing ? "rules.ruleSetKeepExisting" : "rules.ruleSetReferenceOnly")}
+        </span>
       ) : (
-        <div style={{ marginTop: 12 }}>
-          <Typography.Text type="secondary">{t("ruleSets.content")}</Typography.Text>
-          <Input.TextArea
-            style={{ width: "100%", fontFamily: "var(--font-mono)" }}
-            autoSize={{ minRows: 4, maxRows: 12 }}
-            value={model.rsContent}
-            onChange={(e) => onChange({ ...model, rsContent: e.target.value })}
-            placeholder={t("ruleSets.contentPlaceholder")}
+        <>
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12, marginBottom: 12 }}>
+            <div>
+              <Typography.Text type="secondary">{t("ruleSets.behavior")}</Typography.Text>
+              <TypeChips
+                options={RS_BEHAVIORS}
+                value={model.rsBehavior}
+                onChange={(v) =>
+                  changeDefinition({
+                    rsBehavior: v as RuleModel["rsBehavior"],
+                    rsFormat: v === "classical" && model.rsFormat === "mrs" ? "yaml" : model.rsFormat,
+                  })
+                }
+              />
+            </div>
+            <div>
+              <Typography.Text type="secondary">{t("ruleSets.format")}</Typography.Text>
+              <TypeChips
+                options={formats}
+                value={model.rsFormat}
+                onChange={(v) => changeDefinition({ rsFormat: v as RuleModel["rsFormat"] })}
+              />
+            </div>
+          </div>
+          <Typography.Text type="secondary">{t("ruleSets.source")}</Typography.Text>
+          <TypeChips
+            options={RS_SOURCES}
+            value={model.rsSource}
+            onChange={(v) => setSource(v as "manual" | "remote")}
+            labels={{ manual: t("ruleSets.sourceManual"), remote: t("ruleSets.sourceRemote") }}
           />
-          <span className="composer-hint">{t("rules.ruleSetManualHint")}</span>
-        </div>
+          {model.rsSource === "remote" ? (
+            <div style={{ marginTop: 12 }}>
+              <Typography.Text type="secondary">{t("ruleSets.remoteUrl")}</Typography.Text>
+              <Input
+                style={{ width: "100%", fontFamily: "var(--font-mono)" }}
+                value={model.rsUrl}
+                onChange={(e) => changeDefinition({ rsUrl: e.target.value })}
+                placeholder={t("rules.ruleSetUrlPlaceholder")}
+              />
+              <div style={{ marginTop: 12, width: 180 }}>
+                <Typography.Text type="secondary">{t("rules.ruleSetInterval")}</Typography.Text>
+                <InputNumber
+                  min={1}
+                  precision={0}
+                  style={{ width: "100%" }}
+                  value={model.rsInterval}
+                  onChange={(v) => changeDefinition({ rsInterval: v ?? 24 })}
+                />
+              </div>
+              <span className="composer-hint">{t("rules.ruleSetRemoteHint")}</span>
+            </div>
+          ) : (
+            <div style={{ marginTop: 12 }}>
+              <Typography.Text type="secondary">{t("ruleSets.content")}</Typography.Text>
+              <Input.TextArea
+                style={{ width: "100%", fontFamily: "var(--font-mono)" }}
+                autoSize={{ minRows: 4, maxRows: 12 }}
+                value={model.rsContent}
+                onChange={(e) => changeDefinition({ rsContent: e.target.value })}
+                placeholder={t("ruleSets.contentPlaceholder")}
+              />
+              <span className="composer-hint">{t("rules.ruleSetManualHint")}</span>
+            </div>
+          )}
+        </>
       )}
     </div>
   );

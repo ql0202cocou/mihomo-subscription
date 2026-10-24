@@ -423,6 +423,7 @@ async fn import_from_global_copies_and_appends_rule() {
         .as_str()
         .unwrap()
         .contains("RULE-SET,gads,DIRECT"));
+    assert_eq!(body["rules_content"], detail["rules"]["content"]);
 
     // 拉订阅:gads 注入 rule-providers,指向 token 隔离托管链接。
     let resp = app
@@ -1210,6 +1211,7 @@ async fn import_skips_names_missing_from_the_global_library() {
     let body = json(resp).await;
     assert_eq!(body["imported"], 0);
     assert!(body["regenerate"].is_null());
+    assert_eq!(body["rules_content"].as_str().unwrap(), content);
     assert_eq!(rules_content().await, content);
 
     // 已存在且已被引用的定义再次导入:不重复复制、不重复追加规则行(策略保持 DIRECT)。
@@ -1220,6 +1222,7 @@ async fn import_skips_names_missing_from_the_global_library() {
     let body = json(resp).await;
     assert_eq!(body["imported"], 0);
     assert!(body["regenerate"].is_null());
+    assert_eq!(body["rules_content"].as_str().unwrap(), content);
     assert_eq!(rules_content().await, content);
 }
 

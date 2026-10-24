@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { App as AntdApp, Button, Input, Modal, Segmented } from "antd";
 import { useTranslation } from "react-i18next";
 import { api, errorMessage } from "../api";
@@ -13,6 +13,8 @@ export default function Settings() {
   const [settings, setSettings] = useState<SettingsData | null>(null);
   const [confirming, setConfirming] = useState(false);
   const [confirmText, setConfirmText] = useState("");
+  const [resetting, setResetting] = useState(false);
+  const resetPending = useRef(false);
 
   const load = useCallback(async () => {
     try {
@@ -27,6 +29,10 @@ export default function Settings() {
   }, [load]);
 
   async function onReset() {
+    // 重置会一次性失效全部托管链接:ref 同步挡重入(双击只发一次),state 驱动 confirmLoading。
+    if (resetPending.current) return;
+    resetPending.current = true;
+    setResetting(true);
     try {
       const next = await api<SettingsData>("/api/settings/reset-public-path", {
         method: "POST",
@@ -37,6 +43,9 @@ export default function Settings() {
       message.success(t("settings.publicPathPrefix") + ": " + next.public_path_prefix);
     } catch (e) {
       message.error(errorMessage(e, t("common.saveFailed")));
+    } finally {
+      resetPending.current = false;
+      setResetting(false);
     }
   }
 
@@ -78,6 +87,7 @@ export default function Settings() {
         open={confirming}
         onCancel={() => setConfirming(false)}
         okButtonProps={{ danger: true, disabled: confirmText !== t("settings.confirmWord") }}
+        confirmLoading={resetting}
         onOk={onReset}
         okText={t("common.ok")}
         cancelText={t("common.cancel")}

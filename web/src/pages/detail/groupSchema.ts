@@ -8,7 +8,7 @@ export const GROUP_TYPES: GroupType[] = ["select", "url-test", "fallback", "load
 
 const HEALTH: FieldDef[] = [
   { key: "url", kind: "text", placeholder: "https://www.gstatic.com/generate_204" },
-  { key: "interval", kind: "number", placeholder: "300" },
+  { key: "interval", kind: "number", placeholder: "300", min: 1, precision: 0 },
 ];
 
 /** 各类型专属的常用选项字段;其余一律落到高级键值。 */
@@ -16,7 +16,7 @@ export const GROUP_OPTION_FIELDS: Record<string, FieldDef[]> = {
   select: [],
   "url-test": [
     ...HEALTH,
-    { key: "tolerance", kind: "number" },
+    { key: "tolerance", kind: "number", min: 0, precision: 0 },
     { key: "lazy", kind: "switch" },
   ],
   fallback: [...HEALTH, { key: "lazy", kind: "switch" }],

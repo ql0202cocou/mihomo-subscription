@@ -13,6 +13,8 @@ function load(relativePath, mocks = {}, globals = {}) {
   const filename = path.join(root, 'web/src', relativePath);
   const source = ts.transpileModule(fs.readFileSync(filename, 'utf8'), {
     compilerOptions: { module: ts.ModuleKind.CommonJS, jsx: ts.JsxEmit.ReactJSX },
+    // 传真实文件名,TS 才按 .ts(而非 .tsx)解析,泛型箭头函数才不会被误当 JSX 编译。
+    fileName: filename,
   }).outputText;
   const module = { exports: {} };
   const req = (id) => Object.hasOwn(mocks, id) ? mocks[id]
@@ -27,9 +29,20 @@ function hooks(stateSeeds = []) {
   const slots = [];
   let cursor = 0;
   let stateCursor = 0;
-  let pending = [];
+  // 两个队列都要按名动态读取:冲刷时不可重新赋值数组,否则闭包里的旧引用会丢 effect。
+  const queues = { passive: [], layout: [] };
   const sameDeps = (left, right) => left && right && left.length === right.length
     && left.every((dep, n) => Object.is(dep, right[n]));
+  const effectSlot = (name) => (effect, deps) => {
+    const i = cursor++;
+    const old = slots[i];
+    if (!old || !sameDeps(deps, old.deps)) {
+      queues[name].push(() => {
+        old?.cleanup?.();
+        slots[i] = { deps, cleanup: effect() };
+      });
+    }
+  };
   const react = {
     ...React,
     useState(initial) {
@@ -46,16 +59,9 @@ function hooks(stateSeeds = []) {
       if (!slots[i]) slots[i] = { value: { current: initial } };
       return slots[i].value;
     },
-    useEffect(effect, deps) {
-      const i = cursor++;
-      const old = slots[i];
-      if (!old || !sameDeps(deps, old.deps)) {
-        pending.push(() => {
-          old?.cleanup?.();
-          slots[i] = { deps, cleanup: effect() };
-        });
-      }
-    },
+    useEffect: effectSlot('passive'),
+    // 布局副作用在「绘制」前同步执行:render 返回前冲刷,与真实 React 的先后一致。
+    useLayoutEffect: effectSlot('layout'),
     useCallback(fn, deps) {
       const i = cursor++;
       if (!slots[i] || !sameDeps(deps, slots[i].deps)) slots[i] = { deps, value: fn };
@@ -69,8 +75,13 @@ function hooks(stateSeeds = []) {
   };
   return {
     react,
-    render(fn, props) { cursor = 0; stateCursor = 0; return fn(props); },
-    effects() { const effects = pending; pending = []; effects.forEach((fn) => fn()); },
+    render(fn, props) {
+      cursor = 0; stateCursor = 0;
+      const out = fn(props);
+      queues.layout.splice(0).forEach((fn) => fn());
+      return out;
+    },
+    effects() { queues.passive.splice(0).forEach((fn) => fn()); },
     unmount() { slots.forEach((slot) => slot.cleanup?.()); },
   };
 }

@@ -30,8 +30,10 @@ export function setUnauthorizedHandler(fn: (() => void) | null): void {
 
 export async function api<T>(path: string, opts: RequestInit = {}): Promise<T> {
   const res = await fetch(path, {
-    headers: { "Content-Type": "application/json", ...(opts.headers ?? {}) },
+    // 先展开调用方选项再合并 headers:默认 Content-Type 与调用方自定义头都保留,
+    // 同名头以调用方为准。
     ...opts,
+    headers: { "Content-Type": "application/json", ...(opts.headers ?? {}) },
   });
 
   if (res.status === 401) {

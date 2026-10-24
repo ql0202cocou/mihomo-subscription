@@ -28,9 +28,12 @@ export default function Login() {
       await login(username, password);
       navigate(from, { replace: true });
     } catch (err) {
-      // ApiError 带 status(401/429 等);无 status 的是网络层失败(fetch reject)。
+      // ApiError 带 status:401 凭据错误、429 限流,其余状态是服务端问题;
+      // 无 status 的是网络层失败(fetch reject)。
       if (err instanceof ApiError) {
-        setError(err.status === 429 ? t("login.tooMany") : t("login.failed"));
+        if (err.status === 401) setError(t("login.failed"));
+        else if (err.status === 429) setError(t("login.tooMany"));
+        else setError(t("login.serviceError"));
       } else {
         setError(t("login.networkError"));
       }
