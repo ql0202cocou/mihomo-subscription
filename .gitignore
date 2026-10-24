@@ -9,7 +9,7 @@ AGENTS.md
 # Local-only IDE / editor configurations.
 .claude/
 
-# Local-only scratch / audit notes (not for the public repo).
+# Local-only scratch notes (not for the public repo).
 plan-*.md
 
 # Local design references (redesign brief + HTML prototypes) — not for the public repo.
