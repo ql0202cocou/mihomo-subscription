@@ -13,6 +13,7 @@ use axum::{
     Json, Router,
 };
 use ipnet::IpNet;
+use sha2::{Digest, Sha256};
 use sqlx::SqlitePool;
 use subtle::ConstantTimeEq;
 use tower_http::services::{ServeDir, ServeFile};
@@ -65,6 +66,10 @@ impl AppState {
         self.public_path_prefix.read().unwrap().clone()
     }
 
+    pub fn current_capability_hash(&self, token: &str) -> String {
+        capability_hash(token, &self.current_prefix())
+    }
+
     /// 公开端点门:恒定时间比较 `candidate` 与当前公开路径前缀,且无论是否匹配都执行
     /// `lookup`、再合并判断,使响应时序无法单独确认路径前缀(见 `docs/architecture.md`)。
     pub async fn public_gate<T>(
@@ -108,16 +113,41 @@ impl AppState {
         behavior: &str,
         format: &str,
     ) -> String {
+        self.profile_rule_set_url_with_prefix(&self.current_prefix(), token, name, behavior, format)
+    }
+
+    /// 用同一次生成读取的前缀构造链接,避免全局轮换让一份输出混入不同前缀。
+    pub fn profile_rule_set_url_with_prefix(
+        &self,
+        prefix: &str,
+        token: &str,
+        name: &str,
+        behavior: &str,
+        format: &str,
+    ) -> String {
         format!(
             "{}/{}/api/sub/{}/r/{}/{}.{}",
             self.public_base_url.trim_end_matches('/'),
-            self.current_prefix(),
+            prefix,
             token,
             name,
             behavior,
             format
         )
     }
+}
+
+pub fn capability_hash(token: &str, prefix: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"cache-capability-v1\0");
+    hasher.update(token.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(prefix.as_bytes());
+    hasher
+        .finalize()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
 }
 
 async fn health() -> impl IntoResponse {
@@ -222,14 +252,10 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             state.clone(),
             auth::check_origin,
         ))
-        .layer(DefaultBodyLimit::max(MAX_BODY_BYTES));
+        .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
+        .layer(middleware::from_fn(no_store));
 
-    let spa = ServeDir::new(&state.web_dir)
-        .fallback(ServeFile::new(format!("{}/index.html", state.web_dir)));
-
-    Router::new()
-        .route("/health", get(health))
-        .nest("/api", api)
+    let public = Router::new()
         // 公开订阅下载:无鉴权,路径前缀 + token,但按客户端 IP 限流。
         .route(
             "/{public_path_prefix}/api/sub/{token}",
@@ -247,6 +273,15 @@ pub fn build_router(state: Arc<AppState>) -> Router {
                 rate_limit::download,
             )),
         )
+        .layer(middleware::from_fn(no_store));
+
+    let spa = ServeDir::new(&state.web_dir)
+        .fallback(ServeFile::new(format!("{}/index.html", state.web_dir)));
+
+    Router::new()
+        .route("/health", get(health))
+        .nest("/api", api)
+        .merge(public)
         .fallback_service(spa)
         .layer(middleware::from_fn(frame_protection))
         .layer(
@@ -272,6 +307,14 @@ async fn frame_protection(req: Request, next: middleware::Next) -> axum::respons
         header::CONTENT_SECURITY_POLICY,
         HeaderValue::from_static("frame-ancestors 'none'"),
     );
+    response
+}
+
+async fn no_store(req: Request, next: middleware::Next) -> axum::response::Response {
+    let mut response = next.run(req).await;
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
     response
 }
 

@@ -99,20 +99,27 @@ impl RateLimiter {
 
 /// 用应用的受信代理配置推导 `req` 的限流 key(客户端 IP 字符串,推导失败时为 `"unknown"`)。
 fn client_ip_key(state: &AppState, req: &Request) -> String {
+    client_ip_from_request(req, state.trusted_proxy_hops, &state.trusted_proxy_cidrs)
+}
+
+fn client_ip_from_request(
+    req: &Request,
+    trusted_hops: usize,
+    trusted_proxy_cidrs: &[ipnet::IpNet],
+) -> String {
     let xff = req
         .headers()
-        .get(header::HeaderName::from_static("x-forwarded-for"))
-        .and_then(|v| v.to_str().ok());
+        .get_all(header::HeaderName::from_static("x-forwarded-for"))
+        .iter()
+        .map(|value| value.to_str())
+        .collect::<Result<Vec<_>, _>>()
+        .ok()
+        .map(|values| values.join(","));
     let peer = req
         .extensions()
         .get::<ConnectInfo<SocketAddr>>()
         .map(|ci| ci.0.ip());
-    net::client_ip_string(
-        xff,
-        peer,
-        state.trusted_proxy_hops,
-        &state.trusted_proxy_cidrs,
-    )
+    net::client_ip_string(xff.as_deref(), peer, trusted_hops, trusted_proxy_cidrs)
 }
 
 /// 按客户端 IP 限制登录尝试(暴力破解防护)。
@@ -138,6 +145,46 @@ pub async fn download(State(state): State<Arc<AppState>>, req: Request, next: Ne
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::{body::Body, http::HeaderValue};
+
+    fn request(peer: &str) -> Request {
+        let mut req = Request::new(Body::empty());
+        req.extensions_mut()
+            .insert(ConnectInfo(peer.parse::<SocketAddr>().unwrap()));
+        req
+    }
+
+    #[test]
+    fn combines_all_xff_fields_in_received_order() {
+        let mut req = request("10.0.0.1:1234");
+        let name = header::HeaderName::from_static("x-forwarded-for");
+        req.headers_mut().append(
+            name.clone(),
+            HeaderValue::from_static("1.1.1.1, 203.0.113.9"),
+        );
+        req.headers_mut()
+            .append(name, HeaderValue::from_static("10.0.0.2"));
+
+        assert_eq!(
+            client_ip_from_request(&req, 2, &["10.0.0.0/8".parse().unwrap()]),
+            "203.0.113.9"
+        );
+    }
+
+    #[test]
+    fn invalid_xff_field_falls_back_to_peer() {
+        let mut req = request("10.0.0.1:1234");
+        let name = header::HeaderName::from_static("x-forwarded-for");
+        req.headers_mut()
+            .append(name.clone(), HeaderValue::from_static("203.0.113.9"));
+        req.headers_mut()
+            .append(name, HeaderValue::from_bytes(b"\xff").unwrap());
+
+        assert_eq!(
+            client_ip_from_request(&req, 1, &["10.0.0.0/8".parse().unwrap()]),
+            "10.0.0.1"
+        );
+    }
 
     #[test]
     fn allows_burst_up_to_capacity_then_denies() {

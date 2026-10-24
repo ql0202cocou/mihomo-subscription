@@ -20,7 +20,7 @@ use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 use url::Url;
 
-use crate::app::AppState;
+use crate::{app::AppState, error::ApiJson};
 
 const SESSION_COOKIE: &str = "session";
 /// 会话空闲生命周期,见 `docs/architecture.md`「安全设计」(默认 7 天)。
@@ -133,7 +133,10 @@ pub struct SessionResponse {
     username: String,
 }
 
-pub async fn login(State(state): State<Arc<AppState>>, Json(body): Json<LoginRequest>) -> Response {
+pub async fn login(
+    State(state): State<Arc<AppState>>,
+    ApiJson(body): ApiJson<LoginRequest>,
+) -> Response {
     if state.admin.verify(&body.username, &body.password) {
         let id = state.sessions.create();
         let cookie = build_cookie(&id, state.secure_cookies, SESSION_IDLE.as_secs());

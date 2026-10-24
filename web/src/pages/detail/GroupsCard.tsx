@@ -22,7 +22,12 @@ import type { CustomGroup, CustomNode, GroupType, ProxiesResponse, Regenerate } 
 import { AdvancedFields, FieldInput, TypeChips, advancedEntries } from "../../components/fields";
 import { useRegenerateNotice } from "../../components/regenerate";
 import { useSerialSave } from "../../components/useSerialSave";
-import { BUILTIN_POLICIES, GROUP_TYPES, groupOptionFields, groupOptionKeys } from "./groupSchema";
+import {
+  BUILTIN_GROUP_MEMBERS as BUILTIN_POLICIES,
+  GROUP_TYPES,
+  groupOptionFields,
+  groupOptionKeys,
+} from "./groupSchema";
 
 interface Props {
   profileId: string;

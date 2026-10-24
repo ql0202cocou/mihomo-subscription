@@ -45,7 +45,14 @@ const BLOCKED_V4: &[&str] = &[
 ];
 
 /// 直接阻止的 IPv6 范围。IPv4 内嵌范围(IPv4 映射、NAT64、6to4)单独通过解包内嵌 IPv4 处理。
-const BLOCKED_V6: &[&str] = &["::/128", "::1/128", "fc00::/7", "fe80::/10", "ff00::/8"];
+const BLOCKED_V6: &[&str] = &[
+    "::/128",
+    "::1/128",
+    "64:ff9b:1::/48",
+    "fc00::/7",
+    "fe80::/10",
+    "ff00::/8",
+];
 
 fn blocked_nets() -> &'static Vec<IpNet> {
     static NETS: OnceLock<Vec<IpNet>> = OnceLock::new();
@@ -193,6 +200,14 @@ mod tests {
         assert!(is_blocked_ip(ip("fe80::1")));
         assert!(is_blocked_ip(ip("ff02::1")));
         assert!(!is_blocked_ip(ip("2606:4700:4700::1111")));
+    }
+
+    #[test]
+    fn blocks_entire_nat64_local_use_prefix() {
+        assert!(is_blocked_ip(ip("64:ff9b:1::")));
+        assert!(is_blocked_ip(ip("64:ff9b:1:abcd::8.8.8.8")));
+        assert!(is_blocked_ip(ip("64:ff9b:1:ffff:ffff:ffff:ffff:ffff")));
+        assert!(!is_blocked_ip(ip("64:ff9b:2::")));
     }
 
     #[test]

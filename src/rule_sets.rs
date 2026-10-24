@@ -18,7 +18,7 @@ use serde::{Deserialize, Serialize};
 use sqlx::{AssertSqlSafe, FromRow};
 
 use crate::app::AppState;
-use crate::error::{ApiError, ApiResult};
+use crate::error::{ApiError, ApiJson, ApiResult};
 use crate::rulelib::{self, RuleSetBody};
 use crate::util::{MAX_ORDER_ENTRIES, MAX_ORDER_NAME_LEN};
 use crate::{mask, util::now};
@@ -118,14 +118,15 @@ pub async fn list(State(state): State<Arc<AppState>>) -> ApiResult<impl IntoResp
 /// `POST /api/rule-sets` —— 新建规则集,落在库末尾。name 唯一冲突 → 409。
 pub async fn create(
     State(state): State<Arc<AppState>>,
-    Json(body): Json<RuleSetBody>,
+    ApiJson(body): ApiJson<RuleSetBody>,
 ) -> ApiResult<impl IntoResponse> {
     let n = rulelib::normalize(&body, None)?;
     let id = uuid::Uuid::new_v4().to_string();
     let ts = now();
+    let mut tx = state.db.begin_with("BEGIN IMMEDIATE").await?;
     let position =
         sqlx::query_scalar::<_, i64>("SELECT COALESCE(MAX(position), -1) + 1 FROM rule_sets")
-            .fetch_one(&state.db)
+            .fetch_one(&mut *tx)
             .await?;
     sqlx::query(
         "INSERT INTO rule_sets (id, name, behavior, format, source, content, rule_count, url, \
@@ -146,8 +147,9 @@ pub async fn create(
     .bind(position)
     .bind(&ts)
     .bind(&ts)
-    .execute(&state.db)
+    .execute(&mut *tx)
     .await?;
+    tx.commit().await?;
     let row = fetch_one(&state, &id).await?;
     Ok((StatusCode::CREATED, Json(rule_set_response(row))))
 }
@@ -156,7 +158,7 @@ pub async fn create(
 pub async fn update(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
-    Json(body): Json<RuleSetBody>,
+    ApiJson(body): ApiJson<RuleSetBody>,
 ) -> ApiResult<impl IntoResponse> {
     let existing = fetch_one(&state, &id).await?;
     // 传入已存 URL:remote 编辑时前端拿不到明文 URL(只见过脱敏形式),留空即沿用原值。
@@ -208,7 +210,7 @@ pub struct ReorderBody {
 /// `PUT /api/rule-sets/order` —— 设置库内显示顺序(仅影响「规则托管」页展示,不影响任何订阅输出)。
 pub async fn set_order(
     State(state): State<Arc<AppState>>,
-    Json(body): Json<ReorderBody>,
+    ApiJson(body): ApiJson<ReorderBody>,
 ) -> ApiResult<impl IntoResponse> {
     if body.order.len() > MAX_ORDER_ENTRIES {
         return Err(ApiError::BadRequest(format!(
@@ -221,18 +223,17 @@ pub async fn set_order(
         )));
     }
 
-    let mut names: Vec<String> = sqlx::query_scalar::<_, String>(
-        "SELECT name FROM rule_sets ORDER BY position ASC, name ASC",
-    )
-    .fetch_all(&state.db)
-    .await?;
-    crate::converter::reorder_by_name(&mut names, |s| Some(s.as_str()), &body.order);
+    let mut tx = state.db.begin_with("BEGIN IMMEDIATE").await?;
+    let mut rows: Vec<(String, String)> =
+        sqlx::query_as("SELECT id, name FROM rule_sets ORDER BY position ASC, name ASC")
+            .fetch_all(&mut *tx)
+            .await?;
+    crate::converter::reorder_by_name(&mut rows, |(_, name)| Some(name.as_str()), &body.order);
 
-    let mut tx = state.db.begin().await?;
-    for (position, name) in names.iter().enumerate() {
-        sqlx::query("UPDATE rule_sets SET position = ? WHERE name = ?")
+    for (position, (id, _)) in rows.iter().enumerate() {
+        sqlx::query("UPDATE rule_sets SET position = ? WHERE id = ?")
             .bind(position as i64)
-            .bind(name)
+            .bind(id)
             .execute(&mut *tx)
             .await?;
     }

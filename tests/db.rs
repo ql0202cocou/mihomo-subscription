@@ -173,3 +173,93 @@ async fn refresh_migration_preserves_existing_profiles_and_mirror_cache() {
         .unwrap();
     assert_eq!(count(&upgraded, "profile_rule_sets", "profile").await, 0);
 }
+
+#[tokio::test]
+async fn public_path_prefix_is_trimmed_and_validated() {
+    let temp = TempDb::new();
+    let pool = db::init(&temp.path).await.unwrap();
+
+    for invalid in ["a/b", ".", "..", "has space", "query?x"] {
+        assert!(db::ensure_public_path_prefix(&pool, Some(invalid.into()))
+            .await
+            .is_err());
+    }
+    let prefix = db::ensure_public_path_prefix(&pool, Some("  seeded-prefix  ".into()))
+        .await
+        .unwrap();
+    assert_eq!(prefix, "seeded-prefix");
+
+    sqlx::query("UPDATE app_settings SET public_path_prefix = ' padded ' WHERE id = 1")
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        db::ensure_public_path_prefix(&pool, None).await.unwrap(),
+        "padded"
+    );
+    let stored: String =
+        sqlx::query_scalar("SELECT public_path_prefix FROM app_settings WHERE id = 1")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(stored, "padded");
+
+    sqlx::query("UPDATE app_settings SET public_path_prefix = 'a/b' WHERE id = 1")
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert!(db::ensure_public_path_prefix(&pool, None).await.is_err());
+}
+
+#[tokio::test]
+async fn cache_context_stays_unknown_and_legacy_relay_is_disabled() {
+    let temp = TempDb::new();
+    let pool = SqlitePool::connect_with(db::connect_options(&temp.path))
+        .await
+        .unwrap();
+    let migrations = sqlx::migrate!("./migrations");
+    let old = sqlx::migrate::Migrator::with_migrations(
+        migrations
+            .iter()
+            .filter(|m| m.version <= 16)
+            .cloned()
+            .collect(),
+    );
+    old.run(&pool).await.unwrap();
+    seed_profile_with_children(&pool, "profile").await;
+    sqlx::query(
+        "UPDATE profiles SET name = 'first-profile', token = 'first-token' WHERE id = 'profile'",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    seed_profile_with_children(&pool, "relay").await;
+    sqlx::query(
+        "UPDATE profiles SET name = 'relay-profile', token = 'relay-token' WHERE id = 'relay'",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query("UPDATE custom_groups SET group_type = 'relay' WHERE profile_id = 'relay'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    pool.close().await;
+
+    let upgraded = db::init(&temp.path).await.unwrap();
+    let context: (Option<i64>, Option<String>) = sqlx::query_as(
+        "SELECT source_revision, capability_hash FROM generated_cache WHERE profile_id = 'profile'",
+    )
+    .fetch_one(&upgraded)
+    .await
+    .unwrap();
+    assert_eq!(context, (None, None));
+
+    let enabled: bool =
+        sqlx::query_scalar("SELECT enabled FROM custom_groups WHERE profile_id = 'relay'")
+            .fetch_one(&upgraded)
+            .await
+            .unwrap();
+    assert!(!enabled);
+    assert_eq!(count(&upgraded, "generated_cache", "relay").await, 0);
+}

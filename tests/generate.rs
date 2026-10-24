@@ -1168,6 +1168,98 @@ async fn legacy_cache_without_provider_original_is_left_untouched() {
     );
 }
 
+#[tokio::test]
+async fn unknown_cache_context_is_rebuilt_online() {
+    let temp = TempDb::new();
+    let fetcher = Arc::new(FakeFetcher::default());
+    let mut state = test_state_with_fetcher(&temp, fetcher.clone()).await;
+    Arc::get_mut(&mut state)
+        .unwrap()
+        .public_refresh_min_interval = Duration::from_secs(3600);
+    let db = state.db.clone();
+    let app = build_router(state);
+    let cookie = login(&app).await;
+    let profile = create_profile(&app, &cookie).await;
+    let id = profile["id"].as_str().unwrap();
+    let sub = sub_path(profile["subscription_url"].as_str().unwrap());
+    fetcher.calls.store(0, Ordering::SeqCst);
+
+    sqlx::query(
+        "UPDATE generated_cache SET source_revision = NULL, capability_hash = NULL, \
+         output_yaml = 'proxies: []\nrules: []\n' WHERE profile_id = ?",
+    )
+    .bind(id)
+    .execute(&db)
+    .await
+    .unwrap();
+    sqlx::query("UPDATE profiles SET public_refresh_at = ? WHERE id = ?")
+        .bind(mihomo_subscription::util::now())
+        .bind(id)
+        .execute(&db)
+        .await
+        .unwrap();
+
+    let resp = app
+        .oneshot(Request::get(&sub).body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(text(resp).await.contains("hk-1"));
+    assert_eq!(fetcher.calls.load(Ordering::SeqCst), 1);
+    let context: (Option<i64>, Option<String>) = sqlx::query_as(
+        "SELECT source_revision, capability_hash FROM generated_cache WHERE profile_id = ?",
+    )
+    .bind(id)
+    .fetch_one(&db)
+    .await
+    .unwrap();
+    assert!(context.0.is_some() && context.1.is_some());
+}
+
+#[tokio::test]
+async fn capability_mismatch_is_migrated_offline_before_refresh_checks() {
+    let temp = TempDb::new();
+    let fetcher = Arc::new(FakeFetcher::default());
+    let mut state = test_state_with_fetcher(&temp, fetcher.clone()).await;
+    Arc::get_mut(&mut state)
+        .unwrap()
+        .public_refresh_min_interval = Duration::from_secs(3600);
+    let db = state.db.clone();
+    let app = build_router(state);
+    let cookie = login(&app).await;
+    let profile = create_profile(&app, &cookie).await;
+    let id = profile["id"].as_str().unwrap();
+    let sub = sub_path(profile["subscription_url"].as_str().unwrap());
+    fetcher.calls.store(0, Ordering::SeqCst);
+
+    sqlx::query("UPDATE generated_cache SET capability_hash = 'stale' WHERE profile_id = ?")
+        .bind(id)
+        .execute(&db)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE profiles SET public_refresh_at = ? WHERE id = ?")
+        .bind(mihomo_subscription::util::now())
+        .bind(id)
+        .execute(&db)
+        .await
+        .unwrap();
+
+    let resp = app
+        .oneshot(Request::get(&sub).body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(text(resp).await.contains("hk-1"));
+    assert_eq!(fetcher.calls.load(Ordering::SeqCst), 0);
+    let stored: String =
+        sqlx::query_scalar("SELECT capability_hash FROM generated_cache WHERE profile_id = ?")
+            .bind(id)
+            .fetch_one(&db)
+            .await
+            .unwrap();
+    assert_ne!(stored, "stale");
+}
+
 /// 返回固定正文的 fetcher。
 struct BodyFetcher(&'static str);
 
@@ -1319,8 +1411,7 @@ async fn source_change_discards_old_inflight_fetch_result() {
         .unwrap()
         .forget();
 
-    // 换源(并发发起):PUT 内按新来源自动回源要等 per-profile 锁,而锁被在途刷新持有——
-    // 换源写库(版本递增)先于自动回源,等版本落库后再释放旧在途回源。
+    // 换源(并发发起):PUT 的读改写与旧公开刷新共用一把锁,旧刷新释放前不会提交版本。
     let put_app = app.clone();
     let put_cookie = cookie.clone();
     let put_path = format!("/api/profiles/{id}");
@@ -1335,23 +1426,16 @@ async fn source_change_discards_old_inflight_fetch_result() {
             .await
             .unwrap()
     });
-    tokio::time::timeout(Duration::from_secs(3), async {
-        loop {
-            let rev: i64 = sqlx::query_scalar("SELECT source_revision FROM profiles WHERE id = ?")
-                .bind(id)
-                .fetch_one(&state.db)
-                .await
-                .unwrap();
-            if rev == 1 {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(!put.is_finished(), "换源必须等待旧刷新释放 profile 锁");
+    let rev: i64 = sqlx::query_scalar("SELECT source_revision FROM profiles WHERE id = ?")
+        .bind(id)
+        .fetch_one(&state.db)
+        .await
+        .unwrap();
+    assert_eq!(rev, 0);
 
-    // 释放在途请求:它按手中的旧来源结果完成(请求始于换源前),但结果不得写入缓存。
+    // 释放在途请求:旧响应可以完成,随后换源提交并拉取新源;最终缓存不得被旧结果覆盖。
     fetcher.release.add_permits(1);
     let resp = put.await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);

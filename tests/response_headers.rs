@@ -133,5 +133,42 @@ async fn frame_protection_preserves_auth_and_subscription_downloads() {
         .unwrap();
     assert_eq!(response.status(), StatusCode::OK);
     assert_frame_protection(&response);
+    assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
     assert!(common::text(response).await.contains("__proto__"));
+}
+
+#[tokio::test]
+async fn storage_policy_and_public_path_errors_are_consistent() {
+    let temp = common::TempDb::new();
+    let web = WebDir::new();
+    let mut state = common::test_state_with_fetcher(&temp, Arc::new(Provider)).await;
+    Arc::get_mut(&mut state).unwrap().web_dir = web.0.to_str().unwrap().into();
+    let app = build_router(state);
+
+    let response = app
+        .clone()
+        .oneshot(Request::get("/api/profiles").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+
+    let response = app
+        .clone()
+        .oneshot(Request::get("/asset.js").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(!response.headers().contains_key(header::CACHE_CONTROL));
+
+    let response = app
+        .oneshot(
+            Request::get("/testprefix/api/sub/%FF")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
 }

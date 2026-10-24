@@ -14,15 +14,15 @@ use serde_json::Value as JsonValue;
 use sqlx::FromRow;
 
 use crate::app::AppState;
-use crate::error::{ApiError, ApiResult};
-use crate::generate::{regenerate_from_cache, Regenerated};
+use crate::error::{ApiError, ApiJson, ApiResult};
+use crate::generate::{regenerate_for_rotation_locked, regenerate_from_cache_locked, Regenerated};
 use crate::mask::mask_url;
 use crate::ssrf;
 use crate::util::{now, random_token, MAX_ORDER_ENTRIES, MAX_ORDER_NAME_LEN};
 use crate::yaml;
 
-// Mihomo 支持的代理分组类型白名单;手动创建与机场导入共用同一过滤。
-const GROUP_TYPES: [&str; 5] = ["select", "url-test", "fallback", "load-balance", "relay"];
+// Mihomo 支持的代理分组类型白名单(上游已移除 relay,见迁移 0018);手动创建与机场导入共用同一过滤。
+const GROUP_TYPES: [&str; 4] = ["select", "url-test", "fallback", "load-balance"];
 
 // ─── DB 行类型 ─────────────────────────────────────────────────────────────────
 
@@ -33,6 +33,7 @@ struct ProfileRow {
     source_url: String,
     output_type: String,
     token: String,
+    source_revision: i64,
     last_fetch_at: Option<String>,
     last_fetch_status: Option<String>,
     last_generated_at: Option<String>,
@@ -212,7 +213,7 @@ pub async fn list(State(state): State<Arc<AppState>>) -> ApiResult<impl IntoResp
 
 pub async fn create(
     State(state): State<Arc<AppState>>,
-    Json(body): Json<CreateProfile>,
+    ApiJson(body): ApiJson<CreateProfile>,
 ) -> ApiResult<impl IntoResponse> {
     if body.name.trim().is_empty() {
         return Err(ApiError::BadRequest("name is required".into()));
@@ -302,10 +303,16 @@ async fn detail(state: &AppState, row: ProfileRow) -> ApiResult<ProfileDetail> {
     .map(group_response)
     .collect();
 
+    // 指纹风险名单随缓存保存;与 `list_proxies_and_groups` 同一判定:只有来源版本与公开能力
+    // 都和当前一致的缓存才有效,上下文不明/过期的缓存不展示其名单。
+    let expected_hash = state.current_capability_hash(&row.token);
     let reality_fingerprint_risks = sqlx::query_scalar::<_, Option<String>>(
-        "SELECT reality_fingerprint_risks FROM generated_cache WHERE profile_id = ?",
+        "SELECT reality_fingerprint_risks FROM generated_cache \
+         WHERE profile_id = ? AND source_revision = ? AND capability_hash = ?",
     )
     .bind(&profile_id)
+    .bind(row.source_revision)
+    .bind(&expected_hash)
     .fetch_optional(&state.db)
     .await?
     .flatten()
@@ -324,71 +331,94 @@ async fn detail(state: &AppState, row: ProfileRow) -> ApiResult<ProfileDetail> {
 pub async fn update(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
-    Json(body): Json<UpdateProfile>,
+    ApiJson(body): ApiJson<UpdateProfile>,
 ) -> ApiResult<impl IntoResponse> {
-    let existing = load_profile_row(&state, &id).await?;
-
-    // 与创建一致:去除首尾空白,空名拒绝。
-    let name = match body.name {
+    // 纯请求校验在锁外完成(不依赖库中状态)。与创建一致:去除首尾空白,空名拒绝。
+    let name = match &body.name {
         Some(n) if n.trim().is_empty() => {
-            return Err(ApiError::BadRequest("name is required".into()))
+            return Err(ApiError::BadRequest("name is required".into()));
         }
-        Some(n) => n.trim().to_string(),
-        None => existing.name,
+        Some(n) => Some(n.trim().to_string()),
+        None => None,
     };
     // 只写 URL:除非提供非空值,否则保持已存值。
-    let source_changed = body
-        .source_url
-        .as_deref()
-        .is_some_and(|u| !u.trim().is_empty() && u.trim() != existing.source_url);
-    let source_url = match body.source_url {
+    let provided_url = match &body.source_url {
         Some(u) if !u.trim().is_empty() => {
             let trimmed = u.trim();
             ssrf::validate_write_url(trimmed, "source_url")?;
-            trimmed.to_string()
+            Some(trimmed.to_string())
         }
-        _ => existing.source_url,
+        _ => None,
     };
-    let reality_mlkem = body.reality_mlkem.unwrap_or(existing.reality_mlkem);
-    let mut regenerate = None;
-    if source_changed {
-        // 换源:递增来源版本(在途的旧来源回源结果据此丢弃)、清空旧来源缓存(不做跨换源回退,
-        // 避免界面已显示新来源却仍下发旧节点)、重置公开刷新时间(下一次公开拉取立即回源)。
-        sqlx::query(
-            "UPDATE profiles SET name = ?, source_url = ?, reality_mlkem = ?, \
-             source_revision = source_revision + 1, public_refresh_at = NULL, updated_at = ? \
-             WHERE id = ?",
-        )
-        .bind(&name)
-        .bind(&source_url)
-        .bind(reality_mlkem)
-        .bind(now())
-        .bind(&id)
-        .execute(&state.db)
+
+    // 读改写在 per-profile 锁内基于重读的最新行进行,且只更新请求实际提供的字段:
+    // 不把旧整行回写,避免覆盖并发修改(如并发的换源与改名)。
+    let (regenerate, refetch) = state
+        .keyed_lock
+        .run(&id, async {
+            let existing = load_profile_row(&state, &id).await?;
+            let source_changed = provided_url
+                .as_deref()
+                .is_some_and(|u| u != existing.source_url);
+
+            // 只更新实际提供的字段:赋值列是固定字面值(调用方输入只走绑定值)。
+            // 注意 `Separated` 的 push 与 push_bind 都会插入分隔符,故占位符用 unseparated 变体。
+            let mut qb = sqlx::QueryBuilder::<sqlx::Sqlite>::new("UPDATE profiles SET ");
+            {
+                let mut sets = qb.separated(", ");
+                if let Some(n) = &name {
+                    sets.push("name = ").push_bind_unseparated(n.as_str());
+                }
+                if source_changed {
+                    if let Some(u) = &provided_url {
+                        sets.push("source_url = ").push_bind_unseparated(u.as_str());
+                    }
+                }
+                if let Some(m) = body.reality_mlkem {
+                    sets.push("reality_mlkem = ").push_bind_unseparated(m);
+                }
+                if source_changed {
+                    // 换源:递增来源版本(在途的旧来源回源结果据此丢弃)、重置公开刷新时间
+                    // (下一次公开拉取立即回源)。
+                    sets.push("source_revision = source_revision + 1");
+                    sets.push("public_refresh_at = NULL");
+                }
+                sets.push("updated_at = ").push_bind_unseparated(now());
+            }
+            qb.push(" WHERE id = ").push_bind(id.as_str());
+            let q = qb.build();
+
+            if source_changed {
+                // UPDATE 与缓存删除同一事务提交:换源后绝不留旧来源缓存(不做跨换源回退,
+                // 避免界面已显示新来源却仍下发旧节点)。
+                let mut tx = state.db.begin().await?;
+                q.execute(&mut *tx).await?;
+                sqlx::query("DELETE FROM generated_cache WHERE profile_id = ?")
+                    .bind(&id)
+                    .execute(&mut *tx)
+                    .await?;
+                tx.commit().await?;
+                // 重拉自取 profile 锁,必须推迟到提交并释放本锁之后(见下)。
+                Ok::<_, ApiError>((None, true))
+            } else {
+                q.execute(&state.db).await?;
+                // 切换 ML-KEM 自动开启只影响转换,用缓存的机场原文离线重生成即可立即下发,
+                // 不重拉机场;已持有 profile 锁,用锁内版避免重入自锁。
+                let regenerate = match body.reality_mlkem {
+                    Some(m) if m != existing.reality_mlkem => {
+                        Some(regenerate_from_cache_locked(&state, &id).await)
+                    }
+                    _ => None,
+                };
+                Ok::<_, ApiError>((regenerate, false))
+            }
+        })
         .await?;
-        sqlx::query("DELETE FROM generated_cache WHERE profile_id = ?")
-            .bind(&id)
-            .execute(&state.db)
-            .await?;
+
+    if refetch {
         // 与新建一致:换源后立即按新来源拉取一次,使 last_fetch_* 与缓存尽快反映真实状态。
         // 尽力而为,拉取失败只记状态、不影响本次保存。
         crate::generate::generate_best_effort(&state, &id).await;
-    } else {
-        sqlx::query(
-            "UPDATE profiles SET name = ?, source_url = ?, reality_mlkem = ?, updated_at = ?
-             WHERE id = ?",
-        )
-        .bind(&name)
-        .bind(&source_url)
-        .bind(reality_mlkem)
-        .bind(now())
-        .bind(&id)
-        .execute(&state.db)
-        .await?;
-        // 切换 ML-KEM 自动开启只影响转换,用缓存的机场原文离线重生成即可立即下发,不重拉机场。
-        if reality_mlkem != existing.reality_mlkem {
-            regenerate = Some(regenerate_from_cache(&state, &id).await);
-        }
     }
 
     let row = load_profile_row(&state, &id).await?;
@@ -439,15 +469,34 @@ pub async fn reset_token(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> ApiResult<impl IntoResponse> {
-    let _ = load_profile_row(&state, &id).await?;
     let token = random_token();
-    sqlx::query("UPDATE profiles SET token = ?, updated_at = ? WHERE id = ?")
-        .bind(&token)
-        .bind(now())
-        .bind(&id)
-        .execute(&state.db)
+    // 整个「换 token → 清公开刷新节流 → 迁移缓存」在 per-profile 锁内完成,与并发生成/刷新
+    // 串行化;迁移用锁内版(regenerate_for_rotation 会自取同一把锁,这里直接调会自死锁)。
+    let regenerate = state
+        .keyed_lock
+        .run(&id, async {
+            let _ = load_profile_row(&state, &id).await?;
+            // 公开刷新节流时间属于旧能力:一并清零,不推迟新 token 下的首次回源。
+            sqlx::query(
+                "UPDATE profiles SET token = ?, public_refresh_at = NULL, updated_at = ? \
+                 WHERE id = ?",
+            )
+            .bind(&token)
+            .bind(now())
+            .bind(&id)
+            .execute(&state.db)
+            .await?;
+            // 与锁外包装一致:迁移失败记日志并如实报 Pending,不让重置本身失败。
+            Ok::<_, ApiError>(
+                regenerate_for_rotation_locked(&state, &id)
+                    .await
+                    .unwrap_or_else(|_| {
+                        tracing::warn!(profile = %id, "failed to regenerate cache after token rotation");
+                        Regenerated::Pending
+                    }),
+            )
+        })
         .await?;
-    let regenerate = crate::generate::regenerate_for_rotation(&state, &id).await;
     Ok(Json(TokenResponse {
         subscription_url: state.subscription_url(&token),
         token,
@@ -471,20 +520,24 @@ pub struct PutRules {
 pub async fn put_rules(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
-    Json(body): Json<PutRules>,
+    ApiJson(body): ApiJson<PutRules>,
 ) -> ApiResult<impl IntoResponse> {
-    let _ = load_profile_row(&state, &id).await?;
-    sqlx::query("UPDATE rulesets SET content = ?, updated_at = ? WHERE profile_id = ?")
-        .bind(&body.content)
-        .bind(now())
-        .bind(&id)
-        .execute(&state.db)
-        .await?;
-
+    // 写入与离线重生成在同一 per-profile 锁内串行化(与生成/公开刷新互斥);重生成用锁内版。
     // 用缓存的机场原文离线重生成,使编辑立即反映到所服务的订阅(不合法则保留上一份合法输出)。
-    Ok(Json(SavedResponse {
-        regenerate: regenerate_from_cache(&state, &id).await,
-    }))
+    let regenerate = state
+        .keyed_lock
+        .run(&id, async {
+            let _ = load_profile_row(&state, &id).await?;
+            sqlx::query("UPDATE rulesets SET content = ?, updated_at = ? WHERE profile_id = ?")
+                .bind(&body.content)
+                .bind(now())
+                .bind(&id)
+                .execute(&state.db)
+                .await?;
+            Ok::<_, ApiError>(regenerate_from_cache_locked(&state, &id).await)
+        })
+        .await?;
+    Ok(Json(SavedResponse { regenerate }))
 }
 
 // ─── 代理预览 & 节点/分组排序 ─────────────────────────────────────────────────
@@ -516,14 +569,17 @@ struct ProxiesResponse {
 }
 
 /// 列出最近一次生成输出中的全部代理(机场代理 + 并入的自定义节点)与全部分组。从
-/// `generated_cache.output_yaml` 解析;profile 从未生成过时返回 `generated: false` 与空列表。
+/// `generated_cache.output_yaml` 解析;profile 从未生成过、或缓存的来源版本/公开能力
+/// (token + 前缀)与当前不一致(升级前、换源/轮换前的残留)时按未生成处理,返回
+/// `generated: false` 与空列表。
 pub async fn list_proxies_and_groups(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> ApiResult<impl IntoResponse> {
-    let _ = load_profile_row(&state, &id).await?;
-    let cache = sqlx::query_as::<_, (String, String)>(
-        "SELECT output_yaml, generated_at FROM generated_cache WHERE profile_id = ?",
+    let row = load_profile_row(&state, &id).await?;
+    let cache = sqlx::query_as::<_, (String, String, Option<i64>, Option<String>)>(
+        "SELECT output_yaml, generated_at, source_revision, capability_hash \
+         FROM generated_cache WHERE profile_id = ?",
     )
     .bind(&id)
     .fetch_optional(&state.db)
@@ -531,7 +587,13 @@ pub async fn list_proxies_and_groups(
 
     let section_order = section_order(&state, &id).await?;
 
-    let Some((output_yaml, generated_at)) = cache else {
+    // 上下文不明(NULL)或已过期的缓存不得当作有效输出展示。
+    let expected_hash = state.current_capability_hash(&row.token);
+    let usable = cache.filter(|(_, _, revision, hash)| {
+        *revision == Some(row.source_revision) && hash.as_deref() == Some(expected_hash.as_str())
+    });
+
+    let Some((output_yaml, generated_at, _, _)) = usable else {
         return Ok(Json(ProxiesResponse {
             generated: false,
             generated_at: None,
@@ -541,9 +603,9 @@ pub async fn list_proxies_and_groups(
         }));
     };
 
-    // 输出是可信的(我们自己产生)且已分块/排序(任何排序编辑都经 `regenerate_from_cache` 重生成缓存),
-    // 故原样返回。仍走限界解析器解析;遇到任何意外时优雅降级。
-    let (proxies, groups) = yaml::parse_limited(&output_yaml)
+    // 输出是可信的(我们自己产生)且已分块/排序(任何排序编辑都经离线重生成更新缓存),
+    // 故原样返回。仍走限界解析器(自生成原文适用更宽的字节上限);遇到任何意外时优雅降级。
+    let (proxies, groups) = yaml::parse_generated_limited(&output_yaml)
         .ok()
         .map(|v| {
             (
@@ -640,53 +702,60 @@ async fn set_order(
     kind: OrderKind,
     body: OrderBody,
 ) -> ApiResult<Json<SavedResponse>> {
-    let _ = load_profile_row(state, id).await?;
-
-    if body.order.len() > MAX_ORDER_ENTRIES {
-        return Err(ApiError::BadRequest(format!(
-            "order must have at most {MAX_ORDER_ENTRIES} entries"
-        )));
-    }
-    if body.order.iter().any(|n| n.len() > MAX_ORDER_NAME_LEN) {
-        return Err(ApiError::BadRequest(format!(
-            "names must be at most {MAX_ORDER_NAME_LEN} bytes"
-        )));
-    }
-
-    // 空列表清除手动顺序(回到默认);存 NULL。
-    let stored = if body.order.is_empty() {
-        None
-    } else {
-        Some(
-            serde_json::to_string(&body.order)
-                .map_err(|_| ApiError::BadRequest("order could not be serialized".into()))?,
-        )
-    };
-
     let sql = match kind {
         OrderKind::Group => "UPDATE profiles SET group_order = ?, updated_at = ? WHERE id = ?",
         OrderKind::Section => {
             "UPDATE profiles SET node_section_order = ?, updated_at = ? WHERE id = ?"
         }
     };
-    sqlx::query(sql)
-        .bind(&stored)
-        .bind(now())
-        .bind(id)
-        .execute(&state.db)
+
+    // 校验、写入与离线重生成在同一 per-profile 锁内串行化;重生成用锁内版。
+    let regenerate = state
+        .keyed_lock
+        .run(id, async {
+            let _ = load_profile_row(state, id).await?;
+
+            if body.order.len() > MAX_ORDER_ENTRIES {
+                return Err(ApiError::BadRequest(format!(
+                    "order must have at most {MAX_ORDER_ENTRIES} entries"
+                )));
+            }
+            if body.order.iter().any(|n| n.len() > MAX_ORDER_NAME_LEN) {
+                return Err(ApiError::BadRequest(format!(
+                    "names must be at most {MAX_ORDER_NAME_LEN} bytes"
+                )));
+            }
+
+            // 空列表清除手动顺序(回到默认);存 NULL。
+            let stored =
+                if body.order.is_empty() {
+                    None
+                } else {
+                    Some(serde_json::to_string(&body.order).map_err(|_| {
+                        ApiError::BadRequest("order could not be serialized".into())
+                    })?)
+                };
+
+            sqlx::query(sql)
+                .bind(&stored)
+                .bind(now())
+                .bind(id)
+                .execute(&state.db)
+                .await?;
+
+            // 用缓存的机场原文离线重生成(不重拉机场),把新顺序立即应用到所服务的订阅;尽力而为。
+            Ok::<_, ApiError>(regenerate_from_cache_locked(state, id).await)
+        })
         .await?;
 
-    // 用缓存的机场原文离线重生成(不重拉机场),把新顺序立即应用到所服务的订阅;尽力而为。
-    Ok(Json(SavedResponse {
-        regenerate: regenerate_from_cache(state, id).await,
-    }))
+    Ok(Json(SavedResponse { regenerate }))
 }
 
 /// `PUT /api/profiles/:id/group-order` —— 持久化一个手动 proxy-group 顺序。
 pub async fn set_group_order(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
-    Json(body): Json<OrderBody>,
+    ApiJson(body): ApiJson<OrderBody>,
 ) -> ApiResult<impl IntoResponse> {
     set_order(&state, &id, OrderKind::Group, body).await
 }
@@ -696,7 +765,7 @@ pub async fn set_group_order(
 pub async fn set_node_section_order(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
-    Json(body): Json<OrderBody>,
+    ApiJson(body): ApiJson<OrderBody>,
 ) -> ApiResult<impl IntoResponse> {
     let valid = body.order.len() == 2
         && body.order.contains(&"provider".to_string())
@@ -766,28 +835,34 @@ pub async fn list_groups(
 pub async fn create_group(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
-    Json(body): Json<GroupBody>,
+    ApiJson(body): ApiJson<GroupBody>,
 ) -> ApiResult<impl IntoResponse> {
-    let _ = load_profile_row(&state, &id).await?;
-    validate_group(&body)?;
-    let group_id = uuid::Uuid::new_v4().to_string();
-    let ts = now();
-    sqlx::query(
-        "INSERT INTO custom_groups (id, profile_id, name, group_type, members, options, enabled, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-    )
-    .bind(&group_id)
-    .bind(&id)
-    .bind(body.name.trim())
-    .bind(&body.group_type)
-    .bind(serde_json::to_string(&body.members).unwrap_or_else(|_| "[]".into()))
-    .bind(body.options.as_ref().map(|o| o.to_string()))
-    .bind(body.enabled.unwrap_or(true))
-    .bind(&ts)
-    .bind(&ts)
-    .execute(&state.db)
-    .await?;
-    let row = fetch_group(&state, &id, &group_id).await?;
+    // 与同 profile 的其他写(导入、换源等)在 per-profile 锁内串行化。
+    let row = state
+        .keyed_lock
+        .run(&id, async {
+            let _ = load_profile_row(&state, &id).await?;
+            validate_group(&body)?;
+            let group_id = uuid::Uuid::new_v4().to_string();
+            let ts = now();
+            sqlx::query(
+                "INSERT INTO custom_groups (id, profile_id, name, group_type, members, options, enabled, created_at, updated_at)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(&group_id)
+            .bind(&id)
+            .bind(body.name.trim())
+            .bind(&body.group_type)
+            .bind(serde_json::to_string(&body.members).unwrap_or_else(|_| "[]".into()))
+            .bind(body.options.as_ref().map(|o| o.to_string()))
+            .bind(body.enabled.unwrap_or(true))
+            .bind(&ts)
+            .bind(&ts)
+            .execute(&state.db)
+            .await?;
+            fetch_group(&state, &id, &group_id).await
+        })
+        .await?;
     Ok((StatusCode::CREATED, Json(group_response(row))))
 }
 
@@ -801,11 +876,14 @@ pub struct ImportGroupsResponse {
 /// `POST /api/profiles/:id/import-provider-groups` —— 拉取机场订阅,把其 `proxy-groups` 导入为
 /// 可编辑的自定义分组(否则转换器会像对规则那样替换机场分组)。跳过同名已存在或类型不支持的分组。
 /// 实时、SSRF 保护的拉取(同 `provider-rules`);不缓存。在下次生成后生效。
+/// 拉取与解析在锁外进行;提交阶段在 profile 锁内以事务重查来源版本——若拉取期间已换源,
+/// 整批 409 且零写入(旧来源的分组不得落进新来源的配置);否则整批原子入库。
 pub async fn import_provider_groups(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> ApiResult<impl IntoResponse> {
     let profile = load_profile_row(&state, &id).await?;
+    let revision = profile.source_revision;
     let fetched = state
         .fetcher
         .fetch(&profile.source_url)
@@ -818,51 +896,75 @@ pub async fn import_provider_groups(
         _ => Vec::new(),
     };
 
-    // 已占用的分组名:起始为 DB 中已存在的,循环中把本批新导入的也计入,以做批内去重。
-    let mut taken_names: std::collections::HashSet<String> =
-        sqlx::query_scalar::<_, String>("SELECT name FROM custom_groups WHERE profile_id = ?")
-            .bind(&id)
-            .fetch_all(&state.db)
-            .await?
-            .into_iter()
-            .collect();
+    let response = state
+        .keyed_lock
+        .run(&id, async {
+            // IMMEDIATE:事务开始即拿写锁,版本重查与批量插入之间不会被其他写者插入。
+            let mut tx = state.db.begin_with("BEGIN IMMEDIATE").await?;
+            let current =
+                sqlx::query_scalar::<_, i64>("SELECT source_revision FROM profiles WHERE id = ?")
+                    .bind(&id)
+                    .fetch_optional(&mut *tx)
+                    .await?
+                    .ok_or(ApiError::NotFound)?;
+            if current != revision {
+                return Err(ApiError::Conflict(
+                    "profile source changed while importing; nothing was imported".into(),
+                ));
+            }
 
-    let mut imported = 0usize;
-    let mut skipped = 0usize;
-    for item in &provider_groups {
-        let Some((name, group_type, members, options)) = parse_provider_group(item) else {
-            skipped += 1;
-            continue;
-        };
-        // 内置保留名(DIRECT/REJECT/…)与不支持类型一样跳过:导入后生成会被校验拦截。
-        if crate::converter::RESERVED_GROUP_NAMES.contains(&name.as_str()) {
-            skipped += 1;
-            continue;
-        }
-        if !taken_names.insert(name.clone()) {
-            skipped += 1; // name already present
-            continue;
-        }
-        let ts = now();
-        sqlx::query(
-            "INSERT INTO custom_groups (id, profile_id, name, group_type, members, options, enabled, created_at, updated_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        )
-        .bind(uuid::Uuid::new_v4().to_string())
-        .bind(&id)
-        .bind(&name)
-        .bind(&group_type)
-        .bind(serde_json::to_string(&members).unwrap_or_else(|_| "[]".into()))
-        .bind(options.as_ref().map(|o| o.to_string()))
-        .bind(true)
-        .bind(&ts)
-        .bind(&ts)
-        .execute(&state.db)
+            // 已占用的分组名:起始为 DB 中已存在的,循环中把本批新导入的也计入,以做批内去重。
+            let mut taken_names: std::collections::HashSet<String> =
+                sqlx::query_scalar::<_, String>(
+                    "SELECT name FROM custom_groups WHERE profile_id = ?",
+                )
+                .bind(&id)
+                .fetch_all(&mut *tx)
+                .await?
+                .into_iter()
+                .collect();
+
+            let mut imported = 0usize;
+            let mut skipped = 0usize;
+            for item in &provider_groups {
+                let Some((name, group_type, members, options)) = parse_provider_group(item)
+                else {
+                    skipped += 1;
+                    continue;
+                };
+                // 内置保留名(DIRECT/REJECT/…)与不支持类型一样跳过:导入后生成会被校验拦截。
+                if crate::converter::RESERVED_GROUP_NAMES.contains(&name.as_str()) {
+                    skipped += 1;
+                    continue;
+                }
+                if !taken_names.insert(name.clone()) {
+                    skipped += 1; // name already present
+                    continue;
+                }
+                let ts = now();
+                sqlx::query(
+                    "INSERT INTO custom_groups (id, profile_id, name, group_type, members, options, enabled, created_at, updated_at)
+                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                )
+                .bind(uuid::Uuid::new_v4().to_string())
+                .bind(&id)
+                .bind(&name)
+                .bind(&group_type)
+                .bind(serde_json::to_string(&members).unwrap_or_else(|_| "[]".into()))
+                .bind(options.as_ref().map(|o| o.to_string()))
+                .bind(true)
+                .bind(&ts)
+                .bind(&ts)
+                .execute(&mut *tx)
+                .await?;
+                imported += 1;
+            }
+            tx.commit().await?;
+            Ok(ImportGroupsResponse { imported, skipped })
+        })
         .await?;
-        imported += 1;
-    }
 
-    Ok(Json(ImportGroupsResponse { imported, skipped }))
+    Ok(Json(response))
 }
 
 /// 把一个机场 `proxy-groups` 条目解析为自定义分组 `(name, type, members, options)`。条目缺 name/type
@@ -905,25 +1007,31 @@ fn parse_provider_group(
 pub async fn update_group(
     State(state): State<Arc<AppState>>,
     Path((id, group_id)): Path<(String, String)>,
-    Json(body): Json<GroupBody>,
+    ApiJson(body): ApiJson<GroupBody>,
 ) -> ApiResult<impl IntoResponse> {
-    let _ = fetch_group(&state, &id, &group_id).await?;
-    validate_group(&body)?;
-    sqlx::query(
-        "UPDATE custom_groups SET name = ?, group_type = ?, members = ?, options = ?, enabled = ?, updated_at = ?
-         WHERE id = ? AND profile_id = ?",
-    )
-    .bind(body.name.trim())
-    .bind(&body.group_type)
-    .bind(serde_json::to_string(&body.members).unwrap_or_else(|_| "[]".into()))
-    .bind(body.options.as_ref().map(|o| o.to_string()))
-    .bind(body.enabled.unwrap_or(true))
-    .bind(now())
-    .bind(&group_id)
-    .bind(&id)
-    .execute(&state.db)
-    .await?;
-    let row = fetch_group(&state, &id, &group_id).await?;
+    // 读改写与同 profile 的其他写在 per-profile 锁内串行化。
+    let row = state
+        .keyed_lock
+        .run(&id, async {
+            let _ = fetch_group(&state, &id, &group_id).await?;
+            validate_group(&body)?;
+            sqlx::query(
+                "UPDATE custom_groups SET name = ?, group_type = ?, members = ?, options = ?, enabled = ?, updated_at = ?
+                 WHERE id = ? AND profile_id = ?",
+            )
+            .bind(body.name.trim())
+            .bind(&body.group_type)
+            .bind(serde_json::to_string(&body.members).unwrap_or_else(|_| "[]".into()))
+            .bind(body.options.as_ref().map(|o| o.to_string()))
+            .bind(body.enabled.unwrap_or(true))
+            .bind(now())
+            .bind(&group_id)
+            .bind(&id)
+            .execute(&state.db)
+            .await?;
+            fetch_group(&state, &id, &group_id).await
+        })
+        .await?;
     Ok(Json(group_response(row)))
 }
 
@@ -931,10 +1039,15 @@ pub async fn delete_group(
     State(state): State<Arc<AppState>>,
     Path((id, group_id)): Path<(String, String)>,
 ) -> ApiResult<impl IntoResponse> {
-    let result = sqlx::query("DELETE FROM custom_groups WHERE id = ? AND profile_id = ?")
-        .bind(&group_id)
-        .bind(&id)
-        .execute(&state.db)
+    let result = state
+        .keyed_lock
+        .run(&id, async {
+            sqlx::query("DELETE FROM custom_groups WHERE id = ? AND profile_id = ?")
+                .bind(&group_id)
+                .bind(&id)
+                .execute(&state.db)
+                .await
+        })
         .await?;
     if result.rows_affected() == 0 {
         return Err(ApiError::NotFound);

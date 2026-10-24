@@ -4,13 +4,7 @@
 import type { FieldDef } from "../../components/nodeSchema";
 import type { GroupType } from "../../types";
 
-export const GROUP_TYPES: GroupType[] = [
-  "select",
-  "url-test",
-  "fallback",
-  "load-balance",
-  "relay",
-];
+export const GROUP_TYPES: GroupType[] = ["select", "url-test", "fallback", "load-balance"];
 
 const HEALTH: FieldDef[] = [
   { key: "url", kind: "text", placeholder: "https://www.gstatic.com/generate_204" },
@@ -34,7 +28,6 @@ export const GROUP_OPTION_FIELDS: Record<string, FieldDef[]> = {
       options: ["consistent-hashing", "round-robin", "sticky-sessions"],
     },
   ],
-  relay: [],
 };
 
 export function groupOptionFields(type: string): FieldDef[] {
@@ -45,12 +38,23 @@ export function groupOptionKeys(type: string): Set<string> {
   return new Set(groupOptionFields(type).map((f) => f.key));
 }
 
-/** 始终可作为组成员的内置策略目标。 */
+/** 规则策略目标;默认 GLOBAL 在规则解析阶段可用。 */
 export const BUILTIN_POLICIES = [
   "DIRECT",
   "REJECT",
   "REJECT-DROP",
   "PASS",
+  "PASS-RULE",
   "COMPATIBLE",
   "GLOBAL",
+];
+
+/** 分组成员的内置代理;默认 GLOBAL 分组尚未创建,自定义 GLOBAL 会由分组候选单独提供。 */
+export const BUILTIN_GROUP_MEMBERS = [
+  "DIRECT",
+  "REJECT",
+  "REJECT-DROP",
+  "PASS",
+  "PASS-RULE",
+  "COMPATIBLE",
 ];

@@ -47,7 +47,10 @@ async fn main() -> AppResult<()> {
     // 设置 Secure cookie 属性。`SECURE_COOKIES` 是显式覆盖项;未设时由 HTTPS 公共源推断。在
     // TLS 终止反向代理后,应用走纯 HTTP,故若无此覆盖,缺失或 http 的 `PUBLIC_BASE_URL` 会静默
     // 签发不带 `Secure` 的会话 cookie,使其暴露于明文传输。
-    let secure_cookies = env_bool("SECURE_COOKIES", public_base_url.starts_with("https://"));
+    let secure_cookies = env_bool(
+        "SECURE_COOKIES",
+        public_base_url_uses_https(&public_base_url),
+    );
     if !secure_cookies {
         tracing::warn!(
             "session cookies will be issued WITHOUT the Secure attribute; set \
@@ -182,4 +185,22 @@ fn require_env(key: &str) -> io::Result<String> {
         ));
     }
     Ok(value)
+}
+
+fn public_base_url_uses_https(raw: &str) -> bool {
+    url::Url::parse(raw).is_ok_and(|url| url.scheme() == "https")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn secure_cookie_default_parses_https_scheme_case_insensitively() {
+        assert!(public_base_url_uses_https("https://sub.example.com"));
+        assert!(public_base_url_uses_https("HTTPS://sub.example.com"));
+        assert!(!public_base_url_uses_https("http://sub.example.com"));
+        assert!(!public_base_url_uses_https("https://"));
+        assert!(!public_base_url_uses_https("not a URL"));
+    }
 }

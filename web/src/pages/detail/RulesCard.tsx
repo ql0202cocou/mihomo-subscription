@@ -954,7 +954,9 @@ function RuleSetDefBlock({
   onChange: (m: RuleModel) => void;
 }) {
   const { t } = useTranslation();
-  const formats = model.rsSource === "remote" ? RS_REMOTE_FORMATS : RS_MANUAL_FORMATS;
+  const formats = (model.rsSource === "remote" ? RS_REMOTE_FORMATS : RS_MANUAL_FORMATS).filter(
+    (format) => model.rsBehavior !== "classical" || format !== "mrs",
+  );
   // 切来源时纠正不兼容 format(手动不支持 mrs)。
   function setSource(rsSource: "manual" | "remote") {
     const rsFormat = rsSource === "manual" && model.rsFormat === "mrs" ? "yaml" : model.rsFormat;
@@ -976,7 +978,13 @@ function RuleSetDefBlock({
           <TypeChips
             options={RS_BEHAVIORS}
             value={model.rsBehavior}
-            onChange={(v) => onChange({ ...model, rsBehavior: v as RuleModel["rsBehavior"] })}
+            onChange={(v) =>
+              onChange({
+                ...model,
+                rsBehavior: v as RuleModel["rsBehavior"],
+                rsFormat: v === "classical" && model.rsFormat === "mrs" ? "yaml" : model.rsFormat,
+              })
+            }
           />
         </div>
         <div>

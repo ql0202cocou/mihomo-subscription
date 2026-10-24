@@ -52,12 +52,23 @@ pub async fn ensure_public_path_prefix(
             .fetch_optional(pool)
             .await?
     {
-        return Ok(prefix);
+        let normalized = normalize_public_path_prefix(&prefix)?;
+        if normalized != prefix {
+            sqlx::query(
+                "UPDATE app_settings SET public_path_prefix = ?, updated_at = ? WHERE id = 1",
+            )
+            .bind(&normalized)
+            .bind(chrono::Utc::now().to_rfc3339())
+            .execute(pool)
+            .await?;
+        }
+        return Ok(normalized);
     }
 
     let prefix = env_seed
         .filter(|s| !s.trim().is_empty())
         .unwrap_or_else(random_path_prefix);
+    let prefix = normalize_public_path_prefix(&prefix)?;
     let now = chrono::Utc::now().to_rfc3339();
     sqlx::query("INSERT INTO app_settings (id, public_path_prefix, updated_at) VALUES (1, ?, ?)")
         .bind(&prefix)
@@ -65,4 +76,22 @@ pub async fn ensure_public_path_prefix(
         .execute(pool)
         .await?;
     Ok(prefix)
+}
+
+fn normalize_public_path_prefix(prefix: &str) -> DbResult<String> {
+    let prefix = prefix.trim();
+    let valid = !prefix.is_empty()
+        && prefix.len() <= 128
+        && !matches!(prefix, "." | "..")
+        && prefix
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~'));
+    if !valid {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "PUBLIC_PATH_PREFIX must be one URL-safe path segment",
+        )
+        .into());
+    }
+    Ok(prefix.to_string())
 }

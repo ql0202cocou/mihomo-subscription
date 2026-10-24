@@ -13,12 +13,7 @@ export interface ProfileSummary {
   updated_at: string;
 }
 
-export type GroupType =
-  | "select"
-  | "url-test"
-  | "fallback"
-  | "load-balance"
-  | "relay";
+export type GroupType = "select" | "url-test" | "fallback" | "load-balance";
 
 /** 订阅的规则内容(③ 规则文本整体)。 */
 export interface ProfileRules {
@@ -120,6 +115,8 @@ export interface ProfileRuleSet {
   last_fetch_status: string | null;
   created_at: string;
   updated_at: string;
+  /** 创建/更新影响生成输出时带回的离线重生成结果;列表不返回。 */
+  regenerate?: Regenerate;
 }
 
 export interface Settings {

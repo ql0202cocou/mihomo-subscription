@@ -5,18 +5,21 @@
 //! 校验遵循同一节,返回逐条错误列表供生成弹窗使用。
 
 use serde_yaml::{Mapping, Value};
+use sha2::{Digest, Sha256};
 
 use crate::yaml;
 
-/// 在规则与分组成员里始终有效的内置策略目标。
-const BUILTIN_POLICIES: &[&str] = &[
+/// Mihomo 内置的非分组代理。GLOBAL 是内置分组，不在这个集合里。
+const BUILTIN_PROXIES: &[&str] = &[
     "DIRECT",
     "REJECT",
     "REJECT-DROP",
     "PASS",
+    "PASS-RULE",
     "COMPATIBLE",
-    "GLOBAL",
 ];
+
+const SUPPORTED_GROUP_TYPES: &[&str] = &["select", "url-test", "fallback", "load-balance"];
 
 /// Mihomo 在解析配置前创建的内置名(内置代理 DIRECT/REJECT/REJECT-DROP/PASS/PASS-RULE/
 /// COMPATIBLE,另有内置分组 GLOBAL):代理与分组共用同一命名空间,自定义节点占用这些名字会让
@@ -114,7 +117,8 @@ pub fn convert(input: ConvertInput) -> Result<ConvertOutput, ConvertError> {
     let mut root =
         yaml::parse_mapping(input.provider_yaml).map_err(|_| ConvertError::ProviderParse)?;
 
-    let provider_proxies = names_in(root.get("proxies"));
+    let mut errors: Vec<String> = Vec::new();
+    let provider_proxies = provider_proxy_names(root.get("proxies"), &mut errors);
     let provider_rule_providers: Vec<String> = match root.get("rule-providers") {
         Some(Value::Mapping(m)) => m
             .keys()
@@ -125,7 +129,6 @@ pub fn convert(input: ConvertInput) -> Result<ConvertOutput, ConvertError> {
     };
 
     // 先解析自定义节点 content;把解析失败收集为校验错误,而非直接中止。
-    let mut errors: Vec<String> = Vec::new();
     let mut parsed_nodes: Vec<(String, Mapping)> = Vec::new();
     for node in &input.nodes {
         match yaml::parse_mapping(&node.content) {
@@ -220,6 +223,10 @@ pub fn convert(input: ConvertInput) -> Result<ConvertOutput, ConvertError> {
         }
         root.insert(Value::from("rule-providers"), Value::Mapping(map));
     }
+    validate_rule_provider_paths(root.get("rule-providers"), &mut errors);
+    if !errors.is_empty() {
+        return Err(ConvertError::Validation(errors));
+    }
 
     // 其余所有顶层键(dns、tun…)透传。
 
@@ -246,6 +253,10 @@ fn validate(
     custom_group_names: &[String],
     errors: &mut Vec<String>,
 ) {
+    report_duplicate_names(provider_proxies, "provider proxy", errors);
+    report_duplicate_names(custom_node_names, "custom node", errors);
+    report_duplicate_names(custom_group_names, "custom group", errors);
+
     // 内置保留名:自定义节点、自定义分组或机场透传代理占用 DIRECT/REJECT 等内置名时,Mihomo
     // 会以 duplicate name 拒绝加载整个配置,须在校验阶段拦截(GLOBAL 分组是上游支持的用法,放行)。
     for name in provider_proxies {
@@ -287,19 +298,60 @@ fn validate(
         }
     }
 
-    // 已知的引用目标:机场代理(透传)、自定义节点(追加)、自定义分组(输出里唯一的分组)与内置
-    // 策略。引用一个未导入的机场分组即为未知目标。
-    let known = |name: &str| {
+    let known_proxy = |name: &str| {
         provider_proxies.iter().any(|n| n == name)
             || custom_node_names.iter().any(|n| n == name)
-            || custom_group_names.iter().any(|n| n == name)
-            || BUILTIN_POLICIES.contains(&name)
+            || BUILTIN_PROXIES.contains(&name)
     };
+    let known_group = |name: &str| custom_group_names.iter().any(|n| n == name);
 
-    // 自定义分组成员必须引用存在的东西。
     for group in &input.groups {
+        if !SUPPORTED_GROUP_TYPES.contains(&group.group_type.as_str()) {
+            errors.push(format!(
+                "custom group `{}` has unsupported type `{}`",
+                group.name, group.group_type
+            ));
+        }
+
+        let include_all = group_option_bool(group, "include-all");
+        let include_all_proxies = include_all || group_option_bool(group, "include-all-proxies");
+        if group.members.is_empty() && !include_all_proxies {
+            errors.push(format!(
+                "custom group `{}` must have members or include all proxies",
+                group.name
+            ));
+        }
+        // 输出会剥离 proxy-providers,显式 use 与仅包含 provider 的选项不可能再解析。
+        // include-all 同时包含全部静态代理,是 Mihomo 支持的空组形式,单独放行。
+        if group_option_is_nonempty(group, "use")
+            || group_option_bool(group, "include-all-providers")
+        {
+            errors.push(format!(
+                "custom group `{}` depends on proxy-providers, which are stripped",
+                group.name
+            ));
+        }
+
+        match group_option(group, "empty-fallback") {
+            None | Some(serde_json::Value::Null) => {}
+            Some(serde_json::Value::String(target)) if target.is_empty() => {}
+            Some(serde_json::Value::String(target)) => {
+                if !known_proxy(target) {
+                    errors.push(format!(
+                        "custom group `{}` empty-fallback `{target}` must be a known non-group proxy",
+                        group.name
+                    ));
+                }
+            }
+            Some(_) => errors.push(format!(
+                "custom group `{}` empty-fallback must be a known non-group proxy",
+                group.name
+            )),
+        }
+
+        // 分组成员可引用内置代理和已定义分组;默认 GLOBAL 分组不在这里隐式加入。
         for member in &group.members {
-            if !known(member) {
+            if !known_proxy(member) && !known_group(member) {
                 errors.push(format!(
                     "custom group `{}` references unknown member `{member}`",
                     group.name
@@ -318,20 +370,19 @@ fn validate(
         }
     }
 
-    // 每条规则的策略目标必须存在。无法可靠解析的高级/逻辑规则透传,不做目标校验。
-    // `RULE-SET` 引用的规则集必须存在:本订阅注入的规则集(③,仅已启用者)或机场自带的 rule-providers。
-    // 逻辑规则(AND/OR/NOT/SUB-RULE)内嵌套的 `RULE-SET` 同样会被 Mihomo 解析,一并检查。
+    // 规则可引用所有代理、自定义分组及默认 GLOBAL;SUB-RULE 的最后一项是子规则名而非策略。
+    // 逻辑规则内嵌套的 RULE-SET 同样会被 Mihomo 解析,一并检查。
     for (lineno, line) in rule_lines(input.rules) {
-        if let Some(target) = rule_target(line) {
-            if !known(&target) {
-                errors.push(format!(
-                    "rules line {lineno} references unknown policy `{target}`"
-                ));
-            }
-        }
-        match ruleset_names_in_line(line) {
-            Ok(names) => {
-                for name in names {
+        match parse_rule_line(line) {
+            Ok(parsed) => {
+                if let Some(target) = parsed.target {
+                    if !known_proxy(&target) && !known_group(&target) && target != "GLOBAL" {
+                        errors.push(format!(
+                            "rules line {lineno} references unknown policy `{target}`"
+                        ));
+                    }
+                }
+                for name in parsed.rule_sets {
                     let injected = input.rule_providers.iter().any(|rp| rp.name == name);
                     if !injected && !provider_rule_providers.iter().any(|n| n == &name) {
                         errors.push(format!(
@@ -340,9 +391,16 @@ fn validate(
                     }
                 }
             }
-            Err(()) => errors.push(format!(
-                "rules line {lineno} exceeds the supported logic nesting depth"
-            )),
+            Err(error) => {
+                let message = match error {
+                    RuleLineError::MissingTarget => "is missing a target",
+                    RuleLineError::MissingPayload => "is missing a rule payload",
+                    RuleLineError::InvalidLogicPayload => "has an invalid logic payload",
+                    RuleLineError::UnbalancedLogicParentheses => "has unbalanced logic parentheses",
+                    RuleLineError::Depth => "exceeds the supported logic nesting depth",
+                };
+                errors.push(format!("rules line {lineno} {message}"));
+            }
         }
     }
 }
@@ -368,12 +426,83 @@ fn in_cycle(groups: &[CustomGroup], start: &str) -> bool {
     false
 }
 
-/// 从 `proxies`/`proxy-groups` 值中提取各代理/分组的 `name`。
+fn report_duplicate_names(names: &[String], kind: &str, errors: &mut Vec<String>) {
+    let mut seen = std::collections::HashSet::new();
+    for name in names {
+        if !seen.insert(name) {
+            errors.push(format!("duplicate {kind} name `{name}`"));
+        }
+    }
+}
+
+fn group_option<'a>(group: &'a CustomGroup, name: &str) -> Option<&'a serde_json::Value> {
+    let options = group.options.as_ref()?.as_object()?;
+    if let Some(value) = options.get(name) {
+        return Some(value);
+    }
+    options
+        .iter()
+        .find(|(key, _)| key.replace('_', "-").eq_ignore_ascii_case(name))
+        .map(|(_, value)| value)
+}
+
+fn group_option_bool(group: &CustomGroup, name: &str) -> bool {
+    match group_option(group, name) {
+        Some(serde_json::Value::Bool(value)) => *value,
+        Some(serde_json::Value::Number(value)) => {
+            value.as_i64().is_some_and(|i| i != 0) || value.as_u64().is_some_and(|u| u != 0)
+        }
+        _ => false,
+    }
+}
+
+fn group_option_is_nonempty(group: &CustomGroup, name: &str) -> bool {
+    match group_option(group, name) {
+        None | Some(serde_json::Value::Null) => false,
+        Some(serde_json::Value::Array(items)) => !items.is_empty(),
+        Some(_) => true,
+    }
+}
+
+/// 机场 proxies 若存在必须是 sequence,每项必须有非空字符串名称;非法项不能静默消失。
+fn provider_proxy_names(value: Option<&Value>, errors: &mut Vec<String>) -> Vec<String> {
+    match value {
+        None => Vec::new(),
+        Some(Value::Sequence(items)) => {
+            for (index, item) in items.iter().enumerate() {
+                let valid = match item {
+                    Value::Mapping(mapping) => mihomo_key(mapping, "name")
+                        .and_then(|key| mapping.get(&key))
+                        .and_then(Value::as_str)
+                        .is_some_and(|name| !name.trim().is_empty()),
+                    _ => false,
+                };
+                if !valid {
+                    errors.push(format!(
+                        "provider proxy at index {} must be a mapping with a non-empty string name",
+                        index + 1
+                    ));
+                }
+            }
+            names_in(value)
+        }
+        Some(_) => {
+            errors.push("provider `proxies` must be a sequence".into());
+            Vec::new()
+        }
+    }
+}
+
+/// 从 `proxies`/`proxy-groups` 值中提取各代理/分组的 `name`,兼容 Mihomo 键名变体。
 fn names_in(value: Option<&Value>) -> Vec<String> {
     match value {
         Some(Value::Sequence(items)) => items
             .iter()
-            .filter_map(|item| item.get("name").and_then(Value::as_str).map(str::to_string))
+            .filter_map(|item| {
+                let mapping = item.as_mapping()?;
+                let key = mihomo_key(mapping, "name")?;
+                mapping.get(&key)?.as_str().map(str::to_string)
+            })
             .collect(),
         _ => Vec::new(),
     }
@@ -484,7 +613,10 @@ fn apply_reality_mlkem(proxies: &mut [Value], inject: bool) -> Vec<String> {
             .and_then(|k| m.get(&k))
             .and_then(Value::as_str);
         if fingerprint != Some("chrome") {
-            let name = m.get("name").and_then(Value::as_str).unwrap_or("?");
+            let name = mihomo_key(m, "name")
+                .and_then(|key| m.get(&key))
+                .and_then(Value::as_str)
+                .unwrap_or("?");
             fingerprint_risks.push(name.to_string());
         }
     }
@@ -539,8 +671,11 @@ fn build_group(group: CustomGroup) -> Mapping {
 /// rule-provider 默认刷新间隔(秒):客户端按此间隔回面板托管链接拉取规则集内容。
 const RULE_PROVIDER_INTERVAL: i64 = 86400;
 
-/// 构建一个指向面板托管链接的 http 型 rule-provider 条目。
+/// 构建一个指向面板托管链接的 http 型 rule-provider 条目。路径带 URL 摘要,避免同名
+/// 规则集在不同订阅 token 或上游地址之间共享缓存文件。
 fn build_rule_provider(rp: &RuleProvider) -> Value {
+    let digest = Sha256::digest(rp.url.as_bytes());
+    let short_digest: String = digest[..8].iter().map(|b| format!("{b:02x}")).collect();
     let mut m = Mapping::new();
     m.insert(Value::from("type"), Value::from("http"));
     m.insert(Value::from("behavior"), Value::from(rp.behavior.clone()));
@@ -548,10 +683,39 @@ fn build_rule_provider(rp: &RuleProvider) -> Value {
     m.insert(Value::from("url"), Value::from(rp.url.clone()));
     m.insert(
         Value::from("path"),
-        Value::from(format!("./ruleset/{}.{}", rp.name, rp.format)),
+        Value::from(format!(
+            "./ruleset/{}-{short_digest}.{}",
+            rp.name, rp.format
+        )),
     );
     m.insert(Value::from("interval"), Value::from(RULE_PROVIDER_INTERVAL));
     Value::Mapping(m)
+}
+
+/// 最终输出里任意两个 rule-provider 都不能写入同一路径;同名注入已在合并时覆盖,不在此重复计算。
+fn validate_rule_provider_paths(value: Option<&Value>, errors: &mut Vec<String>) {
+    let Some(Value::Mapping(providers)) = value else {
+        return;
+    };
+    let mut paths = std::collections::HashMap::new();
+    for (name, provider) in providers {
+        let Some(mapping) = provider.as_mapping() else {
+            continue;
+        };
+        let Some(path) = mihomo_key(mapping, "path")
+            .and_then(|key| mapping.get(&key))
+            .and_then(Value::as_str)
+            .filter(|path| !path.is_empty())
+        else {
+            continue;
+        };
+        let name = name.as_str().unwrap_or("?");
+        if let Some(previous) = paths.insert(path, name) {
+            errors.push(format!(
+                "rule-providers `{previous}` and `{name}` have conflicting path `{path}`"
+            ));
+        }
+    }
 }
 
 /// 提取 rules 文本中 `RULE-SET` 规则引用的规则集名(去重、保序),含逻辑规则内嵌套的引用。
@@ -559,10 +723,10 @@ fn build_rule_provider(rp: &RuleProvider) -> Value {
 pub fn ruleset_refs(rules: &str) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     for (_, line) in rule_lines(rules) {
-        let Ok(names) = ruleset_names_in_line(line) else {
+        let Ok(parsed) = parse_rule_line(line) else {
             continue;
         };
-        for name in names {
+        for name in parsed.rule_sets {
             if !out.iter().any(|n| n == &name) {
                 out.push(name);
             }
@@ -575,70 +739,92 @@ pub fn ruleset_refs(rules: &str) -> Vec<String> {
 /// 时面板无法可靠收集内嵌的规则集引用,宁可在校验阶段拒绝也不静默漏注入。
 const MAX_LOGIC_DEPTH: usize = 16;
 
-/// 一行规则引用到的规则集名,含逻辑规则内嵌套的引用;嵌套深度超限返回 `Err(())`。
-///
-/// 镜像 Mihomo 的解析(`rules/common/base.go` 的 `ParseRulePayload` 与 `rules/logic/logic.go`):
-/// 行级按 `,` 朴素切分(每项去空格),逻辑类型的末项是策略目标、中间部分 join 成 payload;
-/// 逻辑 payload 必须是 `(…)` 包裹,括号平衡扫描后只下钻未被其他区间包含的顶层区间,区间内
-/// 按「无目标」格式再解析(`RULE-SET` 的名字在第 2 项);逻辑内部不支持 SUB-RULE/MATCH。
-/// 无法可靠解析的行(括号不平衡、payload 非 `(…)` 包裹等,Mihomo 同样会拒绝)不收集,保持透传。
-fn ruleset_names_in_line(line: &str) -> Result<Vec<String>, ()> {
-    let mut names = Vec::new();
-    let items: Vec<&str> = line.split(',').map(str::trim).collect();
-    let tp = items
-        .first()
-        .map(|s| s.to_ascii_uppercase())
-        .unwrap_or_default();
+#[derive(Debug, PartialEq, Eq)]
+enum RuleLineError {
+    MissingTarget,
+    MissingPayload,
+    InvalidLogicPayload,
+    UnbalancedLogicParentheses,
+    Depth,
+}
+
+struct ParsedRuleLine {
+    /// 需要按代理策略校验的目标;SUB-RULE 的目标是子规则名,故为 None。
+    target: Option<String>,
+    rule_sets: Vec<String>,
+}
+
+/// 镜像 Mihomo `ParseRulePayload`:普通规则目标在第 3 项,MATCH 在第 2 项;逻辑规则及
+/// 三种可含逗号的 REGEX 规则目标在末项,中间部分重新 join 为 payload。
+fn parse_rule_payload(rule_raw: &str, need_target: bool) -> (String, String, String) {
+    let mut items: Vec<&str> = rule_raw.split(',').map(str::trim).collect();
+    let tp = items[0].to_ascii_uppercase();
+    let mut payload = String::new();
+    let mut target = String::new();
+    if items.len() > 1 {
+        match tp.as_str() {
+            "MATCH" => target = items[1].to_string(),
+            "NOT" | "OR" | "AND" | "SUB-RULE" | "DOMAIN-REGEX" | "PROCESS-NAME-REGEX"
+            | "PROCESS-PATH-REGEX" => {
+                if need_target {
+                    target = items.last().unwrap().to_string();
+                    items.pop();
+                }
+                payload = items[1..].join(",");
+            }
+            _ => {
+                payload = items[1].to_string();
+                if need_target && items.len() > 2 {
+                    target = items[2].to_string();
+                }
+            }
+        }
+    }
+    (tp, payload, target)
+}
+
+fn parse_rule_line(line: &str) -> Result<ParsedRuleLine, RuleLineError> {
+    let (tp, payload, target) = parse_rule_payload(line, true);
+    if target.is_empty() {
+        return Err(RuleLineError::MissingTarget);
+    }
+    if tp != "MATCH" && payload.is_empty() {
+        return Err(RuleLineError::MissingPayload);
+    }
+
+    let mut rule_sets = Vec::new();
     match tp.as_str() {
-        "RULE-SET" => {
-            if let Some(name) = items.get(1).filter(|n| !n.is_empty()) {
-                names.push(name.to_string());
-            }
-        }
-        "AND" | "OR" | "NOT" | "SUB-RULE" => {
-            // 不足 3 项时分不出 payload 与目标,Mihomo 同样拒绝;透传不收集。
-            if items.len() < 3 {
-                return Ok(names);
-            }
-            let payload = items[1..items.len() - 1].join(",");
-            // SUB-RULE 的行级 payload 会被 Mihomo 再包一层括号后按逻辑 payload 解析。
-            let payload = if tp == "SUB-RULE" {
-                format!("({payload})")
-            } else {
-                payload
-            };
-            collect_logic_payload(&payload, 1, &mut names)?;
-        }
+        "RULE-SET" => rule_sets.push(payload),
+        "AND" | "OR" | "NOT" => collect_logic_payload(&payload, 1, &mut rule_sets)?,
+        // Mihomo 会把 SUB-RULE 的行级 payload 再包一层括号后按逻辑 payload 解析。
+        "SUB-RULE" => collect_logic_payload(&format!("({payload})"), 1, &mut rule_sets)?,
         _ => {}
     }
-    Ok(names)
+    Ok(ParsedRuleLine {
+        target: (tp != "SUB-RULE").then_some(target),
+        rule_sets,
+    })
 }
 
 /// 逻辑 payload(`(…)` 包裹):对每个顶层区间内的子规则递归收集规则集引用。
-/// payload 非括号包裹或括号不平衡时该行无法可靠解析,放弃下钻(已收集的保留)。
-fn collect_logic_payload(payload: &str, depth: usize, names: &mut Vec<String>) -> Result<(), ()> {
+fn collect_logic_payload(
+    payload: &str,
+    depth: usize,
+    names: &mut Vec<String>,
+) -> Result<(), RuleLineError> {
     if depth > MAX_LOGIC_DEPTH {
-        return Err(());
+        return Err(RuleLineError::Depth);
     }
-    let Some(ranges) = next_level_ranges(payload) else {
-        return Ok(());
-    };
-    for (start, end) in ranges {
-        let sub = &payload[start + 1..end];
-        let items: Vec<&str> = sub.split(',').map(str::trim).collect();
-        let tp = items
-            .first()
-            .map(|s| s.to_ascii_uppercase())
-            .unwrap_or_default();
+    for (start, end) in next_level_ranges(payload)? {
+        let (tp, payload, _) = parse_rule_payload(&payload[start + 1..end], false);
+        if tp != "MATCH" && payload.is_empty() {
+            return Err(RuleLineError::MissingPayload);
+        }
         match tp.as_str() {
-            "RULE-SET" => {
-                if let Some(name) = items.get(1).filter(|n| !n.is_empty()) {
-                    names.push(name.to_string());
-                }
-            }
+            "RULE-SET" => names.push(payload),
             // 逻辑内的逻辑规则没有目标项,payload 是第 2 项起的全部。
-            "AND" | "OR" | "NOT" if items.len() >= 2 => {
-                collect_logic_payload(&items[1..].join(","), depth + 1, names)?;
+            "AND" | "OR" | "NOT" => {
+                collect_logic_payload(&payload, depth + 1, names)?;
             }
             // 逻辑内部不支持 SUB-RULE/MATCH;普通类型与未知类型不含规则集引用。
             _ => {}
@@ -648,24 +834,28 @@ fn collect_logic_payload(payload: &str, depth: usize, names: &mut Vec<String>) -
 }
 
 /// 逻辑 payload 括号平衡扫描后的顶层区间(字节索引,含两端括号)。镜像 Mihomo 的
-/// `format`+`findSubRuleRange`:括号不平衡返回 `None`;跳过恰好覆盖整个 payload 的
-/// 最外层区间(如 `AND,(RULE-SET,ads),DIRECT` 的单括号,Mihomo 同样不下钻),并丢弃
-/// 被已选区间包含的区间。
-fn next_level_ranges(payload: &str) -> Option<Vec<(usize, usize)>> {
+/// `format`+`findSubRuleRange`:跳过恰好覆盖整个 payload 的最外层区间(如
+/// `AND,(RULE-SET,ads),DIRECT` 的单括号,Mihomo 同样不下钻),并丢弃被已选区间包含的区间。
+fn next_level_ranges(payload: &str) -> Result<Vec<(usize, usize)>, RuleLineError> {
     if !payload.starts_with('(') || !payload.ends_with(')') {
-        return None;
+        return Err(RuleLineError::InvalidLogicPayload);
     }
     let mut stack: Vec<usize> = Vec::new();
     let mut ranges: Vec<(usize, usize)> = Vec::new();
     for (i, c) in payload.char_indices() {
         match c {
             '(' => stack.push(i),
-            ')' => ranges.push((stack.pop()?, i)),
+            ')' => {
+                let Some(start) = stack.pop() else {
+                    return Err(RuleLineError::UnbalancedLogicParentheses);
+                };
+                ranges.push((start, i));
+            }
             _ => {}
         }
     }
     if !stack.is_empty() {
-        return None;
+        return Err(RuleLineError::UnbalancedLogicParentheses);
     }
     ranges.sort_by_key(|r| r.0);
     let mut top: Vec<(usize, usize)> = Vec::new();
@@ -677,7 +867,7 @@ fn next_level_ranges(payload: &str) -> Option<Vec<(usize, usize)>> {
             top.push(r);
         }
     }
-    Some(top)
+    Ok(top)
 }
 
 /// 规则行是否是 MATCH 兜底规则(忽略大小写)。导入规则行时据此把新行插到兜底之前:
@@ -698,22 +888,6 @@ fn rule_lines(rules: &str) -> impl Iterator<Item = (usize, &str)> {
             Some((i + 1, line))
         }
     })
-}
-
-/// 规则行的策略目标;当无法可靠解析(逻辑/嵌套规则)、应原样透传不检查时返回 `None`。
-fn rule_target(line: &str) -> Option<String> {
-    // 逻辑/嵌套规则含括号;跳过目标校验。
-    if line.contains('(') {
-        return None;
-    }
-    let parts: Vec<&str> = line.split(',').map(str::trim).collect();
-    let kind = parts.first()?.to_ascii_uppercase();
-    let target = if kind == "MATCH" {
-        parts.get(1)
-    } else {
-        parts.get(2)
-    };
-    target.map(|s| s.to_string())
 }
 
 #[cfg(test)]
@@ -910,10 +1084,10 @@ rules:
     }
 
     #[test]
-    fn logical_rules_pass_through_without_target_validation() {
-        // Contains parentheses: target not parseable, must not error.
+    fn logical_rule_target_is_validated() {
         let rules = "AND,((DOMAIN,x.com),(NETWORK,udp)),Proxy\nMATCH,DIRECT";
-        assert!(convert(input(rules, vec![], vec![])).is_ok());
+        let errs = validation_errors(input(rules, vec![], vec![]));
+        assert!(errs.iter().any(|e| e.contains("unknown policy `Proxy`")));
     }
 
     #[test]
@@ -1100,14 +1274,15 @@ rules:
     }
 
     #[test]
-    fn unbalanced_logic_line_passes_through_without_collection() {
-        // 括号不平衡:Mihomo 拒绝该行,面板无法可靠解析则透传,不收集其引用。
-        assert!(convert(input(
+    fn unbalanced_logic_line_is_rejected() {
+        let errs = validation_errors(input(
             "AND,((RULE-SET,ghost),(NETWORK,tcp),DIRECT\nMATCH,DIRECT",
             vec![],
-            vec![]
-        ))
-        .is_ok());
+            vec![],
+        ));
+        assert!(errs
+            .iter()
+            .any(|e| e.contains("unbalanced logic parentheses")));
     }
 
     #[test]
@@ -1145,6 +1320,15 @@ rules:
         assert!(errs
             .iter()
             .any(|e| e.contains("custom group `a` conflicts")));
+    }
+
+    #[test]
+    fn node_name_conflicting_with_a_provider_proxy_is_rejected() {
+        // 机场代理透传 + 自定义节点追加,同名会让 Mihomo 以 duplicate name 拒绝加载。
+        let errs = validation_errors(input("MATCH,DIRECT", vec![node("hk-1")], vec![]));
+        assert!(errs
+            .iter()
+            .any(|e| e.contains("custom node `hk-1` conflicts with a provider proxy name")));
     }
 
     #[test]
@@ -1361,5 +1545,257 @@ rules:
             reality_opts_of(&output, "unset").unwrap().get(MLKEM_KEY),
             None
         );
+    }
+
+    #[test]
+    fn provider_proxy_shape_and_names_are_validated() {
+        for provider_yaml in [
+            "proxies: {}",
+            "proxies: null",
+            "proxies:\n  - hk-1\n",
+            "proxies:\n  - {}\n",
+            "proxies:\n  - { name: '' }\n",
+            "proxies:\n  - { name: '  ' }\n",
+            "proxies:\n  - { name: 42 }\n",
+        ] {
+            let mut inp = input("MATCH,DIRECT", vec![], vec![]);
+            inp.provider_yaml = provider_yaml;
+            let errs = validation_errors(inp);
+            assert!(!errs.is_empty(), "{provider_yaml}");
+        }
+    }
+
+    #[test]
+    fn provider_proxy_name_accepts_mihomo_key_variants() {
+        let mut inp = input("MATCH,variant", vec![], vec![]);
+        inp.provider_yaml =
+            "proxies:\n  - { Name: variant, type: ss, server: 1.2.3.4, port: 8388 }\n";
+        let root = out(inp);
+        assert_eq!(names_in(root.get("proxies")), vec!["variant"]);
+    }
+
+    #[test]
+    fn duplicate_names_are_rejected_within_each_output_section() {
+        let mut inp = input("MATCH,DIRECT", vec![], vec![]);
+        inp.provider_yaml = "proxies:\n  - { Name: dup, type: ss }\n  - { name: dup, type: ss }\n";
+        assert!(validation_errors(inp)
+            .iter()
+            .any(|e| e.contains("duplicate provider proxy name `dup`")));
+
+        let errs = validation_errors(input(
+            "MATCH,DIRECT",
+            vec![node("dup"), node("dup")],
+            vec![group("G", &["hk-1"]), group("G", &["hk-1"])],
+        ));
+        assert!(errs
+            .iter()
+            .any(|e| e.contains("duplicate custom node name `dup`")));
+        assert!(errs
+            .iter()
+            .any(|e| e.contains("duplicate custom group name `G`")));
+    }
+
+    #[test]
+    fn reality_risk_uses_the_effective_variant_name() {
+        let mut inp = input("MATCH,DIRECT", vec![], vec![]);
+        inp.provider_yaml = "proxies:\n  - { Name: variant, type: vless, client-fingerprint: firefox, reality-opts: { public-key: pk } }\n";
+        let output = convert(inp).expect("conversion succeeds");
+        assert_eq!(output.reality_fingerprint_risks, vec!["variant"]);
+    }
+
+    fn managed_provider_path(url: &str) -> String {
+        let mut inp = input("MATCH,DIRECT", vec![], vec![]);
+        inp.rule_providers = vec![RuleProvider {
+            name: "mine".into(),
+            behavior: "domain".into(),
+            format: "yaml".into(),
+            url: url.into(),
+        }];
+        let root = out(inp);
+        root.get("rule-providers")
+            .and_then(|providers| providers.get("mine"))
+            .and_then(|provider| provider.get("path"))
+            .and_then(Value::as_str)
+            .unwrap()
+            .to_string()
+    }
+
+    #[test]
+    fn managed_rule_provider_path_contains_a_url_digest() {
+        let first = managed_provider_path("https://panel.example/token-a/ruleset");
+        let second = managed_provider_path("https://panel.example/token-b/ruleset");
+        assert_ne!(first, second);
+        assert_eq!(
+            first,
+            managed_provider_path("https://panel.example/token-a/ruleset")
+        );
+
+        let digest = Sha256::digest(b"https://panel.example/token-a/ruleset");
+        let short_digest: String = digest[..8].iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(first, format!("./ruleset/mine-{short_digest}.yaml"));
+    }
+
+    #[test]
+    fn final_rule_provider_paths_must_be_unique() {
+        let mut inp = input("MATCH,DIRECT", vec![], vec![]);
+        inp.provider_yaml = "rule-providers:\n  first: { type: http, url: https://example.com/a, path: ./ruleset/shared.yaml }\n  second: { type: http, url: https://example.com/b, path: ./ruleset/shared.yaml }\n";
+        let errs = validation_errors(inp);
+        assert!(errs.iter().any(|e| e.contains("conflicting path")));
+
+        let managed_path = managed_provider_path("https://panel.example/token/ruleset");
+        let provider_yaml = format!(
+            "rule-providers:\n  upstream: {{ type: http, url: https://example.com/a, path: {managed_path} }}\n"
+        );
+        let mut inp = input("MATCH,DIRECT", vec![], vec![]);
+        inp.provider_yaml = &provider_yaml;
+        inp.rule_providers = vec![RuleProvider {
+            name: "mine".into(),
+            behavior: "domain".into(),
+            format: "yaml".into(),
+            url: "https://panel.example/token/ruleset".into(),
+        }];
+        let errs = validation_errors(inp);
+        assert!(errs
+            .iter()
+            .any(|e| e.contains("upstream") && e.contains("mine")));
+    }
+
+    #[test]
+    fn rule_and_group_builtin_targets_are_distinct() {
+        assert!(convert(input(
+            "DOMAIN,x.com,PASS-RULE\nMATCH,GLOBAL",
+            vec![],
+            vec![]
+        ))
+        .is_ok());
+
+        // PASS-RULE 是内置代理,组成员可以直接引用。
+        assert!(convert(input("MATCH,G", vec![], vec![group("G", &["PASS-RULE"])])).is_ok());
+
+        let errs = validation_errors(input("MATCH,DIRECT", vec![], vec![group("G", &["GLOBAL"])]));
+        assert!(errs.iter().any(|e| e.contains("unknown member `GLOBAL`")));
+
+        assert!(convert(input(
+            "MATCH,G",
+            vec![],
+            vec![group("GLOBAL", &["hk-1"]), group("G", &["GLOBAL"])],
+        ))
+        .is_ok());
+    }
+
+    #[test]
+    fn parse_rule_payload_targets_cover_comma_payloads_and_sub_rules() {
+        let rules = "MATCH,PASS-RULE\n\
+                     DOMAIN,x.com,DIRECT\n\
+                     DOMAIN-REGEX,^foo,bar$,DIRECT\n\
+                     PROCESS-NAME-REGEX,^foo,bar$,DIRECT\n\
+                     PROCESS-PATH-REGEX,^foo,bar$,DIRECT\n\
+                     AND,((DOMAIN,x.com),(NETWORK,udp)),DIRECT\n\
+                     OR,((DOMAIN,x.com),(NETWORK,udp)),DIRECT\n\
+                     NOT,((DOMAIN,x.com)),DIRECT\n\
+                     SUB-RULE,(DOMAIN,x.com,DIRECT),Ghost";
+        assert!(convert(input(rules, vec![], vec![])).is_ok());
+    }
+
+    #[test]
+    fn comma_payload_and_logic_rules_reject_unknown_targets() {
+        for line in [
+            "DOMAIN-REGEX,^foo,bar$,Ghost",
+            "PROCESS-NAME-REGEX,^foo,bar$,Ghost",
+            "PROCESS-PATH-REGEX,^foo,bar$,Ghost",
+            "AND,((DOMAIN,x.com)),Ghost",
+            "OR,((DOMAIN,x.com)),Ghost",
+            "NOT,((DOMAIN,x.com)),Ghost",
+        ] {
+            let errs = validation_errors(input(line, vec![], vec![]));
+            assert!(
+                errs.iter().any(|e| e.contains("unknown policy `Ghost`")),
+                "{line}: {errs:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn rules_without_targets_are_rejected() {
+        for line in ["MATCH", "DOMAIN,x.com", "AND", "DOMAIN-REGEX"] {
+            let errs = validation_errors(input(line, vec![], vec![]));
+            assert!(
+                errs.iter().any(|e| e.contains("missing a target")),
+                "{line}: {errs:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn empty_groups_require_an_include_all_proxies_source() {
+        let errs = validation_errors(input("MATCH,DIRECT", vec![], vec![group("Empty", &[])]));
+        assert!(errs.iter().any(|e| e.contains("must have members")));
+
+        for options in [
+            serde_json::json!({"include-all-proxies": true}),
+            serde_json::json!({"include-all": true}),
+            serde_json::json!({"include_all_proxies": 1}),
+        ] {
+            let mut empty = group("Empty", &[]);
+            empty.options = Some(options);
+            assert!(convert(input("MATCH,DIRECT", vec![], vec![empty])).is_ok());
+        }
+    }
+
+    #[test]
+    fn stripped_proxy_provider_dependencies_are_rejected() {
+        for options in [
+            serde_json::json!({"use": ["remote"]}),
+            serde_json::json!({"include-all-providers": true}),
+        ] {
+            let mut dependent = group("Dependent", &["hk-1"]);
+            dependent.options = Some(options);
+            let errs = validation_errors(input("MATCH,DIRECT", vec![], vec![dependent]));
+            assert!(errs
+                .iter()
+                .any(|e| e.contains("depends on proxy-providers")));
+        }
+
+        let mut independent = group("Independent", &["hk-1"]);
+        independent.options = Some(serde_json::json!({"use": []}));
+        assert!(convert(input("MATCH,DIRECT", vec![], vec![independent])).is_ok());
+    }
+
+    #[test]
+    fn empty_fallback_must_be_a_known_non_group_proxy() {
+        for target in ["DIRECT", "PASS-RULE", "COMPATIBLE", "hk-1"] {
+            let mut fallback = group("Fallback", &["hk-1"]);
+            fallback.options = Some(serde_json::json!({"empty-fallback": target}));
+            assert!(convert(input("MATCH,DIRECT", vec![], vec![fallback])).is_ok());
+        }
+
+        for target in ["GLOBAL", "OtherGroup", "ghost"] {
+            let mut fallback = group("Fallback", &["hk-1"]);
+            fallback.options = Some(serde_json::json!({"empty-fallback": target}));
+            let errs = validation_errors(input(
+                "MATCH,DIRECT",
+                vec![],
+                vec![fallback, group("OtherGroup", &["hk-1"])],
+            ));
+            assert!(
+                errs.iter().any(|e| e.contains("empty-fallback")),
+                "{target}: {errs:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn group_types_are_checked_against_current_mihomo() {
+        for group_type in ["select", "url-test", "fallback", "load-balance"] {
+            let mut supported = group("G", &["hk-1"]);
+            supported.group_type = group_type.into();
+            assert!(convert(input("MATCH,G", vec![], vec![supported])).is_ok());
+        }
+        for group_type in ["relay", "smart", ""] {
+            let mut unsupported = group("G", &["hk-1"]);
+            unsupported.group_type = group_type.into();
+            let errs = validation_errors(input("MATCH,DIRECT", vec![], vec![unsupported]));
+            assert!(errs.iter().any(|e| e.contains("unsupported type")));
+        }
     }
 }

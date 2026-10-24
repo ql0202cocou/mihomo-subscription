@@ -159,3 +159,30 @@ async fn reserved_builtin_names_are_rejected() {
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "name={name}");
     }
 }
+
+#[tokio::test]
+async fn concurrent_create_allocates_contiguous_positions() {
+    let temp = TempDb::new();
+    let state = test_state(&temp).await;
+    let app = build_router(state.clone());
+    let cookie = login(&app).await;
+
+    let mut tasks = Vec::new();
+    for index in 0..8 {
+        let app = app.clone();
+        let cookie = cookie.clone();
+        tasks.push(tokio::spawn(async move {
+            create_node(&app, &cookie, &format!("node-{index}")).await;
+        }));
+    }
+    for task in tasks {
+        task.await.unwrap();
+    }
+
+    let positions: Vec<i64> =
+        sqlx::query_scalar("SELECT position FROM global_nodes ORDER BY position")
+            .fetch_all(&state.db)
+            .await
+            .unwrap();
+    assert_eq!(positions, (0..8).collect::<Vec<_>>());
+}

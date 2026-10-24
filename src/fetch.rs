@@ -4,12 +4,12 @@
 //! 并把 reqwest 固定到那个已校验的确切 IP,使后来的 DNS 应答无法改向连接(DNS 重绑定安全)。
 //! 响应体按流式字节上限读取,而非信任 `Content-Length`。见 `docs/architecture.md`「安全设计」。
 
-use std::net::SocketAddr;
+use std::net::{SocketAddr, ToSocketAddrs};
 use std::time::{Duration, Instant};
 
 use reqwest::header::{ACCEPT, CONTENT_TYPE, LOCATION};
 use reqwest::redirect::Policy;
-use tokio::net::lookup_host;
+use tokio::sync::Semaphore;
 use url::{Host, Url};
 
 use crate::ssrf::{self, SsrfError};
@@ -209,6 +209,8 @@ fn remaining(deadline: Instant) -> Result<Duration, FetchError> {
         .ok_or(FetchError::Timeout)
 }
 
+static DNS_LOOKUP_PERMITS: Semaphore = Semaphore::const_new(32);
+
 /// 把 URL 主机解析为单个已校验、可连接的 socket 地址。
 async fn resolve_validated(url: &Url) -> Result<SocketAddr, FetchError> {
     let port = url.port_or_known_default().unwrap_or(80);
@@ -216,9 +218,14 @@ async fn resolve_validated(url: &Url) -> Result<SocketAddr, FetchError> {
         Host::Ipv4(ip) => ok_if_allowed((ip, port).into()),
         Host::Ipv6(ip) => ok_if_allowed((ip, port).into()),
         Host::Domain(domain) => {
-            let candidates = lookup_host((domain, port))
-                .await
-                .map_err(|_| FetchError::Dns)?;
+            let domain = domain.to_string();
+            let candidates = run_dns_task(move || {
+                (domain.as_str(), port)
+                    .to_socket_addrs()
+                    .map(|candidates| candidates.collect::<Vec<_>>())
+                    .map_err(|_| FetchError::Dns)
+            })
+            .await?;
             let mut saw_any = false;
             for addr in candidates {
                 saw_any = true;
@@ -233,6 +240,23 @@ async fn resolve_validated(url: &Url) -> Result<SocketAddr, FetchError> {
             }
         }
     }
+}
+
+async fn run_dns_task<T, F>(task: F) -> Result<T, FetchError>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, FetchError> + Send + 'static,
+{
+    let permit = DNS_LOOKUP_PERMITS
+        .acquire()
+        .await
+        .map_err(|_| FetchError::Dns)?;
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        task()
+    })
+    .await
+    .map_err(|_| FetchError::Dns)?
 }
 
 fn ok_if_allowed(addr: SocketAddr) -> Result<SocketAddr, FetchError> {
@@ -277,14 +301,22 @@ async fn read_limited_bytes(
     Ok(buf)
 }
 
-/// 仅当 `subscription-userinfo` 值是单行且不含控制字符(头注入安全)时才接受,
-/// 见 `docs/architecture.md`「安全设计」。
+/// 仅接受不超过 512 字节的标准 `subscription-userinfo` 分号列表。
 fn validate_userinfo(value: &str) -> Option<String> {
-    if value.is_empty() || value.chars().any(|c| c.is_control()) {
-        None
-    } else {
-        Some(value.to_string())
+    if value.len() > 512 || value.chars().any(|c| c.is_control()) {
+        return None;
     }
+    for field in value.split(';') {
+        let (key, val) = field.split_once('=')?;
+        if !matches!(key.trim(), "upload" | "download" | "total" | "expire") {
+            return None;
+        }
+        let val = val.trim();
+        if val.is_empty() || !val.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+    }
+    Some(value.to_string())
 }
 
 fn classify_reqwest(err: reqwest::Error) -> FetchError {
@@ -327,13 +359,39 @@ mod tests {
     }
 
     #[test]
-    fn sanitize_rejects_control_characters() {
+    fn sanitize_accepts_standard_userinfo() {
+        let value = "upload=1; download=2; total=3; expire=4";
+        assert_eq!(validate_userinfo(value), Some(value.to_string()));
+    }
+
+    #[test]
+    fn sanitize_rejects_malformed_userinfo() {
+        for value in [
+            "inject\r\nSet-Cookie: x",
+            "",
+            "garbage",
+            "upload=1; garbage",
+            "upload=; download=1",
+            "=1",
+            "upload=1.5",
+            "upload=１",
+            "Upload=1",
+            "unknown=1",
+            "upload=1;",
+        ] {
+            assert_eq!(validate_userinfo(value), None, "{value:?}");
+        }
+    }
+
+    #[test]
+    fn sanitize_limits_userinfo_to_512_bytes() {
+        let max = format!("upload={}", "1".repeat(505));
+        assert_eq!(max.len(), 512);
+        assert_eq!(validate_userinfo(&max), Some(max));
         assert_eq!(
-            validate_userinfo("upload=1; download=2; total=3"),
-            Some("upload=1; download=2; total=3".to_string())
+            validate_userinfo(&format!("upload={}", "1".repeat(506))),
+            None
         );
-        assert_eq!(validate_userinfo("inject\r\nSet-Cookie: x"), None);
-        assert_eq!(validate_userinfo(""), None);
     }
 
     #[tokio::test]
@@ -364,5 +422,31 @@ mod tests {
         .await
         .unwrap_err();
         assert!(matches!(err, FetchError::Ssrf(SsrfError::BlockedIp)));
+    }
+
+    #[tokio::test]
+    async fn dns_tasks_bound_running_blocking_work() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let active = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let mut tasks = Vec::new();
+        for _ in 0..40 {
+            let active = Arc::clone(&active);
+            let peak = Arc::clone(&peak);
+            tasks.push(tokio::spawn(run_dns_task(move || {
+                let current = active.fetch_add(1, Ordering::SeqCst) + 1;
+                peak.fetch_max(current, Ordering::SeqCst);
+                std::thread::sleep(Duration::from_millis(2));
+                active.fetch_sub(1, Ordering::SeqCst);
+                Ok(())
+            })));
+        }
+        for task in tasks {
+            task.await.unwrap().unwrap();
+        }
+        assert!(peak.load(Ordering::SeqCst) <= 32);
+        assert_eq!(active.load(Ordering::SeqCst), 0);
     }
 }

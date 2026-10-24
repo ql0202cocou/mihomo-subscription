@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use sqlx::FromRow;
 
 use crate::app::AppState;
-use crate::error::{ApiError, ApiResult};
+use crate::error::{ApiError, ApiJson, ApiResult};
 use crate::util::{now, MAX_ORDER_ENTRIES, MAX_ORDER_NAME_LEN};
 use crate::yaml;
 
@@ -113,15 +113,16 @@ pub async fn list(State(state): State<Arc<AppState>>) -> ApiResult<impl IntoResp
 /// `POST /api/global-nodes` —— 新增节点,落在顺序末尾。
 pub async fn create(
     State(state): State<Arc<AppState>>,
-    Json(body): Json<NodeBody>,
+    ApiJson(body): ApiJson<NodeBody>,
 ) -> ApiResult<impl IntoResponse> {
     validate_node(&body)?;
     let id = uuid::Uuid::new_v4().to_string();
     let ts = now();
-    // 新节点落在自定义块末尾(max position + 1)。
+    // 新节点落在自定义块末尾(max position + 1);立即事务避免并发创建占用同一位置。
+    let mut tx = state.db.begin_with("BEGIN IMMEDIATE").await?;
     let position =
         sqlx::query_scalar::<_, i64>("SELECT COALESCE(MAX(position), -1) + 1 FROM global_nodes")
-            .fetch_one(&state.db)
+            .fetch_one(&mut *tx)
             .await?;
     sqlx::query(
         "INSERT INTO global_nodes (id, name, node_type, content, enabled, position, created_at, updated_at)
@@ -135,8 +136,9 @@ pub async fn create(
     .bind(position)
     .bind(&ts)
     .bind(&ts)
-    .execute(&state.db)
+    .execute(&mut *tx)
     .await?;
+    tx.commit().await?;
     let row = fetch_one(&state, &id).await?;
     Ok((StatusCode::CREATED, Json(node_response(row))))
 }
@@ -145,7 +147,7 @@ pub async fn create(
 pub async fn update(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
-    Json(body): Json<NodeBody>,
+    ApiJson(body): ApiJson<NodeBody>,
 ) -> ApiResult<impl IntoResponse> {
     let _ = fetch_one(&state, &id).await?; // 先确认存在:不存在直接 404,不进入校验
     validate_node(&body)?;
@@ -192,7 +194,7 @@ pub struct ReorderBody {
 /// 离线重生成,不重拉机场)。
 pub async fn set_order(
     State(state): State<Arc<AppState>>,
-    Json(body): Json<ReorderBody>,
+    ApiJson(body): ApiJson<ReorderBody>,
 ) -> ApiResult<impl IntoResponse> {
     if body.order.len() > MAX_ORDER_ENTRIES {
         return Err(ApiError::BadRequest(format!(
@@ -205,19 +207,18 @@ pub async fn set_order(
         )));
     }
 
-    // 算出完整目标顺序:请求的名字在前,其余按当前顺序追加(语义同 per-profile 排序端点)。
-    let mut names: Vec<String> = sqlx::query_scalar::<_, String>(
-        "SELECT name FROM global_nodes ORDER BY position ASC, name ASC",
-    )
-    .fetch_all(&state.db)
-    .await?;
-    crate::converter::reorder_by_name(&mut names, |s| Some(s.as_str()), &body.order);
+    // 立即事务固定名称快照;按不可变 ID 更新,避免并发改名导致漏行。
+    let mut tx = state.db.begin_with("BEGIN IMMEDIATE").await?;
+    let mut rows: Vec<(String, String)> =
+        sqlx::query_as("SELECT id, name FROM global_nodes ORDER BY position ASC, name ASC")
+            .fetch_all(&mut *tx)
+            .await?;
+    crate::converter::reorder_by_name(&mut rows, |(_, name)| Some(name.as_str()), &body.order);
 
-    let mut tx = state.db.begin().await?;
-    for (position, name) in names.iter().enumerate() {
-        sqlx::query("UPDATE global_nodes SET position = ? WHERE name = ?")
+    for (position, (id, _)) in rows.iter().enumerate() {
+        sqlx::query("UPDATE global_nodes SET position = ? WHERE id = ?")
             .bind(position as i64)
-            .bind(name)
+            .bind(id)
             .execute(&mut *tx)
             .await?;
     }

@@ -1,9 +1,9 @@
 //! 反向代理后的客户端 IP 推导。
 //!
 //! 服务跑在 1Panel 反向代理后,故 TCP 对端是代理而非客户端。按 `docs/architecture.md`「安全设计」:
-//! 只信任来自显式可信代理网段的 `X-Forwarded-For`,并从右往左数——有 `trusted_hops` 个代理时,
-//! 客户端是从末尾起第 `trusted_hops` 个条目,故攻击者在左侧拼接的伪造条目不会被误当成客户端。
-//! 头缺失、过短、或 TCP 对端不在可信代理网段时回退到 TCP 对端。
+//! 只信任来自显式可信代理网段的 `X-Forwarded-For`,并从右往左验证预期代理链——有
+//! `trusted_hops` 个代理时,客户端是从末尾起第 `trusted_hops` 个条目,其右侧条目必须是可信代理。
+//! 头缺失、过短、代理链不符、或 TCP 对端不在可信代理网段时回退到 TCP 对端。
 
 use std::net::IpAddr;
 
@@ -26,8 +26,13 @@ pub fn client_ip(
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
                 .collect();
-            // 客户端位于从右数第 `trusted_hops` 个;至少要有这么多条目,否则视为头格式错误/伪造。
             if entries.len() >= trusted_hops {
+                for proxy in entries.iter().rev().take(trusted_hops - 1) {
+                    match proxy.parse::<IpAddr>() {
+                        Ok(ip) if trusted_proxy_cidrs.iter().any(|net| net.contains(&ip)) => {}
+                        _ => return peer,
+                    }
+                }
                 if let Ok(ip) = entries[entries.len() - trusted_hops].parse::<IpAddr>() {
                     return Some(ip);
                 }
@@ -107,6 +112,41 @@ mod tests {
                 &[net("10.0.0.0/8")]
             ),
             Some(ip("203.0.113.9"))
+        );
+    }
+
+    #[test]
+    fn short_proxy_chain_cannot_select_spoofed_left_entry() {
+        assert_eq!(
+            client_ip(
+                Some("1.1.1.1, 203.0.113.9"),
+                Some(ip("10.0.0.1")),
+                2,
+                &[net("10.0.0.0/8")]
+            ),
+            Some(ip("10.0.0.1"))
+        );
+    }
+
+    #[test]
+    fn validates_every_expected_proxy_from_right_to_left() {
+        assert_eq!(
+            client_ip(
+                Some("1.1.1.1, 203.0.113.9, 10.0.0.3, 10.0.0.2"),
+                Some(ip("10.0.0.1")),
+                3,
+                &[net("10.0.0.0/8")]
+            ),
+            Some(ip("203.0.113.9"))
+        );
+        assert_eq!(
+            client_ip(
+                Some("203.0.113.9, 192.0.2.1, 10.0.0.2"),
+                Some(ip("10.0.0.1")),
+                3,
+                &[net("10.0.0.0/8")]
+            ),
+            Some(ip("10.0.0.1"))
         );
     }
 

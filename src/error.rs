@@ -1,11 +1,30 @@
 //! API 错误类型,映射到文档约定的错误信封与状态码(见 `docs/architecture.md`「API 设计」)。
 
 use axum::{
+    extract::{FromRequest, Request},
     http::StatusCode,
     response::{IntoResponse, Response},
     Json,
 };
-use serde::Serialize;
+use serde::{de::DeserializeOwned, Serialize};
+
+/// JSON 请求提取器:所有框架级格式/类型/Content-Type 错误统一走 API 错误信封。
+pub struct ApiJson<T>(pub T);
+
+impl<S, T> FromRequest<S> for ApiJson<T>
+where
+    S: Send + Sync,
+    T: DeserializeOwned,
+{
+    type Rejection = ApiError;
+
+    async fn from_request(req: Request, state: &S) -> Result<Self, Self::Rejection> {
+        Json::<T>::from_request(req, state)
+            .await
+            .map(|Json(value)| Self(value))
+            .map_err(|_| ApiError::BadRequest("Invalid JSON request body".into()))
+    }
+}
 
 #[derive(Debug)]
 pub enum ApiError {

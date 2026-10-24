@@ -27,15 +27,28 @@ pub async fn get(State(state): State<Arc<AppState>>) -> ApiResult<impl IntoRespo
 /// (规则草稿未通过校验的 profile 回退到最近一份合法规则,仍无法迁移的清空缓存,见
 /// `generate::regenerate_for_rotation`)。
 pub async fn reset_public_path(State(state): State<Arc<AppState>>) -> ApiResult<impl IntoResponse> {
-    let prefix = random_path_prefix();
-    sqlx::query("UPDATE app_settings SET public_path_prefix = ?, updated_at = ? WHERE id = 1")
-        .bind(&prefix)
-        .bind(now())
-        .execute(&state.db)
+    let prefix = state
+        .keyed_lock
+        .run("settings:public-prefix", async {
+            let prefix = random_path_prefix();
+            let mut tx = state.db.begin().await?;
+            sqlx::query(
+                "UPDATE app_settings SET public_path_prefix = ?, updated_at = ? WHERE id = 1",
+            )
+            .bind(&prefix)
+            .bind(now())
+            .execute(&mut *tx)
+            .await?;
+            sqlx::query("UPDATE profiles SET public_refresh_at = NULL")
+                .execute(&mut *tx)
+                .await?;
+            tx.commit().await?;
+            // 公开端点校验读的是内存中的前缀,落库后必须同步,使新前缀免重启立即生效。
+            state.set_prefix(prefix.clone());
+            crate::generate::regenerate_all_for_rotation(&state).await;
+            Ok::<_, crate::error::ApiError>(prefix)
+        })
         .await?;
-    // 公开端点校验读的是内存中的前缀,落库后必须同步,使新前缀免重启立即生效。
-    state.set_prefix(prefix.clone());
-    crate::generate::regenerate_all_for_rotation(&state).await;
     Ok(Json(SettingsResponse {
         public_path_prefix: prefix,
     }))

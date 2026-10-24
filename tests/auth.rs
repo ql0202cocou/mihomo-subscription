@@ -238,3 +238,34 @@ async fn missing_origin_on_state_change_is_forbidden() {
 
     assert_eq!(resp.status(), StatusCode::FORBIDDEN);
 }
+
+#[tokio::test]
+async fn malformed_login_json_uses_the_api_error_envelope() {
+    let temp = TempDb::new();
+    let app = build_router(test_state(&temp).await);
+
+    for body in ["{", r#"{"username":7,"password":"s3cret"}"#] {
+        let resp = app
+            .clone()
+            .oneshot(same_origin_post("/api/auth/login", Body::from(body)))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(resp.headers()[header::CACHE_CONTROL], "no-store");
+        let body = common::json(resp).await;
+        assert_eq!(body["error"]["code"], "bad_request");
+    }
+
+    let resp = app
+        .oneshot(
+            Request::post("/api/auth/login")
+                .header(header::HOST, "sub.example.com")
+                .header(header::ORIGIN, "https://sub.example.com")
+                .body(login_body("admin", "s3cret"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(common::json(resp).await["error"]["code"], "bad_request");
+}

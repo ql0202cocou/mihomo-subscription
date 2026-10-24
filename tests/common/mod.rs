@@ -72,6 +72,13 @@ pub async fn test_state_with_fetcher(
     fetcher: Arc<dyn RemoteFetcher>,
 ) -> Arc<AppState> {
     let pool = temp.pool().await;
+    sqlx::query(
+        "INSERT INTO app_settings (id, public_path_prefix, updated_at) VALUES (1, 'testprefix', 'now') \
+         ON CONFLICT(id) DO UPDATE SET public_path_prefix = 'testprefix'",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
     Arc::new(AppState {
         db: pool,
         public_base_url: "https://sub.example.com".into(),

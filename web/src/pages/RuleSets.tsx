@@ -175,7 +175,9 @@ export default function RuleSets() {
     void load(); // 以服务端为准;保存失败时即回到服务端实际持有的顺序
   }
 
-  const formatOptions = form.source === "remote" ? REMOTE_FORMATS : MANUAL_FORMATS;
+  const formatOptions = (form.source === "remote" ? REMOTE_FORMATS : MANUAL_FORMATS).filter(
+    (format) => form.behavior !== "classical" || format !== "mrs",
+  );
 
   return (
     <div className="page">
@@ -231,7 +233,13 @@ export default function RuleSets() {
               <TypeChips
                 options={BEHAVIORS}
                 value={form.behavior}
-                onChange={(v) => setForm({ ...form, behavior: v })}
+                onChange={(v) =>
+                  setForm({
+                    ...form,
+                    behavior: v,
+                    format: v === "classical" && form.format === "mrs" ? "yaml" : form.format,
+                  })
+                }
               />
             </div>
             <div>
