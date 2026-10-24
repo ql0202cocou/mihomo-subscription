@@ -247,7 +247,7 @@ export function AdvancedFields({
   }));
 
   return (
-    <>
+    <div className="advanced-fields">
       <Divider titlePlacement="start" plain>
         {t("fields.advanced")}
       </Divider>
@@ -258,7 +258,7 @@ export function AdvancedFields({
         const conflict = r.key.trim() !== "" && skipped.has(r.id);
         return (
           <div key={r.id} style={{ marginBottom: 8 }}>
-            <Space align="start" style={{ display: "flex" }}>
+            <Space align="start" wrap style={{ display: "flex" }}>
               <Input
                 style={{ width: 160 }}
                 placeholder={t("fields.key")}
@@ -295,7 +295,7 @@ export function AdvancedFields({
       >
         {t("fields.addField")}
       </Button>
-    </>
+    </div>
   );
 }
 

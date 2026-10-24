@@ -42,3 +42,28 @@
   font-weight: 600;
   margin-bottom: 8px;
 }
+
+/* 长表单按弹窗内容区宽度分栏,逻辑区块和高级字段始终独占整行。 */
+.form-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  column-gap: 16px;
+}
+.form-grid > * {
+  min-width: 0;
+}
+.form-grid-span,
+.form-grid > .modal-block,
+.form-grid > .advanced-fields {
+  grid-column: 1 / -1;
+}
+@container form-modal (min-width: 480px) {
+  .form-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+@container form-modal (min-width: 760px) {
+  .form-grid {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+}

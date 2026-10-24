@@ -152,11 +152,12 @@ export default function GlobalNodes() {
       </div>
 
       <Modal
+        className="form-modal"
         title={editing ? t("nodes.edit") : t("nodes.add")}
         open={open}
         onCancel={() => setOpen(false)}
         onOk={save}
-        width={680}
+        width={960}
         okText={t("common.save")}
         cancelText={t("common.cancel")}
         destroyOnHidden

@@ -611,6 +611,7 @@ export default function RulesCard({
       <div className="dcard-note">{t("rules.dragHint")}</div>
 
       <Modal
+        className="form-modal"
         open={modalOpen}
         title={editing === null ? t("rules.add") : t("rules.edit")}
         onOk={submit}
@@ -627,6 +628,7 @@ export default function RulesCard({
       </Modal>
 
       <Modal
+        className="form-modal"
         open={importHostedOpen}
         title={t("rules.importHosted")}
         onOk={doImportHosted}

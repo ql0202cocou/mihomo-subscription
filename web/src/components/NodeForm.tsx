@@ -112,7 +112,7 @@ export default function NodeForm({ value, onChange }: Props) {
   }
 
   return (
-    <Form layout="vertical">
+    <Form layout="vertical" className="form-grid">
       <Form.Item label={t("nodes.name")} required>
         <Input
           value={value.name}
@@ -165,17 +165,19 @@ export default function NodeForm({ value, onChange }: Props) {
                   {t(`nodeHints.${group.key}`)}
                 </Typography.Paragraph>
               )}
-              {group.fields
-                .filter((sub) => !sub.showWhen || sub.showWhen(value.fields))
-                .map((sub) => (
-                  <Form.Item key={sub.key} label={fieldLabel(sub)} style={{ marginBottom: 12 }}>
-                    <FieldInput
-                      def={sub}
-                      value={getPath(nested, sub.key)}
-                      onChange={(v) => setGroupField(group.key, sub.key, v)}
-                    />
-                  </Form.Item>
-                ))}
+              <div className="form-grid">
+                {group.fields
+                  .filter((sub) => !sub.showWhen || sub.showWhen(value.fields))
+                  .map((sub) => (
+                    <Form.Item key={sub.key} label={fieldLabel(sub)} style={{ marginBottom: 12 }}>
+                      <FieldInput
+                        def={sub}
+                        value={getPath(nested, sub.key)}
+                        onChange={(v) => setGroupField(group.key, sub.key, v)}
+                      />
+                    </Form.Item>
+                  ))}
+              </div>
             </div>
           );
         })}

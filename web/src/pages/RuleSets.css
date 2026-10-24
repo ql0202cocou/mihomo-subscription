@@ -67,10 +67,8 @@
   font-size: 13px;
   color: var(--text-2);
 }
-.rs-grid2 {
-  display: grid;
-  grid-template-columns: 1fr 1fr;
-  gap: 14px;
+.rs-form .form-grid {
+  row-gap: 14px;
 }
 .rs-section {
   background: var(--bg-subtle);

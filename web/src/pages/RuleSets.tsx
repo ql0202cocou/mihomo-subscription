@@ -210,24 +210,26 @@ export default function RuleSets() {
       </div>
 
       <Modal
+        className="form-modal"
         title={editing ? t("ruleSets.edit") : t("ruleSets.add")}
         open={open}
         onCancel={() => setOpen(false)}
         onOk={save}
-        width={600}
+        width={960}
         okText={t("common.save")}
         cancelText={t("common.cancel")}
         destroyOnHidden
       >
         <div className="rs-form">
-          <label className="rs-label">{t("ruleSets.name")}</label>
-          <Input
-            value={form.name}
-            placeholder={t("ruleSets.namePlaceholder")}
-            onChange={(e) => setForm({ ...form, name: e.target.value })}
-          />
-
-          <div className="rs-grid2">
+          <div className="form-grid">
+            <div>
+              <label className="rs-label">{t("ruleSets.name")}</label>
+              <Input
+                value={form.name}
+                placeholder={t("ruleSets.namePlaceholder")}
+                onChange={(e) => setForm({ ...form, name: e.target.value })}
+              />
+            </div>
             <div>
               <label className="rs-label">{t("ruleSets.behavior")}</label>
               <TypeChips
@@ -250,15 +252,16 @@ export default function RuleSets() {
                 onChange={(v) => setForm({ ...form, format: v })}
               />
             </div>
+            <div className="form-grid-span">
+              <label className="rs-label">{t("ruleSets.source")}</label>
+              <TypeChips
+                options={SOURCES}
+                value={form.source}
+                onChange={(v) => setSource(v as "manual" | "remote")}
+                labels={{ manual: t("ruleSets.sourceManual"), remote: t("ruleSets.sourceRemote") }}
+              />
+            </div>
           </div>
-
-          <label className="rs-label">{t("ruleSets.source")}</label>
-          <TypeChips
-            options={SOURCES}
-            value={form.source}
-            onChange={(v) => setSource(v as "manual" | "remote")}
-            labels={{ manual: t("ruleSets.sourceManual"), remote: t("ruleSets.sourceRemote") }}
-          />
 
           {form.source === "manual" ? (
             <div className="rs-section">

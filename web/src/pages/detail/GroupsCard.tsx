@@ -301,16 +301,17 @@ export default function GroupsCard({
       <div className="dcard-note">{t("groups.dragHint")}</div>
 
       <Modal
+        className="form-modal"
         title={editing ? t("groups.edit") : t("groups.add")}
         open={open}
         onCancel={() => setOpen(false)}
         onOk={save}
-        width={560}
+        width={960}
         okText={t("common.save")}
         cancelText={t("common.cancel")}
         destroyOnHidden
       >
-        <Form layout="vertical">
+        <Form layout="vertical" className="form-grid">
           <Form.Item label={t("groups.name")} required>
             <Input value={name} onChange={(e) => setName(e.target.value)} />
           </Form.Item>
@@ -321,7 +322,11 @@ export default function GroupsCard({
               onChange={(v) => setGroupType(v as GroupType)}
             />
           </Form.Item>
-          <Form.Item label={t("groups.members")} help={t("groups.membersHint")}>
+          <Form.Item
+            className="form-grid-span"
+            label={t("groups.members")}
+            help={t("groups.membersHint")}
+          >
             <Select
               mode="tags"
               value={members}
@@ -338,19 +343,21 @@ export default function GroupsCard({
           {optionFields.length > 0 && (
             <div className="modal-block">
               <div className="modal-block-title">{t("groups.options")}</div>
-              {optionFields.map((def) => (
-                <Form.Item
-                  key={def.key}
-                  label={t(`groupFields.${def.key}`, def.key)}
-                  style={{ marginBottom: 12 }}
-                >
-                  <FieldInput
-                    def={def}
-                    value={options[def.key]}
-                    onChange={(v) => setOption(def.key, v)}
-                  />
-                </Form.Item>
-              ))}
+              <div className="form-grid">
+                {optionFields.map((def) => (
+                  <Form.Item
+                    key={def.key}
+                    label={t(`groupFields.${def.key}`, def.key)}
+                    style={{ marginBottom: 12 }}
+                  >
+                    <FieldInput
+                      def={def}
+                      value={options[def.key]}
+                      onChange={(v) => setOption(def.key, v)}
+                    />
+                  </Form.Item>
+                ))}
+              </div>
             </div>
           )}
 

@@ -1,3 +1,23 @@
+/* 表单弹窗:顶部间距随视口高度收缩,主体滚动时保留标题和操作区。 */
+.form-modal {
+  --form-modal-top: clamp(16px, 10vh, 100px);
+  top: var(--form-modal-top);
+}
+.form-modal .ant-modal-container {
+  display: flex;
+  flex-direction: column;
+  max-height: calc(100vh - var(--form-modal-top) - 24px);
+}
+.form-modal .ant-modal-header,
+.form-modal .ant-modal-footer {
+  flex-shrink: 0;
+}
+.form-modal .ant-modal-body {
+  container: form-modal / inline-size;
+  min-height: 0;
+  overflow-y: auto;
+}
+
 /* 窄屏降级(桌面优先,但 <=880px 仍可用)。侧栏收 64px 见 AppLayout.css。 */
 @media (max-width: 880px) {
   .page {

@@ -73,6 +73,7 @@ export default function Settings() {
       {/* 重置前缀会让全部托管链接一次性改变、旧链接全部失效(src/settings.rs),
           故要求输入确认词后才可提交,防误触。 */}
       <Modal
+        className="form-modal"
         title={t("settings.resetPublicPath")}
         open={confirming}
         onCancel={() => setConfirming(false)}

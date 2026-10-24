@@ -369,6 +369,7 @@ function BasicInfo({
       </div>
 
       <Modal
+        className="form-modal"
         title={t("basic.edit")}
         open={editOpen}
         onCancel={() => setEditOpen(false)}

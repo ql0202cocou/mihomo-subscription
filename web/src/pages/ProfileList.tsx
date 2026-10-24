@@ -115,6 +115,7 @@ export default function ProfileList() {
       )}
 
       <Modal
+        className="form-modal"
         title={t("profiles.create")}
         open={creating}
         onCancel={() => setCreating(false)}
