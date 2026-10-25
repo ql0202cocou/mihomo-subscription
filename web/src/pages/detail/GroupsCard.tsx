@@ -104,7 +104,7 @@ export default function GroupsCard({
   const { t } = useTranslation();
   const { message } = AntdApp.useApp();
   const saveInOrder = useSerialSave();
-  const notice = useRegenerateNotice();
+  const notice = useRegenerateNotice(onRegenerate);
   const [editing, setEditing] = useState<CustomGroup | null>(null);
   const [open, setOpen] = useState(false);
   const [name, setName] = useState("");
@@ -169,7 +169,6 @@ export default function GroupsCard({
     if (!res.latest) return;
     if (res.ok) {
       notice(res.value.regenerate, t("groups.orderSaved"));
-      onRegenerate(res.value.regenerate);
     } else {
       resync.current = true; // 回滚到服务端实际持有的顺序(与 NodesCard 一致)
       message.error(errorMessage(res.error, t("groups.orderSaveFailed")));

@@ -91,6 +91,16 @@ const RULE_TYPE_GROUPS: { key: string; types: string[] }[] = [
 // 全部已知规则类型集合。用于:输入恰为某完整类型(默认值/已选值)时不收窄下拉,以便浏览切换。
 const ALL_RULE_TYPES = new Set(RULE_TYPE_GROUPS.flatMap((g) => g.types));
 
+// 下拉过滤:输入恰为某个已知完整值(默认值或编辑时预填的原值)时不收窄,展示全部以便浏览切换;
+// 否则按子串过滤。不然预填值会把下拉收成只剩它自己。分组选项仅叶子项带 value,分组标题不参与。
+function filterUnlessKnown(isKnown: (input: string) => boolean) {
+  return (input: string, opt?: unknown) =>
+    isKnown(input) ||
+    String((opt as { value?: unknown } | undefined)?.value ?? "")
+      .toLowerCase()
+      .includes(input.toLowerCase());
+}
+
 const NETWORK_OPTIONS = ["tcp", "udp"];
 const IN_TYPE_OPTIONS = ["HTTP", "HTTPS", "SOCKS", "SOCKS4", "SOCKS5", "MIXED", "REDIR", "TPROXY", "TUN"];
 const LOGICAL_TYPES = new Set(["AND", "OR", "NOT", "SUB-RULE"]);
@@ -230,7 +240,7 @@ export default function RulesCard({
   const { t } = useTranslation();
   const { message } = AntdApp.useApp();
   const saveInOrder = useSerialSave();
-  const notice = useRegenerateNotice();
+  const notice = useRegenerateNotice(onRegenerate);
   // 最后一条 MATCH 钉底;较早的 MATCH 与其余行一样保留在 `rules` 中。
   const [rules, setRules] = useState<string[]>([]);
   const [matchLine, setMatchLine] = useState<string | null>(null);
@@ -264,12 +274,15 @@ export default function RulesCard({
   const saved = useRef<{ rules: string[]; match: string | null }>({ rules: [], match: null });
   // 最新规则的 ref 镜像:「先 await、再基于当前规则合并」的异步流程(导入机场规则)从它取基座——
   // 请求在途期间用户可能已增删规则,闭包里的 state 在 await 返回时早已过期。
+  // 规则只经 applyRules 写入,state 与 ref 镜像同步更新。
   const rulesRef = useRef(rules);
   const matchRef = useRef(matchLine);
-  useEffect(() => {
-    rulesRef.current = rules;
-    matchRef.current = matchLine;
-  }, [rules, matchLine]);
+  const applyRules = useCallback((nextRules: string[], nextMatch: string | null) => {
+    setRules(nextRules);
+    setMatchLine(nextMatch);
+    rulesRef.current = nextRules;
+    matchRef.current = nextMatch;
+  }, []);
 
   useEffect(() => {
     // 导入完成前后的旧 reload 不得覆盖刚确认的服务端文本;本次导入触发的最新 reload 除外。
@@ -283,16 +296,13 @@ export default function RulesCard({
     // 本组件保存后 reload 带回的正是刚保存的规则:列表未变、编辑下标仍有效,不打断正在编辑的弹窗。
     const echoed =
       match === saved.current.match && rest.join("\n") === saved.current.rules.join("\n");
-    setRules(rest);
-    setMatchLine(match);
-    rulesRef.current = rest;
-    matchRef.current = match;
+    applyRules(rest, match);
     saved.current = { rules: rest, match };
     if (echoed) return;
     setModalOpen(false);
     setEditing(null);
     setModel(DEFAULT_RULE);
-  }, [initial]);
+  }, [initial, applyRules]);
 
   const loadPolicies = useCallback(async () => {
     try {
@@ -338,10 +348,7 @@ export default function RulesCard({
   const persist = useCallback(
     async (nextRules: string[], nextMatch: string | null, appliedText?: string): Promise<boolean> => {
       if (hostedImportPending.current) return false;
-      setRules(nextRules);
-      setMatchLine(nextMatch);
-      rulesRef.current = nextRules;
-      matchRef.current = nextMatch;
+      applyRules(nextRules, nextMatch);
       const content = rulesContent(nextRules, nextMatch);
       const res = await saveInOrder(() =>
         api<{ regenerate: Regenerate }>(`/api/profiles/${profileId}/rules`, {
@@ -355,18 +362,14 @@ export default function RulesCard({
       if (!res.latest) return res.ok;
       if (res.ok) {
         notice(res.value.regenerate, appliedText);
-        onRegenerate(res.value.regenerate);
         onSaved();
       } else {
-        setRules(saved.current.rules);
-        setMatchLine(saved.current.match);
-        rulesRef.current = saved.current.rules;
-        matchRef.current = saved.current.match;
+        applyRules(saved.current.rules, saved.current.match);
         message.error(errorMessage(res.error, t("common.saveFailed")));
       }
       return res.ok;
     },
-    [profileId, onSaved, onRegenerate, saveInOrder, notice, message, t],
+    [profileId, onSaved, saveInOrder, notice, applyRules, message, t],
   );
 
   // DnD id / React key 用内容派生的稳定 id(不用数组下标);重复行按出现次序加后缀保证唯一。
@@ -636,10 +639,7 @@ export default function RulesCard({
       }
       const result = res.value;
       const latest = splitRules(result.rules_content);
-      setRules(latest.rules);
-      setMatchLine(latest.match);
-      rulesRef.current = latest.rules;
-      matchRef.current = latest.match;
+      applyRules(latest.rules, latest.match);
       saved.current = latest;
       await loadProfileRuleSets();
       if (result.imported > 0) {
@@ -650,7 +650,6 @@ export default function RulesCard({
         message.info(t("rules.importHostedNone"));
       }
       notice(result.regenerate);
-      if (result.regenerate) onRegenerate(result.regenerate);
     } finally {
       try {
         await onSaved();
@@ -951,11 +950,7 @@ function RuleComposer({ model, onChange, policyOptions, ruleSets }: ComposerProp
             value={model.payload}
             onChange={(payload) => onChange({ ...model, payload })}
             placeholder="HTTP / SOCKS5 / TUN ..."
-            filterOption={(input, opt) =>
-              // 同「规则类型」:输入恰为完整选项时不收窄下拉。
-              IN_TYPE_OPTIONS.includes(input) ||
-              String(opt?.value ?? "").toLowerCase().includes(input.toLowerCase())
-            }
+            filterOption={filterUnlessKnown((v) => IN_TYPE_OPTIONS.includes(v))}
           />
         ),
       };
@@ -1018,14 +1013,7 @@ function RuleComposer({ model, onChange, policyOptions, ruleSets }: ComposerProp
             onChange(next);
           }}
           placeholder={t("rules.ruleType")}
-          filterOption={(input, opt) => {
-            // 输入恰为某个完整类型(默认的 DOMAIN-SUFFIX 或已选值)时不收窄下拉,展示全部以便浏览
-            // 切换;否则按子串过滤。不然预填的默认值会把下拉收成只剩它自己。
-            if (ALL_RULE_TYPES.has(input)) return true;
-            return String((opt as { value?: string })?.value ?? "")
-              .toLowerCase()
-              .includes(input.toLowerCase());
-          }}
+          filterOption={filterUnlessKnown((v) => ALL_RULE_TYPES.has(v))}
         />
       </div>
       {isMatch ? (
@@ -1058,14 +1046,7 @@ function RuleComposer({ model, onChange, policyOptions, ruleSets }: ComposerProp
           value={model.policy}
           onChange={(policy) => onChange({ ...model, policy })}
           placeholder={t("rules.policy")}
-          filterOption={(input, opt) =>
-            // 输入恰为某个完整策略(编辑时预填的原值)时不收窄下拉,同「规则类型」;否则按子串过滤。
-            // 分组选项:仅叶子项带 value;分组标题无 value 不参与。
-            policyValues.has(input) ||
-            String((opt as { value?: string })?.value ?? "")
-              .toLowerCase()
-              .includes(input.toLowerCase())
-          }
+          filterOption={filterUnlessKnown((v) => policyValues.has(v))}
         />
       </div>
     </div>

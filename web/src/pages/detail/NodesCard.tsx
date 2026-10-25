@@ -43,7 +43,7 @@ export default function NodesCard({ profileId, profileName, nodes, generatedAt, 
   const { t } = useTranslation();
   const { message } = AntdApp.useApp();
   const saveInOrder = useSerialSave();
-  const notice = useRegenerateNotice();
+  const notice = useRegenerateNotice(onRegenerate);
   const [proxies, setProxies] = useState<ProxyPreview[]>([]);
   /** 是否已生成过:区分「尚未生成」与「机场无节点」,仅影响空态文案。 */
   const [generated, setGenerated] = useState(true);
@@ -98,7 +98,6 @@ export default function NodesCard({ profileId, profileName, nodes, generatedAt, 
     if (!res.latest) return;
     if (res.ok) {
       notice(res.value.regenerate, t("nodes.orderSaved"));
-      onRegenerate(res.value.regenerate);
     } else {
       message.error(errorMessage(res.error, t("nodes.orderSaveFailed")));
     }

@@ -216,17 +216,17 @@ function convertValue(value: unknown, kind: Exclude<AdvancedKind, "yaml">): unkn
   }
 }
 
+/** 高级值的 YAML 文本形式;空值为空串。 */
+function yamlText(value: unknown): string {
+  return value == null ? "" : stringifyYaml(value).trimEnd();
+}
+
 /** 切换行类型:以当前草稿(YAML 行)或值为源。切到 YAML 时,源文本先作为草稿,
  *  能解析则同时更新值;解析失败只留草稿待用户修正,非法 YAML 不写回父级 fields。 */
 function convertKind(row: AdvancedRow, kind: AdvancedKind): Partial<AdvancedRow> {
   const current = row.kind === "yaml" && row.draft !== undefined ? row.draft : row.value;
   if (kind !== "yaml") return { kind, value: convertValue(current, kind), draft: undefined };
-  const text =
-    typeof current === "string"
-      ? current
-      : current == null
-        ? ""
-        : stringifyYaml(current).trimEnd();
+  const text = typeof current === "string" ? current : yamlText(current);
   try {
     return { kind, value: parseYaml(text), draft: text };
   } catch {
@@ -282,7 +282,7 @@ export function AdvancedFields({
     } catch {
       ok = false;
     }
-    update(rows.map((r) => (r.id === id ? { ...r, draft: text, ...(ok ? { value: parsed } : {}) } : r)));
+    patch(id, { draft: text, ...(ok ? { value: parsed } : {}) });
   }
 
   const kindOptions = (["text", "number", "bool", "yaml"] as const).map((k) => ({
@@ -396,7 +396,7 @@ function ObjectField({
   onDraft: (text: string) => void;
 }) {
   // 无草稿时由当前值序列化;有草稿(含解析失败的中途文本)时原样显示,交给用户修正。
-  const text = draft ?? (value == null ? "" : stringifyYaml(value).trimEnd());
+  const text = draft ?? yamlText(value);
   return (
     <Input.TextArea
       style={{ width: 220, fontFamily: "monospace" }}

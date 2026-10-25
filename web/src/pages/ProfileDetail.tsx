@@ -318,7 +318,7 @@ function BasicInfo({
 }) {
   const { t } = useTranslation();
   const { message } = AntdApp.useApp();
-  const notice = useRegenerateNotice();
+  const notice = useRegenerateNotice(onRegenerate);
   const [editOpen, setEditOpen] = useState(false);
   const [form] = Form.useForm();
 
@@ -333,10 +333,7 @@ function BasicInfo({
         method: "PUT",
         body: JSON.stringify(body),
       });
-      if (res.regenerate) {
-        notice(res.regenerate);
-        onRegenerate(res.regenerate);
-      }
+      notice(res.regenerate);
       setEditOpen(false);
       onSaved();
     } catch (e) {
