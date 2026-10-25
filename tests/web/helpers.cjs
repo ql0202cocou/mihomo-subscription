@@ -7,18 +7,47 @@ const webRequire = createRequire(path.join(root, 'web/package.json'));
 const ts = webRequire('typescript');
 const React = webRequire('react');
 
+const SOURCE_EXTENSIONS = ['', '.ts', '.tsx'];
+
+// Resolve a relative import of web/src to its source file, or null when none exists.
+function resolveSource(fromDir, id) {
+  const base = path.resolve(fromDir, id);
+  return SOURCE_EXTENSIONS.map((ext) => base + ext)
+    .find((file) => fs.existsSync(file) && fs.statSync(file).isFile()) ?? null;
+}
+
 // Execute the real TS/TSX module with controlled network/router/hook inputs.
 // JSX remains real React elements; rendering assertions use react-dom/server.
+// Relative imports that are not mocked load the real web/src module with the same mocks;
+// relative mock keys are matched by resolved path, so a nested module sees the mocks too.
 function load(relativePath, mocks = {}, globals = {}) {
   const filename = path.join(root, 'web/src', relativePath);
+  const relativeMocks = new Map();
+  for (const [id, mock] of Object.entries(mocks)) {
+    if (id.startsWith('.')) relativeMocks.set(path.resolve(path.dirname(filename), id), mock);
+  }
+  return loadFile(filename, mocks, relativeMocks, globals, new Map());
+}
+
+function loadFile(filename, mocks, relativeMocks, globals, cache) {
+  if (cache.has(filename)) return cache.get(filename).exports;
   const source = ts.transpileModule(fs.readFileSync(filename, 'utf8'), {
     compilerOptions: { module: ts.ModuleKind.CommonJS, jsx: ts.JsxEmit.ReactJSX },
     // 传真实文件名,TS 才按 .ts(而非 .tsx)解析,泛型箭头函数才不会被误当 JSX 编译。
     fileName: filename,
   }).outputText;
   const module = { exports: {} };
-  const req = (id) => Object.hasOwn(mocks, id) ? mocks[id]
-    : id.endsWith('.css') ? {} : webRequire(id);
+  cache.set(filename, module);
+  const dir = path.dirname(filename);
+  const req = (id) => {
+    if (id.endsWith('.css')) return {};
+    if (!id.startsWith('.')) return Object.hasOwn(mocks, id) ? mocks[id] : webRequire(id);
+    const target = path.resolve(dir, id);
+    if (relativeMocks.has(target)) return relativeMocks.get(target);
+    const file = resolveSource(dir, id);
+    if (!file) throw new Error(`cannot resolve ${id} from ${filename}`);
+    return loadFile(file, mocks, relativeMocks, globals, cache);
+  };
   vm.runInNewContext(source, { module, exports: module.exports, require: req, ...globals }, { filename });
   return module.exports;
 }
