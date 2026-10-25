@@ -253,6 +253,8 @@ pub async fn create(
         .execute(&state.db)
         .await?;
         let row = fetch_one(&state, &profile_id, &id).await?;
+        // 新建只会补上旧缓存里不存在的定义(引用未定义规则集的规则过不了校验),旧缓存的托管
+        // 链接都仍有效:重生成未通过时保留它继续下发,不同于 `update` 改动已注入定义时删缓存。
         let regenerate = if is_referenced(&referenced, name) {
             Some(crate::generate::regenerate_from_cache_locked(&state, &profile_id).await)
         } else {
@@ -342,8 +344,9 @@ pub async fn update(
         let regenerate = if affects_output {
             let r = crate::generate::regenerate_from_cache_locked(&state, &profile_id).await;
             if !matches!(r, Regenerated::Applied) {
-                // 无法用当前规则重建:旧缓存中的托管链接可能已随本次改动失效,删除缓存而不是
-                // 继续下发,下次公开拉取回源重建。
+                // 本次改的正是旧缓存已注入的定义,旧缓存里的托管链接/直连地址已失效:无法用当前
+                // 规则重建时删除缓存而不是继续下发,下次公开拉取回源重建。新建与导入只增加定义,
+                // 旧缓存仍有效,故不删。
                 crate::generate::invalidate_cache(&state, &profile_id).await?;
             }
             Some(r)
@@ -558,6 +561,7 @@ pub async fn import(
 
         // 用缓存的机场原文离线重生成(含 rule-providers 注入),使导入立即反映到所服务的订阅:
         // 复制来的定义可能补齐了已有引用,新增的规则行也需要注入对应 rule-providers 条目。
+        // 导入不覆盖已有定义,旧缓存不依赖新复制的定义:重生成未通过时保留它继续下发。
         let regenerate = if imported > 0 || rules_changed {
             Some(crate::generate::regenerate_from_cache_locked(&state, &profile_id).await)
         } else {

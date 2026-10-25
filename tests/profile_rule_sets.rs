@@ -1000,6 +1000,118 @@ async fn update_renewing_behavior_or_format_rewrites_cached_links() {
 }
 
 #[tokio::test]
+async fn create_keeps_last_valid_cache_when_rules_stay_invalid() {
+    let temp = TempDb::new();
+    let (app, db) = cached_app(&temp, Arc::new(BodyFetcher(PROVIDER_YAML))).await;
+    let cookie = login(&app).await;
+    let (p1, _, sub_path) = create_profile(&app, &cookie, "P1").await;
+    let baseline = get_text(&app, &sub_path).await;
+
+    // 规则引用了两个尚无定义的名字:草稿不合法,缓存保留上一份合法输出。
+    let resp = app
+        .clone()
+        .oneshot(authed(
+            "PUT",
+            &format!("/api/profiles/{p1}/rules"),
+            &cookie,
+            r#"{"content":"RULE-SET,ads,DIRECT\nRULE-SET,missing,DIRECT\nMATCH,DIRECT"}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(json(resp).await["regenerate"]["status"], "invalid");
+
+    // 只补齐其中一个:重生成仍不通过,旧缓存不依赖新定义,继续下发而不是被删除。
+    let created = create_rs(
+        &app,
+        &cookie,
+        &p1,
+        r#"{"name":"ads","behavior":"domain","format":"yaml","content":"+.ad.example"}"#,
+    )
+    .await;
+    assert_eq!(created["regenerate"]["status"], "invalid");
+    let cached: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM generated_cache WHERE profile_id = ?")
+            .bind(&p1)
+            .fetch_one(&db)
+            .await
+            .unwrap();
+    assert_eq!(cached, 1);
+    assert_eq!(get_text(&app, &sub_path).await, baseline);
+}
+
+#[tokio::test]
+async fn update_of_injected_definition_drops_cache_when_rules_are_invalid() {
+    let temp = TempDb::new();
+    let (app, db) = cached_app(&temp, Arc::new(BodyFetcher(PROVIDER_YAML))).await;
+    let cookie = login(&app).await;
+    let (p1, token1, sub_path) = create_profile(&app, &cookie, "P1").await;
+    let rs = create_rs(
+        &app,
+        &cookie,
+        &p1,
+        r#"{"name":"ads","behavior":"domain","format":"yaml","content":"+.ad.example"}"#,
+    )
+    .await;
+    put_rules(&app, &cookie, &p1, "RULE-SET,ads,DIRECT\nMATCH,DIRECT").await;
+    assert!(get_text(&app, &sub_path)
+        .await
+        .contains("/r/ads/domain.yaml"));
+
+    // 当前规则草稿不合法:缓存仍是含 ads 托管链接的上一份输出。
+    let resp = app
+        .clone()
+        .oneshot(authed(
+            "PUT",
+            &format!("/api/profiles/{p1}/rules"),
+            &cookie,
+            r#"{"content":"RULE-SET,ads,DIRECT\nRULE-SET,missing,DIRECT\nMATCH,DIRECT"}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(json(resp).await["regenerate"]["status"], "invalid");
+
+    // 改 format 使旧缓存里的托管链接失效,而当前规则又无法重建:缓存被删除,不再下发旧输出。
+    let rsid = rs["id"].as_str().unwrap();
+    let resp = app
+        .clone()
+        .oneshot(authed(
+            "PUT",
+            &format!("/api/profiles/{p1}/rule-sets/{rsid}"),
+            &cookie,
+            r#"{"name":"ads","behavior":"domain","format":"text","content":"+.ad.example"}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(json(resp).await["regenerate"]["status"], "invalid");
+    let cached: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM generated_cache WHERE profile_id = ?")
+            .bind(&p1)
+            .fetch_one(&db)
+            .await
+            .unwrap();
+    assert_eq!(cached, 0);
+
+    // 无缓存时公开拉取回源,当前规则仍不合法 → 503;旧托管链接随定义变更 404。
+    let resp = app
+        .clone()
+        .oneshot(Request::get(&sub_path).body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::get(format!("/testprefix/api/sub/{token1}/r/ads/domain.yaml"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
 async fn manual_content_update_keeps_cache_and_serves_new_content() {
     let temp = TempDb::new();
     let (app, db) = cached_app(&temp, Arc::new(BodyFetcher(PROVIDER_YAML))).await;
