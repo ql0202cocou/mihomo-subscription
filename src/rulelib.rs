@@ -62,13 +62,16 @@ pub fn validate_name(name: &str) -> ApiResult<()> {
     Ok(())
 }
 
+/// 可作为规则集上游的 URL:http(s) 且主机名非空。
+pub(crate) fn parse_http_url(raw: &str) -> Option<url::Url> {
+    url::Url::parse(raw).ok().filter(|url| {
+        matches!(url.scheme(), "http" | "https")
+            && url.host_str().is_some_and(|host| !host.is_empty())
+    })
+}
+
 fn normalize_remote_url(raw: &str) -> ApiResult<String> {
-    let url = url::Url::parse(raw)
-        .ok()
-        .filter(|url| {
-            matches!(url.scheme(), "http" | "https")
-                && url.host_str().is_some_and(|host| !host.is_empty())
-        })
+    let url = parse_http_url(raw)
         .ok_or_else(|| ApiError::BadRequest("remote source requires an http(s) url".into()))?;
     Ok(url.to_string())
 }

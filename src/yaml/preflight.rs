@@ -2,7 +2,7 @@ use std::{ffi::CStr, marker::PhantomData, mem::MaybeUninit};
 
 use unsafe_libyaml_norway as unsafe_yaml;
 
-use super::{YamlError, MAX_BYTES, MAX_DEPTH};
+use super::{take, YamlError, MAX_BYTES, MAX_DEPTH};
 
 const MAX_LOADER_EVENTS: usize = 20_000;
 
@@ -25,42 +25,40 @@ pub(super) fn check(input: &str) -> Result<(), YamlError> {
                 }
             }
             unsafe_yaml::YAML_ALIAS_EVENT => {
-                charge_event(&mut events)?;
-                check_scalar_depth(depth)?;
+                take(&mut events, 1)?;
+                check_depth(depth + 1)?;
                 // The alias anchor is valid for as long as the event is alive.
                 let alias = unsafe { event.0.data.alias };
-                charge_bytes(&mut bytes, string_len(alias.anchor))?;
+                take(&mut bytes, string_len(alias.anchor))?;
             }
             unsafe_yaml::YAML_SCALAR_EVENT => {
-                charge_event(&mut events)?;
-                check_scalar_depth(depth)?;
+                take(&mut events, 1)?;
+                check_depth(depth + 1)?;
                 // The scalar fields are valid for as long as the event is alive.
                 let scalar = unsafe { event.0.data.scalar };
                 let length = usize::try_from(scalar.length).map_err(|_| YamlError::TooComplex)?;
-                charge_bytes(&mut bytes, length)?;
-                charge_bytes(&mut bytes, string_len(scalar.tag))?;
-                charge_bytes(&mut bytes, string_len(scalar.anchor))?;
+                take(&mut bytes, length)?;
+                take(&mut bytes, string_len(scalar.tag))?;
+                take(&mut bytes, string_len(scalar.anchor))?;
             }
-            unsafe_yaml::YAML_SEQUENCE_START_EVENT => {
-                charge_event(&mut events)?;
+            kind @ (unsafe_yaml::YAML_SEQUENCE_START_EVENT
+            | unsafe_yaml::YAML_MAPPING_START_EVENT) => {
+                take(&mut events, 1)?;
                 depth += 1;
-                check_collection_depth(depth)?;
-                // The sequence fields are valid for as long as the event is alive.
-                let sequence = unsafe { event.0.data.sequence_start };
-                charge_bytes(&mut bytes, string_len(sequence.tag))?;
-                charge_bytes(&mut bytes, string_len(sequence.anchor))?;
-            }
-            unsafe_yaml::YAML_MAPPING_START_EVENT => {
-                charge_event(&mut events)?;
-                depth += 1;
-                check_collection_depth(depth)?;
-                // The mapping fields are valid for as long as the event is alive.
-                let mapping = unsafe { event.0.data.mapping_start };
-                charge_bytes(&mut bytes, string_len(mapping.tag))?;
-                charge_bytes(&mut bytes, string_len(mapping.anchor))?;
+                check_depth(depth)?;
+                // The collection fields are valid for as long as the event is alive.
+                let (tag, anchor) = if kind == unsafe_yaml::YAML_SEQUENCE_START_EVENT {
+                    let sequence = unsafe { event.0.data.sequence_start };
+                    (sequence.tag, sequence.anchor)
+                } else {
+                    let mapping = unsafe { event.0.data.mapping_start };
+                    (mapping.tag, mapping.anchor)
+                };
+                take(&mut bytes, string_len(tag))?;
+                take(&mut bytes, string_len(anchor))?;
             }
             unsafe_yaml::YAML_SEQUENCE_END_EVENT | unsafe_yaml::YAML_MAPPING_END_EVENT => {
-                charge_event(&mut events)?;
+                take(&mut events, 1)?;
                 depth = depth.checked_sub(1).ok_or(YamlError::Parse)?;
             }
             _ => return Err(YamlError::Parse),
@@ -68,36 +66,13 @@ pub(super) fn check(input: &str) -> Result<(), YamlError> {
     }
 }
 
-fn check_scalar_depth(depth: usize) -> Result<(), YamlError> {
-    if depth >= MAX_DEPTH {
-        Err(YamlError::TooComplex)
-    } else {
-        Ok(())
-    }
-}
-
-fn check_collection_depth(depth: usize) -> Result<(), YamlError> {
+/// 节点所在深度(标量与别名按其父集合深度加一计)不得超过 [`MAX_DEPTH`]。
+fn check_depth(depth: usize) -> Result<(), YamlError> {
     if depth > MAX_DEPTH {
         Err(YamlError::TooComplex)
     } else {
         Ok(())
     }
-}
-
-fn charge_event(events: &mut usize) -> Result<(), YamlError> {
-    if *events == 0 {
-        return Err(YamlError::TooComplex);
-    }
-    *events -= 1;
-    Ok(())
-}
-
-fn charge_bytes(bytes: &mut usize, count: usize) -> Result<(), YamlError> {
-    if count > *bytes {
-        return Err(YamlError::TooComplex);
-    }
-    *bytes -= count;
-    Ok(())
 }
 
 fn string_len(value: *const u8) -> usize {

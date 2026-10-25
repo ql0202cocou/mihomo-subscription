@@ -143,11 +143,7 @@ pub fn capability_hash(token: &str, prefix: &str) -> String {
     hasher.update(token.as_bytes());
     hasher.update(b"\0");
     hasher.update(prefix.as_bytes());
-    hasher
-        .finalize()
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect()
+    crate::util::hex(&hasher.finalize())
 }
 
 async fn health() -> impl IntoResponse {

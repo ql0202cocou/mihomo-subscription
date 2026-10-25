@@ -67,7 +67,7 @@ fn validate_node(body: &NodeBody) -> ApiResult<()> {
         ));
     }
     // 内置保留名(DIRECT/REJECT/…):占用会让 Mihomo 以 duplicate name 拒绝加载整个输出。
-    if crate::converter::RESERVED_NODE_NAMES.contains(&body.name.trim()) {
+    if crate::converter::is_reserved_node_name(body.name.trim()) {
         return Err(ApiError::BadRequest(format!(
             "name `{}` conflicts with a reserved built-in name",
             body.name.trim()

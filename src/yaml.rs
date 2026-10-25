@@ -90,6 +90,16 @@ struct Limited<'a> {
     depth: usize,
 }
 
+impl Limited<'_> {
+    /// 下一层的子值:共享同一预算,深度加一。
+    fn child(&mut self) -> Limited<'_> {
+        Limited {
+            budget: self.budget,
+            depth: self.depth + 1,
+        }
+    }
+}
+
 impl<'de> DeserializeSeed<'de> for Limited<'_> {
     type Value = Value;
 
@@ -134,27 +144,18 @@ impl<'de> Visitor<'de> for Limited<'_> {
         Ok(Value::String(value.to_owned()))
     }
 
-    fn visit_seq<A: SeqAccess<'de>>(self, mut data: A) -> Result<Value, A::Error> {
+    fn visit_seq<A: SeqAccess<'de>>(mut self, mut data: A) -> Result<Value, A::Error> {
         let mut items = Vec::new();
-        while let Some(value) = data.next_element_seed(Limited {
-            budget: self.budget,
-            depth: self.depth + 1,
-        })? {
+        while let Some(value) = data.next_element_seed(self.child())? {
             items.push(value);
         }
         Ok(Value::Sequence(items))
     }
 
-    fn visit_map<A: MapAccess<'de>>(self, mut data: A) -> Result<Value, A::Error> {
+    fn visit_map<A: MapAccess<'de>>(mut self, mut data: A) -> Result<Value, A::Error> {
         let mut map = Mapping::new();
-        while let Some(key) = data.next_key_seed(Limited {
-            budget: self.budget,
-            depth: self.depth + 1,
-        })? {
-            let value = data.next_value_seed(Limited {
-                budget: self.budget,
-                depth: self.depth + 1,
-            })?;
+        while let Some(key) = data.next_key_seed(self.child())? {
+            let value = data.next_value_seed(self.child())?;
             if map.insert(key, value).is_some() {
                 return Err(de::Error::custom("duplicate YAML mapping key"));
             }
@@ -162,19 +163,13 @@ impl<'de> Visitor<'de> for Limited<'_> {
         Ok(Value::Mapping(map))
     }
 
-    fn visit_enum<A: EnumAccess<'de>>(self, data: A) -> Result<Value, A::Error> {
+    fn visit_enum<A: EnumAccess<'de>>(mut self, data: A) -> Result<Value, A::Error> {
         // tag 名也走同一个字节预算,tag 包裹的值走同一个深度/节点预算。
-        let (tag, contents) = data.variant_seed(Limited {
-            budget: self.budget,
-            depth: self.depth + 1,
-        })?;
+        let (tag, contents) = data.variant_seed(self.child())?;
         let Value::String(tag) = tag else {
             return Err(de::Error::custom("invalid YAML tag"));
         };
-        let value = contents.newtype_variant_seed(Limited {
-            budget: self.budget,
-            depth: self.depth + 1,
-        })?;
+        let value = contents.newtype_variant_seed(self.child())?;
         Ok(Value::Tagged(Box::new(TaggedValue {
             tag: Tag::new(tag),
             value,
@@ -190,7 +185,7 @@ fn normalize(value: Value) -> Result<Value, YamlError> {
 }
 
 fn normalize_value(value: Value, steps: &mut usize) -> Result<Value, YamlError> {
-    charge_step(steps)?;
+    take(steps, 1)?;
     match value {
         Value::Sequence(items) => {
             let items = items
@@ -214,7 +209,7 @@ fn normalize_mapping(map: Mapping, steps: &mut usize) -> Result<Mapping, YamlErr
     let mut normalized = Mapping::new();
     for (key, value) in map {
         if matches!(&key, Value::String(key) if key == "<<") {
-            charge_step(steps)?;
+            take(steps, 1)?;
             merge = Some(value);
             continue;
         }
@@ -249,17 +244,15 @@ fn merge_source(target: &mut Mapping, source: Value, steps: &mut usize) -> Resul
 
 fn merge_mapping(target: &mut Mapping, map: Mapping, steps: &mut usize) -> Result<(), YamlError> {
     for (key, value) in map {
-        charge_step(steps)?;
+        take(steps, 1)?;
         target.entry(key).or_insert(value);
     }
     Ok(())
 }
 
-fn charge_step(steps: &mut usize) -> Result<(), YamlError> {
-    if *steps == 0 {
-        return Err(YamlError::TooComplex);
-    }
-    *steps -= 1;
+/// 从预算中扣除 `amount`;不足时报 [`YamlError::TooComplex`]。预检的事件/字节计数与 merge 展开步数共用。
+fn take(budget: &mut usize, amount: usize) -> Result<(), YamlError> {
+    *budget = budget.checked_sub(amount).ok_or(YamlError::TooComplex)?;
     Ok(())
 }
 

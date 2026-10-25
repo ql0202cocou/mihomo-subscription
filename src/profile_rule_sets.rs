@@ -139,8 +139,10 @@ async fn referenced_names(
     if let Some(content) = current {
         out.extend(crate::converter::ruleset_refs(&content));
     }
-    let cache = sqlx::query_as::<_, (Option<String>, String)>(
-        "SELECT rules_snapshot, output_yaml FROM generated_cache WHERE profile_id = ?",
+    // 规则快照缺失(升级前的旧缓存)时才需要整份输出作退路,避免每次读出大块 output_yaml。
+    let cache = sqlx::query_as::<_, (Option<String>, Option<String>)>(
+        "SELECT rules_snapshot, CASE WHEN rules_snapshot IS NULL THEN output_yaml END \
+         FROM generated_cache WHERE profile_id = ?",
     )
     .bind(profile_id)
     .fetch_optional(&state.db)
@@ -148,12 +150,18 @@ async fn referenced_names(
     match cache {
         None => {}
         Some((Some(snapshot), _)) => out.extend(crate::converter::ruleset_refs(&snapshot)),
-        Some((None, output)) => match cached_output_rules(&output) {
+        Some((None, output)) => match cached_output_rules(output.as_deref().unwrap_or_default()) {
             Some(rules) => out.extend(crate::converter::ruleset_refs(&rules)),
             None => return Ok(None),
         },
     }
     Ok(Some(out))
+}
+
+fn referenced_conflict(name: &str, action: &str) -> ApiError {
+    ApiError::Conflict(format!(
+        "rule-set `{name}` is referenced by rules; remove the referencing RULE-SET rules before {action}"
+    ))
 }
 
 /// 从缓存的输出 YAML 提取 `rules` 段文本(升级前无规则快照的缓存的退路);输出不可解析或
@@ -281,16 +289,10 @@ pub async fn update(
         let referenced = referenced_names(&state, &profile_id).await?;
         let was_referenced = is_referenced(&referenced, &existing.name);
         if was_referenced && name != existing.name {
-            return Err(ApiError::Conflict(format!(
-                "rule-set `{}` is referenced by rules; remove the referencing RULE-SET rules before renaming",
-                existing.name
-            )));
+            return Err(referenced_conflict(&existing.name, "renaming"));
         }
         if was_referenced && existing.enabled && !enabled {
-            return Err(ApiError::Conflict(format!(
-                "rule-set `{}` is referenced by rules; remove the referencing RULE-SET rules before disabling",
-                existing.name
-            )));
+            return Err(referenced_conflict(&existing.name, "disabling"));
         }
         // 输出中的 rule-providers 条目由「被引用且启用」的定义注入;条目出现(改名/启用补齐引用)、
         // 消失或字段变化都会改变输出,须重生成缓存。
@@ -362,23 +364,22 @@ pub async fn delete(
     State(state): State<Arc<AppState>>,
     Path((profile_id, rsid)): Path<(String, String)>,
 ) -> ApiResult<impl IntoResponse> {
-    state.keyed_lock.run(&profile_id, async {
-        let existing = fetch_one(&state, &profile_id, &rsid).await?;
-        let referenced = referenced_names(&state, &profile_id).await?;
-        if is_referenced(&referenced, &existing.name) {
-            return Err(ApiError::Conflict(format!(
-                "rule-set `{}` is referenced by rules; remove the referencing RULE-SET rules before deleting",
-                existing.name
-            )));
-        }
-        sqlx::query("DELETE FROM profile_rule_sets WHERE id = ? AND profile_id = ?")
-            .bind(&rsid)
-            .bind(&profile_id)
-            .execute(&state.db)
-            .await?;
-        Ok(StatusCode::NO_CONTENT)
-    })
-    .await
+    state
+        .keyed_lock
+        .run(&profile_id, async {
+            let existing = fetch_one(&state, &profile_id, &rsid).await?;
+            let referenced = referenced_names(&state, &profile_id).await?;
+            if is_referenced(&referenced, &existing.name) {
+                return Err(referenced_conflict(&existing.name, "deleting"));
+            }
+            sqlx::query("DELETE FROM profile_rule_sets WHERE id = ? AND profile_id = ?")
+                .bind(&rsid)
+                .bind(&profile_id)
+                .execute(&state.db)
+                .await?;
+            Ok(StatusCode::NO_CONTENT)
+        })
+        .await
 }
 
 // ─── 从 ② 全局库导入 ─────────────────────────────────────────────────────────────
@@ -421,13 +422,12 @@ fn importable(rule_set: &GlobalRuleSet) -> bool {
         return false;
     }
     match rule_set.source.as_str() {
-        "manual" => matches!(rule_set.format.as_str(), "yaml" | "text"),
-        "remote" => rule_set.url.as_deref().is_some_and(|raw| {
-            url::Url::parse(raw).ok().is_some_and(|url| {
-                matches!(url.scheme(), "http" | "https")
-                    && url.host_str().is_some_and(|host| !host.is_empty())
-            })
-        }),
+        "manual" => rulelib::MANUAL_FORMATS.contains(&rule_set.format.as_str()),
+        "remote" => rule_set
+            .url
+            .as_deref()
+            .and_then(rulelib::parse_http_url)
+            .is_some(),
         _ => false,
     }
 }
@@ -529,14 +529,14 @@ pub async fn import(
             .filter(|n| !referenced.iter().any(|r| r.as_str() == **n))
             .map(|n| format!("RULE-SET,{n},{policy}"))
             .collect();
-        let content = if lines.is_empty() {
-            old_content.clone()
-        } else {
+        let rules_changed = !lines.is_empty();
+        let content = if rules_changed {
             // 客户端按规则顺序匹配:新行必须插到兜底 MATCH 之前(编辑器同样把 MATCH 钉底),
             // 追加在 MATCH 后的规则永远不会命中。
             insert_before_fallback_match(&old_content, &lines)
+        } else {
+            old_content.clone()
         };
-        let rules_changed = !lines.is_empty();
         if rules_changed {
             // 带旧内容的 CAS:规则被并发修改过时整体回滚(定义复制一并撤销),调用方重试即可。
             let updated = sqlx::query(
@@ -577,10 +577,7 @@ fn insert_before_fallback_match(content: &str, new_lines: &[String]) -> String {
     let mut lines: Vec<&str> = content.lines().collect();
     let pos = lines
         .iter()
-        .rposition(|l| {
-            let t = l.trim();
-            !t.is_empty() && !t.starts_with('#') && crate::converter::is_match_line(t)
-        })
+        .rposition(|l| crate::converter::is_match_line(l))
         .unwrap_or(lines.len());
     lines.splice(pos..pos, new_lines.iter().map(String::as_str));
     lines.join("\n")
@@ -646,17 +643,8 @@ pub async fn public_serve(
     let Ok(Path((prefix, token, name, file))) = path else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    let lookup = async {
-        sqlx::query_scalar::<_, String>("SELECT id FROM profiles WHERE token = ?")
-            .bind(&token)
-            .fetch_optional(&state.db)
-            .await
-            .ok()
-            .flatten()
-    };
-    let profile_id = match state.public_gate(&prefix, lookup).await {
-        Some(id) => id,
-        None => return StatusCode::NOT_FOUND.into_response(),
+    let Some(profile_id) = public_profile(&state, &prefix, &token).await else {
+        return StatusCode::NOT_FOUND.into_response();
     };
     let row = match fetch_serve_by_name(&state, &profile_id, &name).await {
         Ok(Some(r)) => r,

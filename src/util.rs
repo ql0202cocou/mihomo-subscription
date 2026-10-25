@@ -41,6 +41,11 @@ fn random_b64(byte_len: usize) -> String {
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
 }
 
+/// 字节串的小写十六进制编码。
+pub fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
 /// 同批等待请求共享最近完成的刷新结果(包括失败),即使最小间隔设为零。
 pub fn completed_since(completed_at: &str, arrived: &str) -> bool {
     match (

@@ -19,32 +19,20 @@ const BUILTIN_PROXIES: &[&str] = &[
     "COMPATIBLE",
 ];
 
-const SUPPORTED_GROUP_TYPES: &[&str] = &["select", "url-test", "fallback", "load-balance"];
+pub(crate) const SUPPORTED_GROUP_TYPES: &[&str] =
+    &["select", "url-test", "fallback", "load-balance"];
 
-/// Mihomo 在解析配置前创建的内置名(内置代理 DIRECT/REJECT/REJECT-DROP/PASS/PASS-RULE/
-/// COMPATIBLE,另有内置分组 GLOBAL):代理与分组共用同一命名空间,自定义节点占用这些名字会让
-/// Mihomo 以 duplicate name 拒绝加载(GLOBAL 节点则会被内置分组静默覆盖)。
+/// 节点名是否占用 Mihomo 在解析配置前创建的内置名(内置代理 [`BUILTIN_PROXIES`],另有内置分组
+/// GLOBAL):代理与分组共用同一命名空间,自定义节点占用这些名字会让 Mihomo 以 duplicate name
+/// 拒绝加载(GLOBAL 节点则会被内置分组静默覆盖)。
 /// 见 mihomo `config/config.go` 的 proxies 初始化与分组重名检查。
-pub(crate) const RESERVED_NODE_NAMES: &[&str] = &[
-    "DIRECT",
-    "REJECT",
-    "REJECT-DROP",
-    "PASS",
-    "PASS-RULE",
-    "COMPATIBLE",
-    "GLOBAL",
-];
+pub(crate) fn is_reserved_node_name(name: &str) -> bool {
+    name == "GLOBAL" || BUILTIN_PROXIES.contains(&name)
+}
 
-/// 自定义分组不得占用的内置名:同 [`RESERVED_NODE_NAMES`],但不含 GLOBAL——上游仅在用户未定义
+/// 自定义分组不得占用的内置名:同 [`is_reserved_node_name`],但不含 GLOBAL——上游仅在用户未定义
 /// 时才内置创建 GLOBAL 分组,自定义 GLOBAL 分组是上游支持的用法。
-pub(crate) const RESERVED_GROUP_NAMES: &[&str] = &[
-    "DIRECT",
-    "REJECT",
-    "REJECT-DROP",
-    "PASS",
-    "PASS-RULE",
-    "COMPATIBLE",
-];
+pub(crate) const RESERVED_GROUP_NAMES: &[&str] = BUILTIN_PROXIES;
 
 pub struct CustomNode {
     pub name: String,
@@ -110,6 +98,8 @@ pub struct ConvertOutput {
     /// ML-KEM 已开启但 `client-fingerprint` 缺失或非 `chrome` 的 REALITY 节点名(见
     /// [`apply_reality_mlkem`])。
     pub reality_fingerprint_risks: Vec<String>,
+    /// 输出 `proxy-groups` 的分组名,按输出顺序。
+    pub group_names: Vec<String>,
 }
 
 /// 把机场 YAML 转换为 Mihomo 配置字符串(见 [`ConvertOutput`])。
@@ -192,6 +182,11 @@ pub fn convert(input: ConvertInput) -> Result<ConvertOutput, ConvertError> {
         |item| item.get("name").and_then(Value::as_str),
         &input.group_order,
     );
+    let group_names = groups
+        .iter()
+        .filter_map(|group| group.get("name").and_then(Value::as_str))
+        .map(str::to_string)
+        .collect();
     root.insert(Value::from("proxy-groups"), Value::Sequence(groups));
 
     // rules:整体替换为用户的规则。
@@ -242,6 +237,7 @@ pub fn convert(input: ConvertInput) -> Result<ConvertOutput, ConvertError> {
         yaml,
         ruleset_conflicts: rule_provider_conflicts,
         reality_fingerprint_risks,
+        group_names,
     })
 }
 
@@ -259,24 +255,20 @@ fn validate(
 
     // 内置保留名:自定义节点、自定义分组或机场透传代理占用 DIRECT/REJECT 等内置名时,Mihomo
     // 会以 duplicate name 拒绝加载整个配置,须在校验阶段拦截(GLOBAL 分组是上游支持的用法,放行)。
-    for name in provider_proxies {
-        if RESERVED_NODE_NAMES.contains(&name.as_str()) {
+    let reserved_group = |name: &str| RESERVED_GROUP_NAMES.contains(&name);
+    let checks = [
+        (
+            provider_proxies,
+            "provider proxy",
+            is_reserved_node_name as fn(&str) -> bool,
+        ),
+        (custom_node_names, "custom node", is_reserved_node_name),
+        (custom_group_names, "custom group", reserved_group),
+    ];
+    for (names, kind, reserved) in checks {
+        for name in names.iter().filter(|n| reserved(n)) {
             errors.push(format!(
-                "provider proxy `{name}` conflicts with a reserved built-in name"
-            ));
-        }
-    }
-    for name in custom_node_names {
-        if RESERVED_NODE_NAMES.contains(&name.as_str()) {
-            errors.push(format!(
-                "custom node `{name}` conflicts with a reserved built-in name"
-            ));
-        }
-    }
-    for name in custom_group_names {
-        if RESERVED_GROUP_NAMES.contains(&name.as_str()) {
-            errors.push(format!(
-                "custom group `{name}` conflicts with a reserved built-in name"
+                "{kind} `{name}` conflicts with a reserved built-in name"
             ));
         }
     }
@@ -442,16 +434,14 @@ fn group_option<'a>(group: &'a CustomGroup, name: &str) -> Option<&'a serde_json
     }
     options
         .iter()
-        .find(|(key, _)| key.replace('_', "-").eq_ignore_ascii_case(name))
+        .find(|(key, _)| mihomo_key_matches(key, name))
         .map(|(_, value)| value)
 }
 
 fn group_option_bool(group: &CustomGroup, name: &str) -> bool {
     match group_option(group, name) {
         Some(serde_json::Value::Bool(value)) => *value,
-        Some(serde_json::Value::Number(value)) => {
-            value.as_i64().is_some_and(|i| i != 0) || value.as_u64().is_some_and(|u| u != 0)
-        }
+        Some(serde_json::Value::Number(n)) => nonzero_int(n.as_i64(), n.as_u64()),
         _ => false,
     }
 }
@@ -469,42 +459,26 @@ fn provider_proxy_names(value: Option<&Value>, errors: &mut Vec<String>) -> Vec<
     match value {
         None => Vec::new(),
         Some(Value::Sequence(items)) => {
+            let mut names = Vec::new();
             for (index, item) in items.iter().enumerate() {
-                let valid = match item {
-                    Value::Mapping(mapping) => mihomo_key(mapping, "name")
-                        .and_then(|key| mapping.get(&key))
-                        .and_then(Value::as_str)
-                        .is_some_and(|name| !name.trim().is_empty()),
-                    _ => false,
-                };
-                if !valid {
+                let name = item
+                    .as_mapping()
+                    .and_then(|mapping| mihomo_get(mapping, "name"))
+                    .and_then(Value::as_str);
+                if !name.is_some_and(|name| !name.trim().is_empty()) {
                     errors.push(format!(
                         "provider proxy at index {} must be a mapping with a non-empty string name",
                         index + 1
                     ));
                 }
+                names.extend(name.map(str::to_string));
             }
-            names_in(value)
+            names
         }
         Some(_) => {
             errors.push("provider `proxies` must be a sequence".into());
             Vec::new()
         }
-    }
-}
-
-/// 从 `proxies`/`proxy-groups` 值中提取各代理/分组的 `name`,兼容 Mihomo 键名变体。
-fn names_in(value: Option<&Value>) -> Vec<String> {
-    match value {
-        Some(Value::Sequence(items)) => items
-            .iter()
-            .filter_map(|item| {
-                let mapping = item.as_mapping()?;
-                let key = mihomo_key(mapping, "name")?;
-                mapping.get(&key)?.as_str().map(str::to_string)
-            })
-            .collect(),
-        _ => Vec::new(),
     }
 }
 
@@ -583,8 +557,7 @@ fn apply_reality_mlkem(proxies: &mut [Value], inject: bool) -> Vec<String> {
         let Some(Value::Mapping(opts)) = m.get_mut(&opts_key) else {
             continue;
         };
-        let has_public_key = mihomo_key(opts, "public-key")
-            .and_then(|k| opts.get(&k))
+        let has_public_key = mihomo_get(opts, "public-key")
             .and_then(Value::as_str)
             .is_some_and(|s| !s.is_empty());
         if !has_public_key {
@@ -609,14 +582,9 @@ fn apply_reality_mlkem(proxies: &mut [Value], inject: bool) -> Vec<String> {
         if !enabled {
             continue;
         }
-        let fingerprint = mihomo_key(m, "client-fingerprint")
-            .and_then(|k| m.get(&k))
-            .and_then(Value::as_str);
+        let fingerprint = mihomo_get(m, "client-fingerprint").and_then(Value::as_str);
         if fingerprint != Some("chrome") {
-            let name = mihomo_key(m, "name")
-                .and_then(|key| m.get(&key))
-                .and_then(Value::as_str)
-                .unwrap_or("?");
+            let name = mihomo_get(m, "name").and_then(Value::as_str).unwrap_or("?");
             fingerprint_risks.push(name.to_string());
         }
     }
@@ -630,22 +598,31 @@ fn mihomo_key(m: &Mapping, name: &str) -> Option<Value> {
         return Some(Value::from(name));
     }
     m.keys()
-        .find(|k| {
-            k.as_str()
-                .is_some_and(|s| s.replace('_', "-").eq_ignore_ascii_case(name))
-        })
+        .find(|k| k.as_str().is_some_and(|s| mihomo_key_matches(s, name)))
         .cloned()
+}
+
+/// 按 [`mihomo_key`] 的规则读取字段值。
+fn mihomo_get<'a>(m: &'a Mapping, name: &str) -> Option<&'a Value> {
+    m.get(mihomo_key(m, name)?)
+}
+
+/// mihomo 字段名的宽松匹配:把 `_` 视作 `-` 后忽略大小写比较。YAML 节点与 JSON 分组选项共用。
+fn mihomo_key_matches(key: &str, name: &str) -> bool {
+    key.replace('_', "-").eq_ignore_ascii_case(name)
 }
 
 /// mihomo 解码 bool 字段的取值:布尔原样,整数非零为真;其余类型 mihomo 会拒绝加载该节点,按假处理。
 fn mihomo_bool(value: &Value) -> bool {
     match value {
         Value::Bool(b) => *b,
-        Value::Number(n) => {
-            n.as_i64().is_some_and(|i| i != 0) || n.as_u64().is_some_and(|u| u != 0)
-        }
+        Value::Number(n) => nonzero_int(n.as_i64(), n.as_u64()),
         _ => false,
     }
+}
+
+fn nonzero_int(signed: Option<i64>, unsigned: Option<u64>) -> bool {
+    signed.is_some_and(|i| i != 0) || unsigned.is_some_and(|u| u != 0)
 }
 
 fn build_group(group: CustomGroup) -> Mapping {
@@ -675,7 +652,7 @@ const RULE_PROVIDER_INTERVAL: i64 = 86400;
 /// 规则集在不同订阅 token 或上游地址之间共享缓存文件。
 fn build_rule_provider(rp: &RuleProvider) -> Value {
     let digest = Sha256::digest(rp.url.as_bytes());
-    let short_digest: String = digest[..8].iter().map(|b| format!("{b:02x}")).collect();
+    let short_digest = crate::util::hex(&digest[..8]);
     let mut m = Mapping::new();
     m.insert(Value::from("type"), Value::from("http"));
     m.insert(Value::from("behavior"), Value::from(rp.behavior.clone()));
@@ -702,8 +679,7 @@ fn validate_rule_provider_paths(value: Option<&Value>, errors: &mut Vec<String>)
         let Some(mapping) = provider.as_mapping() else {
             continue;
         };
-        let Some(path) = mihomo_key(mapping, "path")
-            .and_then(|key| mapping.get(&key))
+        let Some(path) = mihomo_get(mapping, "path")
             .and_then(Value::as_str)
             .filter(|path| !path.is_empty())
         else {
@@ -893,6 +869,17 @@ fn rule_lines(rules: &str) -> impl Iterator<Item = (usize, &str)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn names_in(value: Option<&Value>) -> Vec<String> {
+        match value {
+            Some(Value::Sequence(items)) => items
+                .iter()
+                .filter_map(|item| mihomo_get(item.as_mapping()?, "name")?.as_str())
+                .map(str::to_string)
+                .collect(),
+            _ => Vec::new(),
+        }
+    }
 
     #[test]
     fn convert_reports_rule_provider_name_collisions() {

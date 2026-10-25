@@ -22,7 +22,7 @@ use crate::util::{now, random_token, MAX_ORDER_ENTRIES, MAX_ORDER_NAME_LEN};
 use crate::yaml;
 
 // Mihomo 支持的代理分组类型白名单(上游已移除 relay,见迁移 0018);手动创建与机场导入共用同一过滤。
-const GROUP_TYPES: [&str; 4] = ["select", "url-test", "fallback", "load-balance"];
+use crate::converter::SUPPORTED_GROUP_TYPES as GROUP_TYPES;
 
 // ─── DB 行类型 ─────────────────────────────────────────────────────────────────
 
@@ -306,18 +306,25 @@ async fn detail(state: &AppState, row: ProfileRow) -> ApiResult<ProfileDetail> {
     // 指纹风险名单随缓存保存;与 `list_proxies_and_groups` 同一判定:只有来源版本与公开能力
     // 都和当前一致的缓存才有效,上下文不明/过期的缓存不展示其名单。
     let expected_hash = state.current_capability_hash(&row.token);
-    let reality_fingerprint_risks = sqlx::query_scalar::<_, Option<String>>(
-        "SELECT reality_fingerprint_risks FROM generated_cache \
-         WHERE profile_id = ? AND source_revision = ? AND capability_hash = ?",
-    )
-    .bind(&profile_id)
-    .bind(row.source_revision)
-    .bind(&expected_hash)
-    .fetch_optional(&state.db)
-    .await?
-    .flatten()
-    .and_then(|risks| serde_json::from_str(&risks).ok())
-    .unwrap_or_default();
+    let reality_fingerprint_risks =
+        sqlx::query_as::<_, (Option<String>, Option<i64>, Option<String>)>(
+            "SELECT reality_fingerprint_risks, source_revision, capability_hash \
+             FROM generated_cache WHERE profile_id = ?",
+        )
+        .bind(&profile_id)
+        .fetch_optional(&state.db)
+        .await?
+        .filter(|(_, revision, hash)| {
+            crate::generate::cache_context_matches(
+                *revision,
+                hash.as_deref(),
+                row.source_revision,
+                &expected_hash,
+            )
+        })
+        .and_then(|(risks, _, _)| risks)
+        .and_then(|risks| serde_json::from_str(&risks).ok())
+        .unwrap_or_default();
 
     Ok(ProfileDetail {
         summary: summary(state, row),
@@ -357,9 +364,9 @@ pub async fn update(
         .keyed_lock
         .run(&id, async {
             let existing = load_profile_row(&state, &id).await?;
-            let source_changed = provided_url
+            let new_url = provided_url
                 .as_deref()
-                .is_some_and(|u| u != existing.source_url);
+                .filter(|u| *u != existing.source_url);
 
             // 只更新实际提供的字段:赋值列是固定字面值(调用方输入只走绑定值)。
             // 注意 `Separated` 的 push 与 push_bind 都会插入分隔符,故占位符用 unseparated 变体。
@@ -369,17 +376,13 @@ pub async fn update(
                 if let Some(n) = &name {
                     sets.push("name = ").push_bind_unseparated(n.as_str());
                 }
-                if source_changed {
-                    if let Some(u) = &provided_url {
-                        sets.push("source_url = ").push_bind_unseparated(u.as_str());
-                    }
-                }
                 if let Some(m) = body.reality_mlkem {
                     sets.push("reality_mlkem = ").push_bind_unseparated(m);
                 }
-                if source_changed {
+                if let Some(u) = new_url {
                     // 换源:递增来源版本(在途的旧来源回源结果据此丢弃)、重置公开刷新时间
                     // (下一次公开拉取立即回源)。
+                    sets.push("source_url = ").push_bind_unseparated(u);
                     sets.push("source_revision = source_revision + 1");
                     sets.push("public_refresh_at = NULL");
                 }
@@ -388,7 +391,7 @@ pub async fn update(
             qb.push(" WHERE id = ").push_bind(id.as_str());
             let q = qb.build();
 
-            if source_changed {
+            if new_url.is_some() {
                 // UPDATE 与缓存删除同一事务提交:换源后绝不留旧来源缓存(不做跨换源回退,
                 // 避免界面已显示新来源却仍下发旧节点)。
                 let mut tx = state.db.begin().await?;
@@ -590,7 +593,12 @@ pub async fn list_proxies_and_groups(
     // 上下文不明(NULL)或已过期的缓存不得当作有效输出展示。
     let expected_hash = state.current_capability_hash(&row.token);
     let usable = cache.filter(|(_, _, revision, hash)| {
-        *revision == Some(row.source_revision) && hash.as_deref() == Some(expected_hash.as_str())
+        crate::generate::cache_context_matches(
+            *revision,
+            hash.as_deref(),
+            row.source_revision,
+            &expected_hash,
+        )
     });
 
     let Some((output_yaml, generated_at, _, _)) = usable else {

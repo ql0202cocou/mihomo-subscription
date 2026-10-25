@@ -84,6 +84,8 @@ struct Built {
     ruleset_conflicts: Vec<String>,
     /// ML-KEM 已开启但指纹不是 chrome 的 REALITY 节点名;随缓存保存,供详情页常驻告警。
     reality_fingerprint_risks: Vec<String>,
+    /// 输出的分组名(按输出顺序),回写为 `profiles.group_order` 快照。
+    group_names: Vec<String>,
     context: BuildContext,
     group_order_before: Option<String>,
 }
@@ -235,27 +237,28 @@ pub async fn public_sub(
     let Ok(Path((prefix, token))) = path else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    let lookup = async { load_core_by_token(&state, &token).await.ok().flatten() };
-    let profile = match state.public_gate(&prefix, lookup).await {
-        Some(p) => p,
-        None => return StatusCode::NOT_FOUND.into_response(),
+    let Some(profile) = gated_core(&state, &prefix, &token).await else {
+        return StatusCode::NOT_FOUND.into_response();
     };
 
     let served = serve_or_refresh(&state, &profile, &prefix).await;
     // 锁等待、回源、转换过程中可能已轮换能力;交付前再次校验前缀和 token。
-    if state
-        .public_gate(&prefix, async {
-            load_core_by_token(&state, &token).await.ok().flatten()
-        })
-        .await
-        .is_none()
-    {
+    if gated_core(&state, &prefix, &token).await.is_none() {
         return StatusCode::NOT_FOUND.into_response();
     }
     match served {
         Some(served) => public_response(&profile.name, served),
         None => StatusCode::SERVICE_UNAVAILABLE.into_response(),
     }
+}
+
+/// 经 [`AppState::public_gate`] 按前缀与 token 定位 profile;任一不符(或查询失败)返回 `None`。
+async fn gated_core(state: &AppState, prefix: &str, token: &str) -> Option<ProfileCore> {
+    state
+        .public_gate(prefix, async {
+            load_core_by_token(state, token).await.ok().flatten()
+        })
+        .await
 }
 
 // ─── 公开 serve/refresh(带 single-flight）──────────────────────────────────
@@ -274,9 +277,7 @@ async fn serve_or_refresh(state: &AppState, profile: &ProfileCore, prefix: &str)
     state
         .keyed_lock
         .run(&profile.id, async {
-            let current = state.public_gate(prefix, async {
-                load_core_by_token(state, &profile.token).await.ok().flatten()
-            }).await?;
+            let current = gated_core(state, prefix, &profile.token).await?;
             let profile = &current;
             // 只有来源与公开能力都匹配的缓存才能进入新鲜复用和失败兜底。
             let cached = load_usable_cache(state, profile, prefix).await;
@@ -284,12 +285,15 @@ async fn serve_or_refresh(state: &AppState, profile: &ProfileCore, prefix: &str)
                 is_fresh(&cache.generated_at, state.public_refresh_min_interval)
                     || completed_since(&cache.generated_at, &arrived)
             });
+            if serve_cached {
+                return cached.map(Served::from);
+            }
             let attempted = sqlx::query_scalar::<_, Option<String>>("SELECT public_refresh_at FROM profiles WHERE id = ?")
                 .bind(&profile.id).fetch_optional(&state.db).await.ok().flatten().flatten();
             let recent_attempt = attempted.as_deref().is_some_and(|at| {
                 is_fresh(at, state.public_refresh_min_interval) || completed_since(at, &arrived)
             });
-            if serve_cached || recent_attempt {
+            if recent_attempt {
                 return cached.map(Served::from);
             }
             let attempt_prefix = state.current_prefix();
@@ -325,9 +329,23 @@ async fn serve_or_refresh(state: &AppState, profile: &ProfileCore, prefix: &str)
 }
 
 fn cache_is_compatible(cache: &CacheRow, profile: &ProfileCore, prefix: &str) -> bool {
-    let expected = capability_hash(&profile.token, prefix);
-    cache.source_revision == Some(profile.source_revision)
-        && cache.capability_hash.as_deref() == Some(expected.as_str())
+    cache_context_matches(
+        cache.source_revision,
+        cache.capability_hash.as_deref(),
+        profile.source_revision,
+        &capability_hash(&profile.token, prefix),
+    )
+}
+
+/// 缓存记录的构建上下文(来源版本、能力摘要)是否与当前一致;NULL(旧缓存/已标脏)一律不一致。
+/// 公开端点与管理端展示共用这一判定。
+pub(crate) fn cache_context_matches(
+    revision: Option<i64>,
+    hash: Option<&str>,
+    source_revision: i64,
+    expected_hash: &str,
+) -> bool {
+    revision == Some(source_revision) && hash == Some(expected_hash)
 }
 
 /// 在 profile 锁内验证缓存上下文。仅能力变化可离线迁移;来源未知或变化时必须在线重建。
@@ -475,6 +493,7 @@ impl Converted {
             yaml,
             ruleset_conflicts,
             reality_fingerprint_risks,
+            group_names,
         } = self.output;
         Built {
             content_hash: content_hash_of(&yaml),
@@ -485,6 +504,7 @@ impl Converted {
             generated_at,
             ruleset_conflicts,
             reality_fingerprint_risks,
+            group_names,
             context,
             group_order_before: self.group_order_before,
         }
@@ -624,11 +644,7 @@ async fn convert(
 }
 
 fn direct_rule_url(raw: &str) -> Option<String> {
-    let url = url::Url::parse(raw).ok()?;
-    if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none_or(str::is_empty) {
-        return None;
-    }
-    Some(url.to_string())
+    crate::rulelib::parse_http_url(raw).map(|url| url.to_string())
 }
 
 fn map_convert_err(e: ConvertError) -> ApiError {
@@ -736,7 +752,7 @@ async fn persist_cache_and_group_order(
     if snapshot_group_order(
         state,
         profile_id,
-        &built.yaml,
+        &built.group_names,
         built.context.source_revision,
         &built.group_order_before,
     )
@@ -753,14 +769,15 @@ async fn persist_cache_and_group_order(
 async fn snapshot_group_order(
     state: &AppState,
     profile_id: &str,
-    yaml: &str,
+    group_names: &[String],
     source_revision: i64,
     expected: &Option<String>,
 ) -> ApiResult<()> {
-    let Ok(root) = crate::yaml::parse_generated_limited(yaml) else {
-        return Ok(());
+    let group_order = if group_names.is_empty() {
+        None
+    } else {
+        serde_json::to_string(group_names).ok()
     };
-    let group_order = order_json(&root, "proxy-groups", |_| true);
     sqlx::query(
         "UPDATE profiles SET group_order = ? \
          WHERE id = ? AND source_revision = ? AND group_order IS ?",
@@ -772,23 +789,6 @@ async fn snapshot_group_order(
     .execute(&state.db)
     .await?;
     Ok(())
-}
-
-/// 提取某顶层序列的有序 `name`,仅保留匹配 `keep` 的,序列化为 JSON 数组;无则 `None`(→ SQL NULL)。
-fn order_json(root: &serde_yaml::Value, key: &str, keep: impl Fn(&str) -> bool) -> Option<String> {
-    let names: Vec<&str> = match root.get(key) {
-        Some(serde_yaml::Value::Sequence(items)) => items
-            .iter()
-            .filter_map(|item| item.get("name").and_then(|v| v.as_str()))
-            .filter(|n| keep(n))
-            .collect(),
-        _ => Vec::new(),
-    };
-    if names.is_empty() {
-        None
-    } else {
-        serde_json::to_string(&names).ok()
-    }
 }
 
 async fn update_last_fetch(
@@ -992,11 +992,7 @@ pub async fn regenerate_all_for_rotation(state: &AppState) {
 fn content_hash_of(output_yaml: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(output_yaml.as_bytes());
-    hex(hasher.finalize().as_slice())
-}
-
-fn hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
+    crate::util::hex(&hasher.finalize())
 }
 
 fn yaml_body(yaml: String) -> Response {
