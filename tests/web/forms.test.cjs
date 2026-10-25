@@ -1,6 +1,6 @@
 const assert = require('node:assert/strict');
 const { test } = require('node:test');
-const { load, hooks, find, tick, translation, icons } = require('./helpers.cjs');
+const { load, hooks, find, tick, translation, icons, dndMocks } = require('./helpers.cjs');
 
 // 表单层行为:节点/分组编辑器的键值累积、YAML 草稿、数值约束与类型输入。
 
@@ -193,14 +193,6 @@ test('kind switching converts from the current draft, not a stale parsed value',
   assert.equal(valueEditor(tree).props.value, '{broken');
 });
 
-const passthrough = ({ children }) => children;
-const arrayMove = (arr, from, to) => {
-  const next = arr.slice();
-  const [moved] = next.splice(from, 1);
-  next.splice(to, 0, moved);
-  return next;
-};
-
 test('group form keeps `__proto__` advanced options through save and confirms once', async () => {
   const state = hooks();
   const posts = [];
@@ -226,22 +218,7 @@ test('group form keeps `__proto__` advanced options through save and confirms on
       Select: 'Select',
     },
     '@ant-design/icons': icons,
-    '@dnd-kit/core': {
-      DndContext: passthrough,
-      PointerSensor: 'PointerSensor',
-      KeyboardSensor: 'KeyboardSensor',
-      closestCenter: () => {},
-      useSensor: (s) => (sensors.push(s), {}),
-      useSensors: () => [],
-    },
-    '@dnd-kit/sortable': {
-      SortableContext: passthrough,
-      arrayMove,
-      sortableKeyboardCoordinates: () => {},
-      useSortable: () => ({ attributes: {}, listeners: {}, setNodeRef: () => {} }),
-      verticalListSortingStrategy: {},
-    },
-    '@dnd-kit/utilities': { CSS: { Transform: { toString: () => undefined } } },
+    ...dndMocks(sensors),
     'react-i18next': translation,
     '../../api': { api, errorMessage: () => 'failed' },
     '../../components/fields': {

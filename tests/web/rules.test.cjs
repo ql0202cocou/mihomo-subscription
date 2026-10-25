@@ -1,26 +1,11 @@
 const assert = require('node:assert/strict');
 const { test } = require('node:test');
-const { load, hooks, find, deferred, tick, translation, icons, React } = require('./helpers.cjs');
+const {
+  load, hooks, find, findAll, deferred, tick, translation, icons, passthrough, arrayMove,
+} = require('./helpers.cjs');
 
 // 装配与 detail_state.test.cjs 同风格,但 useSerialSave / ruleRefs / groupSchema /
 // ruleSetConstants 一律用真实模块,只替身 antd、图标与 dnd-kit。
-const passthrough = ({ children }) => children;
-const arrayMove = (arr, from, to) => {
-  const next = arr.slice();
-  const [moved] = next.splice(from, 1);
-  next.splice(to, 0, moved);
-  return next;
-};
-
-function findAll(element, predicate, out = []) {
-  if (!element || typeof element !== 'object') return out;
-  if (predicate(element)) out.push(element);
-  for (const child of React.Children.toArray(element.props?.children)) {
-    findAll(child, predicate, out);
-  }
-  return out;
-}
-
 // 列表行(SortableRuleRow)带 onRemove;钉底的 MATCH 行(MatchRow)只有 onEdit。
 const isRow = (e) => typeof e.props?.line === 'string' && typeof e.props?.onRemove === 'function';
 const isMatchRow = (e) =>

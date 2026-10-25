@@ -7,33 +7,20 @@
 mod common;
 
 use std::sync::Arc;
-use std::time::Duration;
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use axum::Router;
 use mihomo_subscription::app::build_router;
-use mihomo_subscription::fetch::{FetchError, Fetched, RemoteFetcher};
 use serde_json::Value;
 use tower::util::ServiceExt;
 
-use common::{authed, json, login, test_state_with_fetcher, text, TempDb};
+use common::{
+    authed, cached_app, json, login, sub_path, test_state_with_fetcher, text, BodyFetcher, TempDb,
+};
 
 const PROVIDER_YAML: &str =
     "proxies:\n  - { name: hk-1, type: ss, server: 1.2.3.4, port: 8388 }\nrules:\n  - MATCH,DIRECT\n";
-
-#[derive(Clone, Default)]
-struct FakeFetcher;
-
-#[async_trait::async_trait]
-impl RemoteFetcher for FakeFetcher {
-    async fn fetch(&self, _url: &str) -> Result<Fetched, FetchError> {
-        Ok(Fetched {
-            body: PROVIDER_YAML.to_string(),
-            subscription_userinfo: None,
-        })
-    }
-}
 
 /// 建 profile,返回 (id, token, 订阅相对路径)。
 async fn create_profile(app: &Router, cookie: &str, name: &str) -> (String, String, String) {
@@ -51,11 +38,7 @@ async fn create_profile(app: &Router, cookie: &str, name: &str) -> (String, Stri
     let id = profile["id"].as_str().unwrap().to_string();
     let sub = profile["subscription_url"].as_str().unwrap();
     let token = sub.rsplit('/').next().unwrap().to_string();
-    let sub_path = {
-        let after = sub.split("://").nth(1).unwrap();
-        after[after.find('/').unwrap()..].to_string()
-    };
-    (id, token, sub_path)
+    (id, token, sub_path(sub))
 }
 
 async fn create_rs(app: &Router, cookie: &str, profile_id: &str, body: &str) -> Value {
@@ -89,7 +72,8 @@ async fn put_rules(app: &Router, cookie: &str, profile_id: &str, content: &str) 
 #[tokio::test]
 async fn crud_is_per_profile_and_name_unique_within_profile() {
     let temp = TempDb::new();
-    let app = build_router(test_state_with_fetcher(&temp, Arc::new(FakeFetcher)).await);
+    let app =
+        build_router(test_state_with_fetcher(&temp, Arc::new(BodyFetcher(PROVIDER_YAML))).await);
     let cookie = login(&app).await;
     let (p1, token1, _) = create_profile(&app, &cookie, "P1").await;
     let (p2, _token2, _) = create_profile(&app, &cookie, "P2").await;
@@ -172,7 +156,8 @@ async fn crud_is_per_profile_and_name_unique_within_profile() {
 #[tokio::test]
 async fn public_serve_is_token_scoped_and_404s() {
     let temp = TempDb::new();
-    let app = build_router(test_state_with_fetcher(&temp, Arc::new(FakeFetcher)).await);
+    let app =
+        build_router(test_state_with_fetcher(&temp, Arc::new(BodyFetcher(PROVIDER_YAML))).await);
     let cookie = login(&app).await;
     let (p1, token1, _) = create_profile(&app, &cookie, "P1").await;
     let (_p2, token2, _) = create_profile(&app, &cookie, "P2").await;
@@ -231,7 +216,8 @@ async fn public_serve_is_token_scoped_and_404s() {
 #[tokio::test]
 async fn referenced_rule_set_injected_with_token_scoped_link() {
     let temp = TempDb::new();
-    let app = build_router(test_state_with_fetcher(&temp, Arc::new(FakeFetcher)).await);
+    let app =
+        build_router(test_state_with_fetcher(&temp, Arc::new(BodyFetcher(PROVIDER_YAML))).await);
     let cookie = login(&app).await;
     let (p1, token1, sub_path) = create_profile(&app, &cookie, "P1").await;
 
@@ -271,7 +257,8 @@ async fn referenced_rule_set_injected_with_token_scoped_link() {
 #[tokio::test]
 async fn logic_nested_rule_set_reference_is_injected() {
     let temp = TempDb::new();
-    let app = build_router(test_state_with_fetcher(&temp, Arc::new(FakeFetcher)).await);
+    let app =
+        build_router(test_state_with_fetcher(&temp, Arc::new(BodyFetcher(PROVIDER_YAML))).await);
     let cookie = login(&app).await;
     let (p1, token1, sub_path) = create_profile(&app, &cookie, "P1").await;
 
@@ -322,7 +309,8 @@ async fn logic_nested_rule_set_reference_is_injected() {
 #[tokio::test]
 async fn remote_cache_off_injects_upstream_url() {
     let temp = TempDb::new();
-    let app = build_router(test_state_with_fetcher(&temp, Arc::new(FakeFetcher)).await);
+    let app =
+        build_router(test_state_with_fetcher(&temp, Arc::new(BodyFetcher(PROVIDER_YAML))).await);
     let cookie = login(&app).await;
     let (p1, token1, sub_path) = create_profile(&app, &cookie, "P1").await;
 
@@ -368,7 +356,8 @@ async fn remote_cache_off_injects_upstream_url() {
 #[tokio::test]
 async fn import_from_global_copies_and_appends_rule() {
     let temp = TempDb::new();
-    let app = build_router(test_state_with_fetcher(&temp, Arc::new(FakeFetcher)).await);
+    let app =
+        build_router(test_state_with_fetcher(&temp, Arc::new(BodyFetcher(PROVIDER_YAML))).await);
     let cookie = login(&app).await;
     let (p1, token1, sub_path) = create_profile(&app, &cookie, "P1").await;
 
@@ -437,17 +426,6 @@ async fn import_from_global_copies_and_appends_rule() {
     )));
 }
 
-/// 公开刷新间隔足够长的 app:公开拉取直接返回缓存而不回源重生成,用于验证「编辑后的缓存本身」。
-/// 返回的 DB 句柄用于直接布置/检查库内状态(如模拟升级前的旧缓存)。
-async fn cached_app(temp: &TempDb) -> (Router, sqlx::SqlitePool) {
-    let mut state = test_state_with_fetcher(temp, Arc::new(FakeFetcher)).await;
-    Arc::get_mut(&mut state)
-        .unwrap()
-        .public_refresh_min_interval = Duration::from_secs(3600);
-    let db = state.db.clone();
-    (build_router(state), db)
-}
-
 async fn get_text(app: &Router, path: &str) -> String {
     let resp = app
         .clone()
@@ -461,7 +439,7 @@ async fn get_text(app: &Router, path: &str) -> String {
 #[tokio::test]
 async fn import_injects_rule_provider_into_served_cache() {
     let temp = TempDb::new();
-    let (app, _) = cached_app(&temp).await;
+    let (app, _) = cached_app(&temp, Arc::new(BodyFetcher(PROVIDER_YAML))).await;
     let cookie = login(&app).await;
     let (p1, token1, sub_path) = create_profile(&app, &cookie, "P1").await;
 
@@ -495,7 +473,7 @@ async fn import_injects_rule_provider_into_served_cache() {
 #[tokio::test]
 async fn import_inserts_rule_before_the_fallback_match() {
     let temp = TempDb::new();
-    let (app, _) = cached_app(&temp).await;
+    let (app, _) = cached_app(&temp, Arc::new(BodyFetcher(PROVIDER_YAML))).await;
     let cookie = login(&app).await;
     let (p1, _, sub_path) = create_profile(&app, &cookie, "P1").await;
     put_rules(&app, &cookie, &p1, "MATCH,DIRECT").await;
@@ -541,7 +519,7 @@ async fn import_inserts_rule_before_the_fallback_match() {
 #[tokio::test]
 async fn reset_token_rewrites_hosted_rule_set_links_in_cache() {
     let temp = TempDb::new();
-    let (app, _) = cached_app(&temp).await;
+    let (app, _) = cached_app(&temp, Arc::new(BodyFetcher(PROVIDER_YAML))).await;
     let cookie = login(&app).await;
     let (p1, old_token, _) = create_profile(&app, &cookie, "P1").await;
     create_rs(
@@ -575,7 +553,7 @@ async fn reset_token_rewrites_hosted_rule_set_links_in_cache() {
 #[tokio::test]
 async fn reset_public_path_rewrites_hosted_rule_set_links_in_cache() {
     let temp = TempDb::new();
-    let (app, _) = cached_app(&temp).await;
+    let (app, _) = cached_app(&temp, Arc::new(BodyFetcher(PROVIDER_YAML))).await;
     let cookie = login(&app).await;
     let (p1, token1, _) = create_profile(&app, &cookie, "P1").await;
     create_rs(
@@ -613,7 +591,7 @@ async fn reset_public_path_rewrites_hosted_rule_set_links_in_cache() {
 async fn rotation_after_invalid_edit_migrates_links_with_last_valid_rules() {
     for rotate_prefix in [false, true] {
         let temp = TempDb::new();
-        let (app, _) = cached_app(&temp).await;
+        let (app, _) = cached_app(&temp, Arc::new(BodyFetcher(PROVIDER_YAML))).await;
         let cookie = login(&app).await;
         let (p1, old_token, old_path) = create_profile(&app, &cookie, "P1").await;
         create_rs(
@@ -699,7 +677,7 @@ async fn rotation_after_invalid_edit_migrates_links_with_last_valid_rules() {
 #[tokio::test]
 async fn rotation_without_valid_rules_clears_cached_subscription() {
     let temp = TempDb::new();
-    let (app, db) = cached_app(&temp).await;
+    let (app, db) = cached_app(&temp, Arc::new(BodyFetcher(PROVIDER_YAML))).await;
     let cookie = login(&app).await;
     let (p1, _, _) = create_profile(&app, &cookie, "P1").await;
     let rs = create_rs(
@@ -750,7 +728,8 @@ async fn rotation_without_valid_rules_clears_cached_subscription() {
 #[tokio::test]
 async fn generate_rejects_rule_referencing_disabled_rule_set() {
     let temp = TempDb::new();
-    let app = build_router(test_state_with_fetcher(&temp, Arc::new(FakeFetcher)).await);
+    let app =
+        build_router(test_state_with_fetcher(&temp, Arc::new(BodyFetcher(PROVIDER_YAML))).await);
     let cookie = login(&app).await;
     let (p1, _, _) = create_profile(&app, &cookie, "P1").await;
     let rs = create_rs(
@@ -793,7 +772,8 @@ async fn generate_rejects_rule_referencing_disabled_rule_set() {
 #[tokio::test]
 async fn import_rejects_malformed_policy_without_writing() {
     let temp = TempDb::new();
-    let app = build_router(test_state_with_fetcher(&temp, Arc::new(FakeFetcher)).await);
+    let app =
+        build_router(test_state_with_fetcher(&temp, Arc::new(BodyFetcher(PROVIDER_YAML))).await);
     let cookie = login(&app).await;
     let (p1, _, _) = create_profile(&app, &cookie, "P1").await;
     app.clone()
@@ -844,7 +824,8 @@ async fn import_rejects_malformed_policy_without_writing() {
 #[tokio::test]
 async fn referenced_rule_set_is_protected_from_rename_disable_and_delete() {
     let temp = TempDb::new();
-    let app = build_router(test_state_with_fetcher(&temp, Arc::new(FakeFetcher)).await);
+    let app =
+        build_router(test_state_with_fetcher(&temp, Arc::new(BodyFetcher(PROVIDER_YAML))).await);
     let cookie = login(&app).await;
     let (p1, _, _) = create_profile(&app, &cookie, "P1").await;
     let rs = create_rs(
@@ -918,7 +899,7 @@ async fn referenced_rule_set_is_protected_from_rename_disable_and_delete() {
 #[tokio::test]
 async fn create_completing_a_reference_regenerates_cache() {
     let temp = TempDb::new();
-    let (app, _) = cached_app(&temp).await;
+    let (app, _) = cached_app(&temp, Arc::new(BodyFetcher(PROVIDER_YAML))).await;
     let cookie = login(&app).await;
     let (p1, token1, sub_path) = create_profile(&app, &cookie, "P1").await;
 
@@ -964,7 +945,7 @@ async fn create_completing_a_reference_regenerates_cache() {
 #[tokio::test]
 async fn update_renewing_behavior_or_format_rewrites_cached_links() {
     let temp = TempDb::new();
-    let (app, _) = cached_app(&temp).await;
+    let (app, _) = cached_app(&temp, Arc::new(BodyFetcher(PROVIDER_YAML))).await;
     let cookie = login(&app).await;
     let (p1, token1, sub_path) = create_profile(&app, &cookie, "P1").await;
     let rs = create_rs(
@@ -1021,7 +1002,7 @@ async fn update_renewing_behavior_or_format_rewrites_cached_links() {
 #[tokio::test]
 async fn manual_content_update_keeps_cache_and_serves_new_content() {
     let temp = TempDb::new();
-    let (app, db) = cached_app(&temp).await;
+    let (app, db) = cached_app(&temp, Arc::new(BodyFetcher(PROVIDER_YAML))).await;
     let cookie = login(&app).await;
     let (p1, token1, sub_path) = create_profile(&app, &cookie, "P1").await;
     let rs = create_rs(
@@ -1081,7 +1062,7 @@ async fn manual_content_update_keeps_cache_and_serves_new_content() {
 #[tokio::test]
 async fn legacy_cache_rotation_does_not_serve_revoked_token_links() {
     let temp = TempDb::new();
-    let (app, db) = cached_app(&temp).await;
+    let (app, db) = cached_app(&temp, Arc::new(BodyFetcher(PROVIDER_YAML))).await;
     let cookie = login(&app).await;
     let (p1, old_token, _) = create_profile(&app, &cookie, "P1").await;
     create_rs(
@@ -1144,7 +1125,8 @@ async fn legacy_cache_rotation_does_not_serve_revoked_token_links() {
 #[tokio::test]
 async fn import_skips_names_missing_from_the_global_library() {
     let temp = TempDb::new();
-    let app = build_router(test_state_with_fetcher(&temp, Arc::new(FakeFetcher)).await);
+    let app =
+        build_router(test_state_with_fetcher(&temp, Arc::new(BodyFetcher(PROVIDER_YAML))).await);
     let cookie = login(&app).await;
     let (p1, _, _) = create_profile(&app, &cookie, "P1").await;
     // ② 里只有 real;ghost 不存在。
@@ -1229,7 +1211,7 @@ async fn import_skips_names_missing_from_the_global_library() {
 #[tokio::test]
 async fn import_skips_unsupported_legacy_definitions() {
     let temp = TempDb::new();
-    let state = test_state_with_fetcher(&temp, Arc::new(FakeFetcher)).await;
+    let state = test_state_with_fetcher(&temp, Arc::new(BodyFetcher(PROVIDER_YAML))).await;
     let app = build_router(state.clone());
     let cookie = login(&app).await;
     let (profile_id, _, _) = create_profile(&app, &cookie, "P1").await;
@@ -1292,7 +1274,7 @@ async fn import_skips_unsupported_legacy_definitions() {
 #[tokio::test]
 async fn legacy_invalid_rule_providers_are_rejected() {
     let temp = TempDb::new();
-    let state = test_state_with_fetcher(&temp, Arc::new(FakeFetcher)).await;
+    let state = test_state_with_fetcher(&temp, Arc::new(BodyFetcher(PROVIDER_YAML))).await;
     let app = build_router(state.clone());
     let cookie = login(&app).await;
     let (profile_id, _, _) = create_profile(&app, &cookie, "P1").await;
@@ -1364,7 +1346,8 @@ async fn legacy_invalid_rule_providers_are_rejected() {
 #[tokio::test]
 async fn import_validates_names_before_writing() {
     let temp = TempDb::new();
-    let app = build_router(test_state_with_fetcher(&temp, Arc::new(FakeFetcher)).await);
+    let app =
+        build_router(test_state_with_fetcher(&temp, Arc::new(BodyFetcher(PROVIDER_YAML))).await);
     let cookie = login(&app).await;
     let (p1, _, _) = create_profile(&app, &cookie, "P1").await;
     app.clone()

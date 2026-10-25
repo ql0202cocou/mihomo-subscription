@@ -1,11 +1,12 @@
 const assert = require('node:assert/strict');
 const { test } = require('node:test');
-const { load, hooks, find, deferred, tick, translation, icons, webRequire } = require('./helpers.cjs');
+const {
+  load, hooks, find, deferred, tick, translation, icons, webRequire, passthrough, arrayMove,
+} = require('./helpers.cjs');
 const { renderToStaticMarkup } = webRequire('react-dom/server');
 
 test('provider and custom node types render safely, including inherited object keys', () => {
   const schema = load('components/nodeSchema.ts');
-  const passthrough = ({ children }) => children;
   for (const type of ['ss', '__proto__', 'constructor', 'toString', 'new-protocol']) {
     const state = hooks([[{ name: '<em>node</em>', type }], true, ['provider', 'custom']]);
     const { default: NodesCard } = load('pages/detail/NodesCard.tsx', {
@@ -180,13 +181,6 @@ test('detail reloads accept the newest result and an unmounted generation is ign
 });
 
 function rulesCardModule(state, api) {
-  const passthrough = ({ children }) => children;
-  const arrayMove = (arr, from, to) => {
-    const next = arr.slice();
-    const [moved] = next.splice(from, 1);
-    next.splice(to, 0, moved);
-    return next;
-  };
   return load('pages/detail/RulesCard.tsx', {
     react: state.react,
     antd: {

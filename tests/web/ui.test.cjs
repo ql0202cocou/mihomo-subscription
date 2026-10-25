@@ -1,26 +1,11 @@
 const assert = require('node:assert/strict');
 const { test } = require('node:test');
-const { load, hooks, find, deferred, tick, translation, icons, React } = require('./helpers.cjs');
+const {
+  load, hooks, find, findAll, deferred, tick, translation, icons, passthrough, dndMocks,
+} = require('./helpers.cjs');
 
 // 页面层行为:提交防重、加载失败与重试、陈旧读取失效、登录错误映射、会话探活、
 // 主题存储兜底、请求头合并与排序传感器注册。
-
-const passthrough = ({ children }) => children;
-const arrayMove = (arr, from, to) => {
-  const next = arr.slice();
-  const [moved] = next.splice(from, 1);
-  next.splice(to, 0, moved);
-  return next;
-};
-
-function collect(element, predicate, out = []) {
-  if (!element || typeof element !== 'object') return out;
-  if (predicate(element)) out.push(element);
-  for (const child of React.Children.toArray(element.props?.children)) {
-    collect(child, predicate, out);
-  }
-  return out;
-}
 
 const messageLog = () => {
   const log = [];
@@ -39,25 +24,6 @@ const serialImmediate = {
     catch (error) { return { ok: false, error, latest: true }; }
   },
 };
-
-const dndMocks = (sensors) => ({
-  '@dnd-kit/core': {
-    DndContext: passthrough,
-    PointerSensor: 'PointerSensor',
-    KeyboardSensor: 'KeyboardSensor',
-    closestCenter: () => {},
-    useSensor: (s) => (sensors.push(s), {}),
-    useSensors: () => [],
-  },
-  '@dnd-kit/sortable': {
-    SortableContext: passthrough,
-    arrayMove,
-    sortableKeyboardCoordinates: () => {},
-    useSortable: () => ({ attributes: {}, listeners: {}, setNodeRef: () => {} }),
-    verticalListSortingStrategy: {},
-  },
-  '@dnd-kit/utilities': { CSS: { Transform: { toString: () => undefined } } },
-});
 
 // ─── Settings:重置公共路径 ───────────────────────────────────────────────────
 
@@ -199,7 +165,7 @@ function globalNodesModule(state, api, sensors) {
 }
 
 const nodeRowOrder = (tree) =>
-  collect(tree, (e) => e.props?.node?.name).map((e) => e.props.node.name);
+  findAll(tree, (e) => e.props?.node?.name).map((e) => e.props.node.name);
 const node = (name) => ({ id: name, name, node_type: 'ss', content: '', enabled: true });
 
 test('global nodes offer retry after load failure and keep the list on refresh failure', async () => {

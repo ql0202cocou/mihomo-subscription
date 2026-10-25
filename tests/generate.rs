@@ -20,7 +20,9 @@ use mihomo_subscription::rate_limit::RateLimiter;
 use serde_json::Value;
 use tower::util::ServiceExt;
 
-use common::{authed, json, login, test_state_with_fetcher, text, TempDb};
+use common::{
+    authed, cached_app, json, login, sub_path, test_state_with_fetcher, text, BodyFetcher, TempDb,
+};
 
 const PROVIDER_YAML: &str =
     "proxies:\n  - { name: hk-1, type: ss, server: 1.2.3.4, port: 8388 }\nproxy-groups:\n  - { name: Proxy, type: select, proxies: [hk-1] }\nrules:\n  - MATCH,DIRECT\n";
@@ -57,13 +59,6 @@ async fn create_profile(app: &Router, cookie: &str) -> Value {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::CREATED);
     json(resp).await
-}
-
-/// Extract the `/<prefix>/api/sub/<token>` path from a full subscription URL.
-fn sub_path(subscription_url: &str) -> String {
-    let after = subscription_url.split("://").nth(1).unwrap();
-    let idx = after.find('/').unwrap();
-    after[idx..].to_string()
 }
 
 #[tokio::test]
@@ -1080,16 +1075,6 @@ async fn wrong_prefix_and_unknown_token_are_404() {
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 }
 
-/// 公开刷新间隔足够长:公开拉取直接返回缓存,用于验证编辑后的缓存本身。返回 app 与 DB 句柄。
-async fn cached_app(temp: &TempDb) -> (Router, sqlx::SqlitePool) {
-    let mut state = test_state_with_fetcher(temp, Arc::new(FakeFetcher::default())).await;
-    Arc::get_mut(&mut state)
-        .unwrap()
-        .public_refresh_min_interval = Duration::from_secs(3600);
-    let db = state.db.clone();
-    (build_router(state), db)
-}
-
 /// 保存规则并返回响应中的离线重生成结果(`regenerate`)。
 async fn put_rules(app: &Router, cookie: &str, id: &str, content: &str) -> Value {
     let body = serde_json::json!({ "content": content }).to_string();
@@ -1120,7 +1105,7 @@ async fn get_text(app: &Router, path: &str) -> String {
 #[tokio::test]
 async fn invalid_rule_edit_never_reaches_the_served_cache() {
     let temp = TempDb::new();
-    let (app, _) = cached_app(&temp).await;
+    let (app, _) = cached_app(&temp, Arc::new(FakeFetcher::default())).await;
     let cookie = login(&app).await;
     let profile = create_profile(&app, &cookie).await;
     let id = profile["id"].as_str().unwrap();
@@ -1146,7 +1131,7 @@ async fn invalid_rule_edit_never_reaches_the_served_cache() {
 #[tokio::test]
 async fn legacy_cache_without_provider_original_is_left_untouched() {
     let temp = TempDb::new();
-    let (app, db) = cached_app(&temp).await;
+    let (app, db) = cached_app(&temp, Arc::new(FakeFetcher::default())).await;
     let cookie = login(&app).await;
     let profile = create_profile(&app, &cookie).await;
     let id = profile["id"].as_str().unwrap();
@@ -1258,19 +1243,6 @@ async fn capability_mismatch_is_migrated_offline_before_refresh_checks() {
             .await
             .unwrap();
     assert_ne!(stored, "stale");
-}
-
-/// 返回固定正文的 fetcher。
-struct BodyFetcher(&'static str);
-
-#[async_trait::async_trait]
-impl RemoteFetcher for BodyFetcher {
-    async fn fetch(&self, _url: &str) -> Result<Fetched, FetchError> {
-        Ok(Fetched {
-            body: self.0.to_string(),
-            subscription_userinfo: None,
-        })
-    }
 }
 
 #[tokio::test]

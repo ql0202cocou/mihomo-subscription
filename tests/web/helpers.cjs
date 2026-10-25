@@ -96,6 +96,16 @@ function find(element, predicate) {
   return null;
 }
 
+// Collect every element in the tree that matches `predicate`, depth-first.
+function findAll(element, predicate, out = []) {
+  if (!element || typeof element !== 'object') return out;
+  if (predicate(element)) out.push(element);
+  for (const child of React.Children.toArray(element.props?.children)) {
+    findAll(child, predicate, out);
+  }
+  return out;
+}
+
 function deferred() {
   let resolve, reject;
   const promise = new Promise((res, rej) => { resolve = res; reject = rej; });
@@ -103,6 +113,35 @@ function deferred() {
 }
 
 const tick = () => new Promise(setImmediate);
+const passthrough = ({ children }) => children;
+const arrayMove = (arr, from, to) => {
+  const next = arr.slice();
+  const [moved] = next.splice(from, 1);
+  next.splice(to, 0, moved);
+  return next;
+};
+// '@dnd-kit/*' stand-ins whose sensors are recorded by name into `sensors`.
+const dndMocks = (sensors) => ({
+  '@dnd-kit/core': {
+    DndContext: passthrough,
+    PointerSensor: 'PointerSensor',
+    KeyboardSensor: 'KeyboardSensor',
+    closestCenter: () => {},
+    useSensor: (s) => (sensors.push(s), {}),
+    useSensors: () => [],
+  },
+  '@dnd-kit/sortable': {
+    SortableContext: passthrough,
+    arrayMove,
+    sortableKeyboardCoordinates: () => {},
+    useSortable: () => ({ attributes: {}, listeners: {}, setNodeRef: () => {} }),
+    verticalListSortingStrategy: {},
+  },
+  '@dnd-kit/utilities': { CSS: { Transform: { toString: () => undefined } } },
+});
 const translation = { useTranslation: () => ({ t: (key) => key }) };
 const icons = new Proxy({}, { get: () => () => null });
-module.exports = { load, hooks, find, deferred, tick, translation, icons, React, webRequire };
+module.exports = {
+  load, hooks, find, findAll, deferred, tick, translation, icons, React, webRequire,
+  passthrough, arrayMove, dndMocks,
+};

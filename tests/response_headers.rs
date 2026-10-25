@@ -7,7 +7,6 @@ use std::sync::Arc;
 use axum::body::Body;
 use axum::http::{header, Request, Response, StatusCode};
 use mihomo_subscription::app::build_router;
-use mihomo_subscription::fetch::{FetchError, Fetched, RemoteFetcher};
 use tower::ServiceExt;
 
 struct WebDir(PathBuf);
@@ -32,17 +31,7 @@ impl Drop for WebDir {
     }
 }
 
-struct Provider;
-
-#[async_trait::async_trait]
-impl RemoteFetcher for Provider {
-    async fn fetch(&self, _: &str) -> Result<Fetched, FetchError> {
-        Ok(Fetched {
-            body: "proxies:\n  - { name: sample, type: __proto__, server: example.com, port: 443 }\nrules:\n  - MATCH,DIRECT\n".into(),
-            subscription_userinfo: None,
-        })
-    }
-}
+const PROVIDER: &str = "proxies:\n  - { name: sample, type: __proto__, server: example.com, port: 443 }\nrules:\n  - MATCH,DIRECT\n";
 
 fn assert_frame_protection(response: &Response<Body>) {
     assert_eq!(response.headers()[header::X_FRAME_OPTIONS], "DENY");
@@ -56,7 +45,8 @@ fn assert_frame_protection(response: &Response<Body>) {
 async fn spa_deep_links_assets_head_and_not_modified_deny_framing() {
     let temp = common::TempDb::new();
     let web = WebDir::new();
-    let mut state = common::test_state_with_fetcher(&temp, Arc::new(Provider)).await;
+    let mut state =
+        common::test_state_with_fetcher(&temp, Arc::new(common::BodyFetcher(PROVIDER))).await;
     Arc::get_mut(&mut state).unwrap().web_dir = web.0.to_str().unwrap().into();
     let app = build_router(state);
 
@@ -100,7 +90,9 @@ async fn spa_deep_links_assets_head_and_not_modified_deny_framing() {
 #[tokio::test]
 async fn frame_protection_preserves_auth_and_subscription_downloads() {
     let temp = common::TempDb::new();
-    let app = build_router(common::test_state_with_fetcher(&temp, Arc::new(Provider)).await);
+    let app = build_router(
+        common::test_state_with_fetcher(&temp, Arc::new(common::BodyFetcher(PROVIDER))).await,
+    );
     let response = app
         .clone()
         .oneshot(Request::get("/api/profiles").body(Body::empty()).unwrap())
@@ -141,7 +133,8 @@ async fn frame_protection_preserves_auth_and_subscription_downloads() {
 async fn storage_policy_and_public_path_errors_are_consistent() {
     let temp = common::TempDb::new();
     let web = WebDir::new();
-    let mut state = common::test_state_with_fetcher(&temp, Arc::new(Provider)).await;
+    let mut state =
+        common::test_state_with_fetcher(&temp, Arc::new(common::BodyFetcher(PROVIDER))).await;
     Arc::get_mut(&mut state).unwrap().web_dir = web.0.to_str().unwrap().into();
     let app = build_router(state);
 

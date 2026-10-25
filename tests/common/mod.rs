@@ -8,10 +8,10 @@ use std::time::Duration;
 use axum::body::Body;
 use axum::http::{header, Request, Response, StatusCode};
 use axum::Router;
-use mihomo_subscription::app::AppState;
+use mihomo_subscription::app::{build_router, AppState};
 use mihomo_subscription::auth::{AdminAuth, SessionStore, SESSION_IDLE};
 use mihomo_subscription::db;
-use mihomo_subscription::fetch::{HttpFetcher, RemoteFetcher};
+use mihomo_subscription::fetch::{FetchError, Fetched, HttpFetcher, RemoteFetcher};
 use mihomo_subscription::keyed_lock::KeyedLock;
 use mihomo_subscription::rate_limit::RateLimiter;
 use serde_json::Value;
@@ -97,6 +97,38 @@ pub async fn test_state_with_fetcher(
         login_limiter: Arc::new(RateLimiter::new(100, Duration::from_secs(60))),
         download_limiter: Arc::new(RateLimiter::new(1000, Duration::from_secs(60))),
     })
+}
+
+/// A fetcher that returns the same fixed body for every URL.
+pub struct BodyFetcher(pub &'static str);
+
+#[async_trait::async_trait]
+impl RemoteFetcher for BodyFetcher {
+    async fn fetch(&self, _url: &str) -> Result<Fetched, FetchError> {
+        Ok(Fetched {
+            body: self.0.to_string(),
+            subscription_userinfo: None,
+        })
+    }
+}
+
+/// An app whose public refresh interval is long enough that public pulls serve
+/// the cache instead of regenerating, for checking the cache left by edits.
+/// Also returns the DB handle for arranging or inspecting stored state.
+pub async fn cached_app(temp: &TempDb, fetcher: Arc<dyn RemoteFetcher>) -> (Router, SqlitePool) {
+    let mut state = test_state_with_fetcher(temp, fetcher).await;
+    Arc::get_mut(&mut state)
+        .unwrap()
+        .public_refresh_min_interval = Duration::from_secs(3600);
+    let db = state.db.clone();
+    (build_router(state), db)
+}
+
+/// Extract the `/<prefix>/api/sub/<token>` path from a full subscription URL.
+pub fn sub_path(subscription_url: &str) -> String {
+    let after = subscription_url.split("://").nth(1).unwrap();
+    let idx = after.find('/').unwrap();
+    after[idx..].to_string()
 }
 
 /// Log in with the fixed test admin credentials (see [`test_state_with_fetcher`])
