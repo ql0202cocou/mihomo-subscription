@@ -3,17 +3,12 @@ import { App as AntdApp } from "antd";
 import { HolderOutlined, LockOutlined } from "@ant-design/icons";
 import {
   DndContext,
-  KeyboardSensor,
-  PointerSensor,
   closestCenter,
-  useSensor,
-  useSensors,
   type DragEndEvent,
 } from "@dnd-kit/core";
 import {
   SortableContext,
   arrayMove,
-  sortableKeyboardCoordinates,
   useSortable,
   verticalListSortingStrategy,
 } from "@dnd-kit/sortable";
@@ -24,6 +19,7 @@ import type { CustomNode, ProxiesResponse, ProxyPreview, Regenerate } from "../.
 import { nodeTypeLabel } from "../../components/nodeSchema";
 import { useRegenerateNotice } from "../../components/regenerate";
 import { useSerialSave } from "../../components/useSerialSave";
+import { useSortableSensors } from "../../components/useSortableSensors";
 
 interface Props {
   profileId: string;
@@ -49,10 +45,7 @@ export default function NodesCard({ profileId, profileName, nodes, generatedAt, 
   const [generated, setGenerated] = useState(true);
   const [sectionOrder, setSectionOrder] = useState<string[]>(DEFAULT_SECTIONS);
 
-  const sensors = useSensors(
-    useSensor(PointerSensor, { activationConstraint: { distance: 4 } }),
-    useSensor(KeyboardSensor, { coordinateGetter: sortableKeyboardCoordinates }),
-  );
+  const sensors = useSortableSensors();
 
   const loadGeneratedPreview = useCallback(async () => {
     try {

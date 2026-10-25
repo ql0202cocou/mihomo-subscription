@@ -209,10 +209,6 @@ function rulesCardModule(state, api) {
     './groupSchema': { BUILTIN_POLICIES: ['DIRECT', 'REJECT'] },
     './ruleRefs': load('pages/detail/ruleRefs.ts'),
     '../../components/fields': { TypeChips: 'TypeChips' },
-    '../../components/ruleSetConstants': {
-      RULE_SET_BEHAVIORS: [], RULE_SET_MANUAL_FORMATS: [],
-      RULE_SET_REMOTE_FORMATS: [], RULE_SET_SOURCES: [],
-    },
   });
 }
 

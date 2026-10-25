@@ -25,6 +25,7 @@ import type { ProfileDetail as Detail, Regenerate } from "../types";
 import NodesCard from "./detail/NodesCard";
 import GroupsCard from "./detail/GroupsCard";
 import RulesCard from "./detail/RulesCard";
+import { useSingleFlight } from "../components/useSingleFlight";
 import "../components/cards.css";
 import "./detail/detail.css";
 
@@ -229,34 +230,29 @@ function ProfileDetailContent({ id }: { id: string }) {
 function HostedLink({ detail, onReset }: { detail: Detail; onReset: () => void }) {
   const { t } = useTranslation();
   const { message } = AntdApp.useApp();
-  const [resetting, setResetting] = useState(false);
-  const resetPending = useRef(false);
+  const [resetting, guardReset] = useSingleFlight();
 
   async function resetToken() {
     // 重置 token 会更换订阅 URL 并使旧链接立即失效(公开端点按 token 校验),故需 Popconfirm 二次确认;
-    // ref 同步挡重入,避免双击发出两次重置。
-    if (resetPending.current) return;
-    resetPending.current = true;
-    setResetting(true);
-    try {
-      const res = await api<{ regenerate?: Regenerate }>(`/api/profiles/${detail.id}/reset-token`, {
-        method: "POST",
-      });
-      // 当前配置未通过校验且无法用最近合法配置迁移时,缓存已清空,如实警告而非笼统成功。
-      if (res.regenerate?.status === "invalid") {
-        message.warning(t("detail.resetTokenInvalid"));
-      } else if (res.regenerate?.status === "pending") {
-        message.info(t("regenerate.pending"));
-      } else {
-        message.success(t("detail.generateSuccess"));
+    // 避免双击发出两次重置。
+    await guardReset(async () => {
+      try {
+        const res = await api<{ regenerate?: Regenerate }>(`/api/profiles/${detail.id}/reset-token`, {
+          method: "POST",
+        });
+        // 当前配置未通过校验且无法用最近合法配置迁移时,缓存已清空,如实警告而非笼统成功。
+        if (res.regenerate?.status === "invalid") {
+          message.warning(t("detail.resetTokenInvalid"));
+        } else if (res.regenerate?.status === "pending") {
+          message.info(t("regenerate.pending"));
+        } else {
+          message.success(t("detail.generateSuccess"));
+        }
+        onReset();
+      } catch (e) {
+        message.error(errorMessage(e, t("common.saveFailed")));
       }
-      onReset();
-    } catch (e) {
-      message.error(errorMessage(e, t("common.saveFailed")));
-    } finally {
-      resetPending.current = false;
-      setResetting(false);
-    }
+    });
   }
 
   async function copyUrl() {

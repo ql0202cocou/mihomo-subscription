@@ -1,5 +1,5 @@
 // 主框架:侧边导航 + 顶栏(当前页标题、主题切换)+ <Outlet/> 内容区。
-import { useRef, useState, type ReactNode } from "react";
+import type { ReactNode } from "react";
 import { App as AntdApp } from "antd";
 import { Link, Outlet, useLocation, useNavigate } from "react-router";
 import { useTranslation } from "react-i18next";
@@ -14,6 +14,7 @@ import {
 import { useAuth } from "../auth";
 import { useTheme } from "../theme";
 import PageErrorBoundary from "./PageErrorBoundary";
+import { useSingleFlight } from "./useSingleFlight";
 import "./AppLayout.css";
 
 interface NavItem {
@@ -31,8 +32,7 @@ export default function AppLayout() {
   const { mode, toggle } = useTheme();
   const navigate = useNavigate();
   const { pathname } = useLocation();
-  const [loggingOut, setLoggingOut] = useState(false);
-  const logoutPending = useRef(false);
+  const [loggingOut, guardLogout] = useSingleFlight();
 
   const items: NavItem[] = [
     {
@@ -69,18 +69,14 @@ export default function AppLayout() {
   const title = items.find((it) => it.match(pathname))?.label ?? t("nav.profiles");
 
   async function onLogout() {
-    if (logoutPending.current) return;
-    logoutPending.current = true;
-    setLoggingOut(true);
-    try {
-      await logout();
-      navigate("/login", { replace: true });
-    } catch {
-      message.error(t("nav.logoutFailed"));
-    } finally {
-      logoutPending.current = false;
-      setLoggingOut(false);
-    }
+    await guardLogout(async () => {
+      try {
+        await logout();
+        navigate("/login", { replace: true });
+      } catch {
+        message.error(t("nav.logoutFailed"));
+      }
+    });
   }
 
   return (

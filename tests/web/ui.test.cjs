@@ -280,12 +280,6 @@ test('rule sets retry after load failure and save once under a double confirm', 
     '../api': { api, errorMessage: () => 'failed' },
     '../components/useSerialSave': serialImmediate,
     '../components/fields': { TypeChips: 'TypeChips' },
-    '../components/ruleSetConstants': {
-      RULE_SET_BEHAVIORS: ['domain'],
-      RULE_SET_MANUAL_FORMATS: ['yaml'],
-      RULE_SET_REMOTE_FORMATS: ['yaml'],
-      RULE_SET_SOURCES: ['manual', 'remote'],
-    },
   });
   let tree = state.render(RuleSets);
   state.effects();

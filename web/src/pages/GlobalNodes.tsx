@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useEffect, useState } from "react";
 import { App as AntdApp, Button, Modal, Popconfirm } from "antd";
 import {
   DeleteOutlined,
@@ -8,17 +8,12 @@ import {
 } from "@ant-design/icons";
 import {
   DndContext,
-  KeyboardSensor,
-  PointerSensor,
   closestCenter,
-  useSensor,
-  useSensors,
   type DragEndEvent,
 } from "@dnd-kit/core";
 import {
   SortableContext,
   arrayMove,
-  sortableKeyboardCoordinates,
   useSortable,
   verticalListSortingStrategy,
 } from "@dnd-kit/sortable";
@@ -29,6 +24,9 @@ import type { CustomNode } from "../types";
 import { useSerialSave } from "../components/useSerialSave";
 import NodeForm, { contentToModel, modelToContent, type NodeModel } from "../components/NodeForm";
 import { nodeTypeLabel } from "../components/nodeSchema";
+import { useLatestList } from "../components/useLatestList";
+import { useSingleFlight } from "../components/useSingleFlight";
+import { useSortableSensors } from "../components/useSortableSensors";
 import "../components/cards.css";
 
 const EMPTY_MODEL: NodeModel = { name: "", type: "", fields: {} };
@@ -37,39 +35,15 @@ export default function GlobalNodes() {
   const { t } = useTranslation();
   const { message } = AntdApp.useApp();
   const saveInOrder = useSerialSave();
-  const [rows, setRows] = useState<CustomNode[]>([]);
-  const [loaded, setLoaded] = useState(false);
-  const [loadFailed, setLoadFailed] = useState(false);
+  const { rows, setRows, loaded, loadFailed, load, invalidate } = useLatestList<CustomNode>("/api/global-nodes");
   const [open, setOpen] = useState(false);
   const [editing, setEditing] = useState<CustomNode | null>(null);
   const [model, setModel] = useState<NodeModel>(EMPTY_MODEL);
-  const [saving, setSaving] = useState(false);
-  const savePending = useRef(false);
+  const [saving, guardSave] = useSingleFlight();
   // NodeForm 内部有派生状态(高级键值行等),每次打开弹窗换 key 强制重挂载复位。
   const [formKey, setFormKey] = useState("new");
-  // 并发 load 只采用最后一次发起的结果;排序开始时递增序号,使在途的旧读取失效。
-  const loadSeq = useRef(0);
 
-  const sensors = useSensors(
-    useSensor(PointerSensor, { activationConstraint: { distance: 4 } }),
-    useSensor(KeyboardSensor, { coordinateGetter: sortableKeyboardCoordinates }),
-  );
-
-  const load = useCallback(async () => {
-    const seq = ++loadSeq.current;
-    try {
-      const next = await api<CustomNode[]>("/api/global-nodes");
-      if (seq !== loadSeq.current) return;
-      setRows(next);
-      setLoadFailed(false);
-      setLoaded(true);
-    } catch {
-      // 瞬时错误时保留当前列表
-      if (seq !== loadSeq.current) return;
-      setLoadFailed(true);
-      setLoaded(true);
-    }
-  }, []);
+  const sensors = useSortableSensors();
 
   useEffect(() => {
     void load();
@@ -94,26 +68,22 @@ export default function GlobalNodes() {
       message.error(t("nodes.nameTypeRequired"));
       return;
     }
-    if (savePending.current) return;
-    savePending.current = true;
-    setSaving(true);
     const body = JSON.stringify({
       name: model.name.trim(),
       node_type: model.type.trim(),
       content: modelToContent(model),
       enabled: editing ? editing.enabled : true,
     });
-    try {
-      if (editing) await api(`/api/global-nodes/${editing.id}`, { method: "PUT", body });
-      else await api("/api/global-nodes", { method: "POST", body });
-      setOpen(false);
-      await load();
-    } catch (e) {
-      message.error(errorMessage(e, t("common.saveFailed")));
-    } finally {
-      savePending.current = false;
-      setSaving(false);
-    }
+    await guardSave(async () => {
+      try {
+        if (editing) await api(`/api/global-nodes/${editing.id}`, { method: "PUT", body });
+        else await api("/api/global-nodes", { method: "POST", body });
+        setOpen(false);
+        await load();
+      } catch (e) {
+        message.error(errorMessage(e, t("common.saveFailed")));
+      }
+    });
   }
 
   async function remove(node: CustomNode) {
@@ -133,7 +103,7 @@ export default function GlobalNodes() {
     const newIndex = rows.findIndex((n) => n.name === over.id);
     if (oldIndex < 0 || newIndex < 0) return;
     const next = arrayMove(rows, oldIndex, newIndex);
-    loadSeq.current += 1; // 在途的旧读取结果作废,避免覆盖乐观顺序
+    invalidate(); // 在途的旧读取结果作废,避免覆盖乐观顺序
     setRows(next); // 乐观更新
     const res = await saveInOrder(() =>
       api("/api/global-nodes/order", {

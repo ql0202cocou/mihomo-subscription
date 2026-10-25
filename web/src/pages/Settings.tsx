@@ -1,9 +1,10 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { App as AntdApp, Button, Input, Modal, Segmented } from "antd";
 import { useTranslation } from "react-i18next";
 import { api, errorMessage } from "../api";
 import type { Settings as SettingsData } from "../types";
 import { useTheme, type ThemeMode } from "../theme";
+import { useSingleFlight } from "../components/useSingleFlight";
 import "./Settings.css";
 
 export default function Settings() {
@@ -13,8 +14,7 @@ export default function Settings() {
   const [settings, setSettings] = useState<SettingsData | null>(null);
   const [confirming, setConfirming] = useState(false);
   const [confirmText, setConfirmText] = useState("");
-  const [resetting, setResetting] = useState(false);
-  const resetPending = useRef(false);
+  const [resetting, guardReset] = useSingleFlight();
 
   const load = useCallback(async () => {
     try {
@@ -29,24 +29,20 @@ export default function Settings() {
   }, [load]);
 
   async function onReset() {
-    // 重置会一次性失效全部托管链接:ref 同步挡重入(双击只发一次),state 驱动 confirmLoading。
-    if (resetPending.current) return;
-    resetPending.current = true;
-    setResetting(true);
-    try {
-      const next = await api<SettingsData>("/api/settings/reset-public-path", {
-        method: "POST",
-      });
-      setSettings(next);
-      setConfirming(false);
-      setConfirmText("");
-      message.success(t("settings.publicPathPrefix") + ": " + next.public_path_prefix);
-    } catch (e) {
-      message.error(errorMessage(e, t("common.saveFailed")));
-    } finally {
-      resetPending.current = false;
-      setResetting(false);
-    }
+    // 重置会一次性失效全部托管链接:双击只发一次。
+    await guardReset(async () => {
+      try {
+        const next = await api<SettingsData>("/api/settings/reset-public-path", {
+          method: "POST",
+        });
+        setSettings(next);
+        setConfirming(false);
+        setConfirmText("");
+        message.success(t("settings.publicPathPrefix") + ": " + next.public_path_prefix);
+      } catch (e) {
+        message.error(errorMessage(e, t("common.saveFailed")));
+      }
+    });
   }
 
   return (

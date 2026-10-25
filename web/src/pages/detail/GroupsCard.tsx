@@ -3,17 +3,12 @@ import { App as AntdApp, Button, Form, Input, Modal, Popconfirm, Select } from "
 import { DeleteOutlined, EditOutlined, HolderOutlined, PlusOutlined } from "@ant-design/icons";
 import {
   DndContext,
-  KeyboardSensor,
-  PointerSensor,
   closestCenter,
-  useSensor,
-  useSensors,
   type DragEndEvent,
 } from "@dnd-kit/core";
 import {
   SortableContext,
   arrayMove,
-  sortableKeyboardCoordinates,
   useSortable,
   verticalListSortingStrategy,
 } from "@dnd-kit/sortable";
@@ -30,6 +25,8 @@ import {
   groupOptionFields,
   groupOptionKeys,
 } from "./groupSchema";
+import { useSingleFlight } from "../../components/useSingleFlight";
+import { useSortableSensors } from "../../components/useSortableSensors";
 
 interface Props {
   profileId: string;
@@ -115,15 +112,10 @@ export default function GroupsCard({
   const [proxyNames, setProxyNames] = useState<string[]>([]);
   const [orderNames, setOrderNames] = useState<string[]>([]);
   const [rows, setRows] = useState<GroupRow[]>([]);
-  const [importing, setImporting] = useState(false);
-  const importPending = useRef(false);
-  const [saving, setSaving] = useState(false);
-  const savePending = useRef(false);
+  const [importing, guardImport] = useSingleFlight();
+  const [saving, guardSave] = useSingleFlight();
 
-  const sensors = useSensors(
-    useSensor(PointerSensor, { activationConstraint: { distance: 4 } }),
-    useSensor(KeyboardSensor, { coordinateGetter: sortableKeyboardCoordinates }),
-  );
+  const sensors = useSortableSensors();
 
   const loadGeneratedPreview = useCallback(async () => {
     try {
@@ -177,23 +169,19 @@ export default function GroupsCard({
   }
 
   async function importProviderGroups() {
-    if (importPending.current) return;
-    importPending.current = true;
-    setImporting(true);
-    try {
-      const res = await api<{ imported: number; skipped: number }>(
-        `/api/profiles/${profileId}/import-provider-groups`,
-        { method: "POST" },
-      );
-      if (res.imported === 0) message.info(t("groups.importNone"));
-      else message.success(t("groups.imported", { count: res.imported }));
-      onSaved();
-    } catch (e) {
-      message.error(errorMessage(e, t("groups.importFailed")));
-    } finally {
-      importPending.current = false;
-      setImporting(false);
-    }
+    await guardImport(async () => {
+      try {
+        const res = await api<{ imported: number; skipped: number }>(
+          `/api/profiles/${profileId}/import-provider-groups`,
+          { method: "POST" },
+        );
+        if (res.imported === 0) message.info(t("groups.importNone"));
+        else message.success(t("groups.imported", { count: res.imported }));
+        onSaved();
+      } catch (e) {
+        message.error(errorMessage(e, t("groups.importFailed")));
+      }
+    });
   }
 
   function startAdd() {
@@ -236,9 +224,6 @@ export default function GroupsCard({
       message.error(t("groups.nameRequired"));
       return;
     }
-    if (savePending.current) return;
-    savePending.current = true;
-    setSaving(true);
     const cleaned: Options = Object.create(null);
     for (const [k, v] of Object.entries(options)) {
       if (k.trim() === "" || v === "" || v === undefined || v === null) continue;
@@ -253,17 +238,16 @@ export default function GroupsCard({
       // 弹窗不暴露 enabled 开关,编辑时原样保留
       enabled: editing ? editing.enabled : true,
     });
-    try {
-      if (editing) await api(`/api/profiles/${profileId}/groups/${editing.id}`, { method: "PUT", body });
-      else await api(`/api/profiles/${profileId}/groups`, { method: "POST", body });
-      setOpen(false);
-      onSaved();
-    } catch (e) {
-      message.error(errorMessage(e, t("common.saveFailed")));
-    } finally {
-      savePending.current = false;
-      setSaving(false);
-    }
+    await guardSave(async () => {
+      try {
+        if (editing) await api(`/api/profiles/${profileId}/groups/${editing.id}`, { method: "PUT", body });
+        else await api(`/api/profiles/${profileId}/groups`, { method: "POST", body });
+        setOpen(false);
+        onSaved();
+      } catch (e) {
+        message.error(errorMessage(e, t("common.saveFailed")));
+      }
+    });
   }
 
   async function remove(group: CustomGroup) {

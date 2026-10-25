@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useEffect, useState } from "react";
 import { App as AntdApp, Button, Input, InputNumber, Modal, Popconfirm, Switch } from "antd";
 import {
   DeleteOutlined,
@@ -8,17 +8,12 @@ import {
 } from "@ant-design/icons";
 import {
   DndContext,
-  KeyboardSensor,
-  PointerSensor,
   closestCenter,
-  useSensor,
-  useSensors,
   type DragEndEvent,
 } from "@dnd-kit/core";
 import {
   SortableContext,
   arrayMove,
-  sortableKeyboardCoordinates,
   useSortable,
   verticalListSortingStrategy,
 } from "@dnd-kit/sortable";
@@ -30,10 +25,13 @@ import { useSerialSave } from "../components/useSerialSave";
 import { TypeChips } from "../components/fields";
 import {
   RULE_SET_BEHAVIORS as BEHAVIORS,
-  RULE_SET_MANUAL_FORMATS as MANUAL_FORMATS,
-  RULE_SET_REMOTE_FORMATS as REMOTE_FORMATS,
+  coerceRuleSetFormat,
+  ruleSetFormatOptions,
   RULE_SET_SOURCES as SOURCES,
 } from "../components/ruleSetConstants";
+import { useLatestList } from "../components/useLatestList";
+import { useSingleFlight } from "../components/useSingleFlight";
+import { useSortableSensors } from "../components/useSortableSensors";
 import "../components/cards.css";
 import "./RuleSets.css";
 
@@ -66,37 +64,13 @@ export default function RuleSets() {
   const { t } = useTranslation();
   const { message } = AntdApp.useApp();
   const saveInOrder = useSerialSave();
-  const [rows, setRows] = useState<RuleSet[]>([]);
-  const [loaded, setLoaded] = useState(false);
-  const [loadFailed, setLoadFailed] = useState(false);
+  const { rows, setRows, loaded, loadFailed, load, invalidate } = useLatestList<RuleSet>("/api/rule-sets");
   const [open, setOpen] = useState(false);
   const [editing, setEditing] = useState<RuleSet | null>(null);
   const [form, setForm] = useState<FormState>(EMPTY);
-  const [saving, setSaving] = useState(false);
-  const savePending = useRef(false);
-  // 并发 load 只采用最后一次发起的结果;排序开始时递增序号,使在途的旧读取失效。
-  const loadSeq = useRef(0);
+  const [saving, guardSave] = useSingleFlight();
 
-  const sensors = useSensors(
-    useSensor(PointerSensor, { activationConstraint: { distance: 4 } }),
-    useSensor(KeyboardSensor, { coordinateGetter: sortableKeyboardCoordinates }),
-  );
-
-  const load = useCallback(async () => {
-    const seq = ++loadSeq.current;
-    try {
-      const next = await api<RuleSet[]>("/api/rule-sets");
-      if (seq !== loadSeq.current) return;
-      setRows(next);
-      setLoadFailed(false);
-      setLoaded(true);
-    } catch {
-      // 瞬时错误时保留当前列表
-      if (seq !== loadSeq.current) return;
-      setLoadFailed(true);
-      setLoaded(true);
-    }
-  }, []);
+  const sensors = useSortableSensors();
 
   useEffect(() => {
     void load();
@@ -128,7 +102,7 @@ export default function RuleSets() {
     setForm((f) => ({
       ...f,
       source,
-      format: source === "manual" && f.format === "mrs" ? "yaml" : f.format,
+      format: coerceRuleSetFormat(source, f.behavior, f.format),
     }));
   }
 
@@ -136,9 +110,6 @@ export default function RuleSets() {
     const name = form.name.trim();
     if (!name) return message.error(t("ruleSets.nameRequired"));
     if (!NAME_RE.test(name)) return message.error(t("ruleSets.nameInvalid"));
-    if (savePending.current) return;
-    savePending.current = true;
-    setSaving(true);
     const base = {
       name,
       behavior: form.behavior,
@@ -156,17 +127,16 @@ export default function RuleSets() {
             ...(form.url.trim() ? { url: form.url.trim() } : {}),
           }
         : { ...base, content: form.content };
-    try {
-      if (editing) await api(`/api/rule-sets/${editing.id}`, { method: "PUT", body: JSON.stringify(body) });
-      else await api("/api/rule-sets", { method: "POST", body: JSON.stringify(body) });
-      setOpen(false);
-      await load();
-    } catch (e) {
-      message.error(errorMessage(e, t("common.saveFailed")));
-    } finally {
-      savePending.current = false;
-      setSaving(false);
-    }
+    await guardSave(async () => {
+      try {
+        if (editing) await api(`/api/rule-sets/${editing.id}`, { method: "PUT", body: JSON.stringify(body) });
+        else await api("/api/rule-sets", { method: "POST", body: JSON.stringify(body) });
+        setOpen(false);
+        await load();
+      } catch (e) {
+        message.error(errorMessage(e, t("common.saveFailed")));
+      }
+    });
   }
 
   async function remove(rs: RuleSet) {
@@ -186,7 +156,7 @@ export default function RuleSets() {
     const newIndex = rows.findIndex((n) => n.name === over.id);
     if (oldIndex < 0 || newIndex < 0) return;
     const next = arrayMove(rows, oldIndex, newIndex);
-    loadSeq.current += 1; // 在途的旧读取结果作废,避免覆盖乐观顺序
+    invalidate(); // 在途的旧读取结果作废,避免覆盖乐观顺序
     setRows(next); // 乐观更新
     const res = await saveInOrder(() =>
       api("/api/rule-sets/order", {
@@ -201,9 +171,7 @@ export default function RuleSets() {
     void load(); // 以服务端为准;保存失败时即回到服务端实际持有的顺序
   }
 
-  const formatOptions = (form.source === "remote" ? REMOTE_FORMATS : MANUAL_FORMATS).filter(
-    (format) => form.behavior !== "classical" || format !== "mrs",
-  );
+  const formatOptions = ruleSetFormatOptions(form.source, form.behavior);
 
   return (
     <div className="page">
@@ -285,7 +253,7 @@ export default function RuleSets() {
                   setForm({
                     ...form,
                     behavior: v,
-                    format: v === "classical" && form.format === "mrs" ? "yaml" : form.format,
+                    format: coerceRuleSetFormat(form.source, v, form.format),
                   })
                 }
               />

@@ -24,17 +24,12 @@ import {
 } from "@ant-design/icons";
 import {
   DndContext,
-  KeyboardSensor,
-  PointerSensor,
   closestCenter,
-  useSensor,
-  useSensors,
   type DragEndEvent,
 } from "@dnd-kit/core";
 import {
   SortableContext,
   arrayMove,
-  sortableKeyboardCoordinates,
   useSortable,
   verticalListSortingStrategy,
 } from "@dnd-kit/sortable";
@@ -57,10 +52,12 @@ import { useRegenerateNotice } from "../../components/regenerate";
 import { useSerialSave } from "../../components/useSerialSave";
 import {
   RULE_SET_BEHAVIORS as RS_BEHAVIORS,
-  RULE_SET_MANUAL_FORMATS as RS_MANUAL_FORMATS,
-  RULE_SET_REMOTE_FORMATS as RS_REMOTE_FORMATS,
+  coerceRuleSetFormat,
+  ruleSetFormatOptions,
   RULE_SET_SOURCES as RS_SOURCES,
 } from "../../components/ruleSetConstants";
+import { useSingleFlight } from "../../components/useSingleFlight";
+import { useSortableSensors } from "../../components/useSortableSensors";
 
 interface Props {
   profileId: string;
@@ -247,8 +244,7 @@ export default function RulesCard({
   const [modalOpen, setModalOpen] = useState(false);
   const [editing, setEditing] = useState<EditTarget>(null);
   const [model, setModel] = useState<RuleModel>(DEFAULT_RULE);
-  const [submitting, setSubmitting] = useState(false);
-  const submitPending = useRef(false);
+  const [submitting, guardSubmit] = useSingleFlight();
   // 策略候选拆成两类(输出中的代理 / 输出中的分组——生成时机场分组已被自定义分组整体替换),
   // 以便在编辑弹窗按设计稿分组展示。
   const [proxyNames, setProxyNames] = useState<string[]>([]);
@@ -264,10 +260,7 @@ export default function RulesCard({
   const [picked, setPicked] = useState<Set<string>>(new Set());
   const [importPolicy, setImportPolicy] = useState("DIRECT");
 
-  const sensors = useSensors(
-    useSensor(PointerSensor, { activationConstraint: { distance: 4 } }),
-    useSensor(KeyboardSensor, { coordinateGetter: sortableKeyboardCoordinates }),
-  );
+  const sensors = useSortableSensors();
 
   // 服务端最近确认的规则(加载或保存成功时更新):保存失败时回滚到它。不用闭包里的 `rules`,
   // 因为 persist 不依赖它(可能已过期),且连续保存时应回到服务端实际持有的状态。
@@ -460,73 +453,68 @@ export default function RulesCard({
   }
 
   async function submit() {
-    if (submitPending.current || hostedImportPending.current) return;
-    submitPending.current = true;
-    setSubmitting(true);
-    try {
-      const upperType = model.type.trim().toUpperCase();
-      const isMatch = upperType === "MATCH";
-      const isRuleSet = upperType === "RULE-SET";
-      if (!model.type.trim() || !model.policy.trim() || (!isMatch && !model.payload.trim())) {
-        message.error(t("rules.incomplete"));
-        return;
-      }
-      const multiline =
-        /[\r\n]/.test(model.type) ||
-        /[\r\n]/.test(model.policy) ||
-        (!isMatch && /[\r\n]/.test(model.payload));
-      if (multiline) {
-        message.error(t("rules.singleLine"));
-        return;
-      }
-      if (isRuleSet) {
-        const existing = profileRuleSets.find((r) => r.name === model.payload.trim());
-        const shouldUpsert = model.rsManage && (!existing || model.rsDirty);
-        if (shouldUpsert) {
-          if (model.rsSource === "remote" && !model.rsUrl.trim() && !existing) {
-            message.error(t("rules.ruleSetUrlRequired"));
-            return;
-          }
-          try {
-            await upsertRuleSet(model);
-            await loadProfileRuleSets();
-          } catch (e) {
-            message.error(errorMessage(e, t("common.saveFailed")));
-            return;
+    if (hostedImportPending.current) return;
+    await guardSubmit(async () => {
+        const upperType = model.type.trim().toUpperCase();
+        const isMatch = upperType === "MATCH";
+        const isRuleSet = upperType === "RULE-SET";
+        if (!model.type.trim() || !model.policy.trim() || (!isMatch && !model.payload.trim())) {
+          message.error(t("rules.incomplete"));
+          return;
+        }
+        const multiline =
+          /[\r\n]/.test(model.type) ||
+          /[\r\n]/.test(model.policy) ||
+          (!isMatch && /[\r\n]/.test(model.payload));
+        if (multiline) {
+          message.error(t("rules.singleLine"));
+          return;
+        }
+        if (isRuleSet) {
+          const existing = profileRuleSets.find((r) => r.name === model.payload.trim());
+          const shouldUpsert = model.rsManage && (!existing || model.rsDirty);
+          if (shouldUpsert) {
+            if (model.rsSource === "remote" && !model.rsUrl.trim() && !existing) {
+              message.error(t("rules.ruleSetUrlRequired"));
+              return;
+            }
+            try {
+              await upsertRuleSet(model);
+              await loadProfileRuleSets();
+            } catch (e) {
+              message.error(errorMessage(e, t("common.saveFailed")));
+              return;
+            }
           }
         }
-      }
-      const line = serializeRule(model);
-      closeModal();
-      if (isMatch) {
+        const line = serializeRule(model);
+        closeModal();
+        if (isMatch) {
+          if (editing === "match") {
+            void persist(rules, line);
+          } else if (typeof editing === "number" && isMatchLine(rules[editing])) {
+            // 较早的 MATCH 仍是普通列表行,编辑它时保留当前钉底行。
+            void persist(rules.map((l, i) => (i === editing ? line : l)), matchLine);
+          } else {
+            // 新增或普通行改为 MATCH:移除原行,用新行替换钉底兜底。
+            const next = typeof editing === "number" ? rules.filter((_, i) => i !== editing) : rules;
+            void persist(next, line);
+          }
+          return;
+        }
         if (editing === "match") {
-          void persist(rules, line);
-        } else if (typeof editing === "number" && isMatchLine(rules[editing])) {
-          // 较早的 MATCH 仍是普通列表行,编辑它时保留当前钉底行。
-          void persist(rules.map((l, i) => (i === editing ? line : l)), matchLine);
-        } else {
-          // 新增或普通行改为 MATCH:移除原行,用新行替换钉底兜底。
-          const next = typeof editing === "number" ? rules.filter((_, i) => i !== editing) : rules;
-          void persist(next, line);
+          // 在编辑钉底行时把类型改成了非 MATCH:将其落入列表,并清空钉底的 MATCH。
+          void persist([...rules, line], null);
+          return;
         }
-        return;
-      }
-      if (editing === "match") {
-        // 在编辑钉底行时把类型改成了非 MATCH:将其落入列表,并清空钉底的 MATCH。
-        void persist([...rules, line], null);
-        return;
-      }
-      if (editing === null) {
-        // 「添加规则」:新非 MATCH 规则追加到列表末尾(MATCH 仍钉底)。
-        void persist([...rules, line], matchLine);
-        return;
-      }
-      const next = rules.map((l, i) => (i === editing ? line : l));
-      void persist(next, matchLine);
-    } finally {
-      submitPending.current = false;
-      setSubmitting(false);
-    }
+        if (editing === null) {
+          // 「添加规则」:新非 MATCH 规则追加到列表末尾(MATCH 仍钉底)。
+          void persist([...rules, line], matchLine);
+          return;
+        }
+        const next = rules.map((l, i) => (i === editing ? line : l));
+        void persist(next, matchLine);
+    });
   }
 
   function remove(index: number) {
@@ -1064,9 +1052,7 @@ function RuleSetDefBlock({
   ruleSets: ProfileRuleSet[];
 }) {
   const { t } = useTranslation();
-  const formats = (model.rsSource === "remote" ? RS_REMOTE_FORMATS : RS_MANUAL_FORMATS).filter(
-    (format) => model.rsBehavior !== "classical" || format !== "mrs",
-  );
+  const formats = ruleSetFormatOptions(model.rsSource, model.rsBehavior);
   const existing = ruleSets.find((rs) => rs.name === model.payload.trim());
 
   function changeDefinition(change: Partial<RuleModel>) {
@@ -1093,7 +1079,7 @@ function RuleSetDefBlock({
 
   // 切来源时纠正不兼容 format(手动不支持 mrs)。
   function setSource(rsSource: "manual" | "remote") {
-    const rsFormat = rsSource === "manual" && model.rsFormat === "mrs" ? "yaml" : model.rsFormat;
+    const rsFormat = coerceRuleSetFormat(rsSource, model.rsBehavior, model.rsFormat);
     changeDefinition({ rsSource, rsFormat });
   }
   return (
@@ -1129,7 +1115,7 @@ function RuleSetDefBlock({
                 onChange={(v) =>
                   changeDefinition({
                     rsBehavior: v as RuleModel["rsBehavior"],
-                    rsFormat: v === "classical" && model.rsFormat === "mrs" ? "yaml" : model.rsFormat,
+                    rsFormat: coerceRuleSetFormat(model.rsSource, v, model.rsFormat),
                   })
                 }
               />
