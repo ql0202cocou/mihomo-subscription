@@ -5,7 +5,7 @@ const {
 } = require('./helpers.cjs');
 
 // 装配与 detail_state.test.cjs 同风格,但 useSerialSave / ruleRefs / groupSchema /
-// ruleSetConstants 一律用真实模块,只替身 antd、图标与 dnd-kit。
+// ruleSetConstants 不做替身,由 load 加载真实模块;只替身 antd、图标与 dnd-kit。
 // 列表行(SortableRuleRow)带 onRemove;钉底的 MATCH 行(MatchRow)只有 onEdit。
 const isRow = (e) => typeof e.props?.line === 'string' && typeof e.props?.onRemove === 'function';
 const isMatchRow = (e) =>
@@ -95,11 +95,7 @@ function session(initial, options = {}) {
     'react-i18next': translation,
     '../../api': { api, errorMessage: () => 'failed' },
     '../../components/regenerate': { useRegenerateNotice: () => () => {} },
-    '../../components/useSerialSave': load('components/useSerialSave.ts', { react: state.react }),
-    '../../components/ruleSetConstants': load('components/ruleSetConstants.ts'),
     '../../components/fields': { TypeChips: 'TypeChips' },
-    './groupSchema': load('pages/detail/groupSchema.ts'),
-    './ruleRefs': load('pages/detail/ruleRefs.ts'),
   });
   const props = {
     profileId: 'p', initial, nodes: [], groups: [], generatedAt: null, errors: [],
