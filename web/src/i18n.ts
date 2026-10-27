@@ -290,7 +290,6 @@ const zh = {
     },
     preview: {
       title: "输出预览",
-      load: "预览配置",
       loading: "生成中…",
     },
     settings: {

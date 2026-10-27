@@ -179,11 +179,6 @@ function ProfileDetailContent({ id }: { id: string }) {
         />
       ),
     },
-    {
-      key: "preview",
-      label: t("preview.title"),
-      children: <PreviewCard profileId={detail.id} />,
-    },
   ];
 
   return (
@@ -231,6 +226,7 @@ function HostedLink({ detail, onReset }: { detail: Detail; onReset: () => void }
   const { t } = useTranslation();
   const { message } = AntdApp.useApp();
   const [resetting, guardReset] = useSingleFlight();
+  const [previewOpen, setPreviewOpen] = useState(false);
 
   async function resetToken() {
     // 重置 token 会更换订阅 URL 并使旧链接立即失效(公开端点按 token 校验),故需 Popconfirm 二次确认;
@@ -278,6 +274,7 @@ function HostedLink({ detail, onReset }: { detail: Detail; onReset: () => void }
           <Button type="primary" icon={<CopyOutlined />} onClick={copyUrl}>
             {t("detail.copy")}
           </Button>
+          <Button onClick={() => setPreviewOpen(true)}>{t("preview.title")}</Button>
           <Popconfirm
             title={t("detail.resetTokenConfirm")}
             onConfirm={resetToken}
@@ -295,6 +292,7 @@ function HostedLink({ detail, onReset }: { detail: Detail; onReset: () => void }
         </div>
         <span className="hero-qr-cap">{t("detail.scan")}</span>
       </div>
+      {previewOpen && <PreviewModal profileId={detail.id} onClose={() => setPreviewOpen(false)} />}
     </div>
   );
 }
@@ -411,39 +409,49 @@ function BasicInfo({
   );
 }
 
-function PreviewCard({ profileId }: { profileId: string }) {
+function PreviewModal({ profileId, onClose }: { profileId: string; onClose: () => void }) {
   const { t } = useTranslation();
   const { message } = AntdApp.useApp();
   const [yaml, setYaml] = useState<string | null>(null);
   const [errors, setErrors] = useState<string[]>([]);
-  const [loading, setLoading] = useState(false);
+  const [loading, setLoading] = useState(true);
+  const [attempt, setAttempt] = useState(0);
+  const generateFailed = t("detail.generateFailed");
 
-  async function load() {
-    // 预览是只读的「试生成」:后端不落缓存、不改拉取状态(对应 src/generate.rs 的 preview)。
-    setLoading(true);
-    setErrors([]);
-    try {
-      setYaml(await api<string>(`/api/profiles/${profileId}/preview`));
-    } catch (e) {
-      // 校验失败时逐条列出(details),不只显示笼统的「Validation failed」。
-      if (e instanceof ApiError && e.details?.length) {
-        setYaml(null);
-        setErrors(e.details);
+  useEffect(() => {
+    let active = true;
+    async function load() {
+      // 预览是只读的「试生成」:后端不落缓存、不改拉取状态(对应 src/generate.rs 的 preview)。
+      setLoading(true);
+      setErrors([]);
+      try {
+        const next = await api<string>(`/api/profiles/${profileId}/preview`);
+        if (active) setYaml(next);
+      } catch (e) {
+        if (!active) return;
+        // 校验失败时逐条列出(details),不只显示笼统的「Validation failed」。
+        if (e instanceof ApiError && e.details?.length) {
+          setYaml(null);
+          setErrors(e.details);
+        }
+        message.error(errorMessage(e, generateFailed));
+      } finally {
+        if (active) setLoading(false);
       }
-      message.error(errorMessage(e, t("detail.generateFailed")));
-    } finally {
-      setLoading(false);
     }
+    void load();
+    return () => {
+      active = false;
+    };
+  }, [attempt, generateFailed, message, profileId]);
+
+  function retry() {
+    setLoading(true);
+    setAttempt((value) => value + 1);
   }
 
   return (
-    <div className="dcard">
-      <div className="dcard-head">
-        <span className="dcard-title">{t("preview.title")}</span>
-        <Button type="primary" onClick={load} loading={loading}>
-          {t("preview.load")}
-        </Button>
-      </div>
+    <Modal title={t("preview.title")} open onCancel={onClose} footer={null} width={900}>
       {loading ? (
         <div className="preview-loading">
           <Spin />
@@ -458,11 +466,14 @@ function PreviewCard({ profileId }: { profileId: string }) {
             ))}
           </ul>
         </div>
-      ) : yaml ? (
+      ) : yaml !== null ? (
         <pre className="preview-pre">{yaml}</pre>
       ) : (
-        <div className="empty-line">{t("preview.load")}</div>
+        <div className="preview-loading">
+          {t("common.loadFailed")}
+          <Button onClick={retry}>{t("common.retry")}</Button>
+        </div>
       )}
-    </div>
+    </Modal>
   );
 }

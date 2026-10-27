@@ -536,10 +536,13 @@ function mountDetail(state, module) {
   return render;
 }
 
-// HostedLink 是模块内部组件,harness 不执行;每个渲染周期展开一次(hook 槽位随游标延续),
-// 取到其中的 Popconfirm。
+// 内部组件由 harness 按真实 hook 顺序逐层展开。
 const expandHostedLink = (tree) => {
   const el = find(tree, (e) => typeof e.type === 'function' && e.props?.detail && e.props?.onReset);
+  return el.type(el.props);
+};
+const expandPreview = (hosted) => {
+  const el = find(hosted, (e) => typeof e.type === 'function' && e.props?.profileId && e.props?.onClose);
   return el.type(el.props);
 };
 
@@ -550,6 +553,38 @@ test('hosted QR code keeps a dark foreground on its white frame', async () => {
   const qrCode = find(expandHostedLink(render()), (e) => e.type === 'QRCode');
   assert.equal(qrCode.props.value, detail().subscription_url);
   assert.equal(qrCode.props.color, '#000');
+});
+
+test('output preview follows the copy action and loads YAML in a modal', async () => {
+  const state = hooks();
+  const requests = [];
+  const output = 'proxies:\n  - name: node-a';
+  const api = async (url) => {
+    requests.push(url);
+    return url.endsWith('/preview') ? output : detail();
+  };
+  const render = mountDetail(state, detailModule(state, api, messageLog()));
+  await tick();
+  let tree = render();
+  const tabKeys = find(tree, (e) => e.type === 'Tabs').props.items.map((item) => item.key);
+  assert.equal(tabKeys.join(','), 'basic,nodes,groups,rules');
+
+  let hosted = expandHostedLink(tree);
+  const actions = findAll(hosted, (e) => e.type === 'Button').map((e) => e.props.children);
+  assert.deepEqual(actions, ['detail.copy', 'preview.title', 'detail.resetToken']);
+  find(hosted, (e) => e.type === 'Button' && e.props.children === 'preview.title').props.onClick();
+
+  hosted = expandHostedLink(render());
+  expandPreview(hosted);
+  state.effects();
+  await tick();
+  assert.deepEqual(requests.filter((url) => url.endsWith('/preview')), ['/api/profiles/B/preview']);
+
+  const preview = expandPreview(expandHostedLink(render()));
+  const modal = find(preview, (e) => e.type === 'Modal');
+  assert.equal(modal.props.title, 'preview.title');
+  assert.equal(modal.props.open, true);
+  assert.equal(find(preview, (e) => e.props?.className === 'preview-pre').props.children, output);
 });
 
 test('reset-token confirms once and reports a pending result distinctly', async () => {

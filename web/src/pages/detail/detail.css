@@ -280,8 +280,8 @@
   border: 1px solid var(--border-2);
   border-radius: 9px;
   padding: 14px;
-  /* 高度跟随视口:160px ≈ 顶栏 60 + 卡片内边距/标题栏,滚到卡片顶部时整块恰好一屏;矮窗口不低于原 440px。 */
-  max-height: max(440px, calc(100vh - 160px));
+  /* 弹窗内滚动,为标题、边框与上下间距预留视口空间。 */
+  max-height: calc(100vh - 220px);
   overflow: auto;
   margin: 0;
   color: var(--text-2);
