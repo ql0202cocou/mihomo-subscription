@@ -13,7 +13,6 @@ import {
   Tabs,
 } from "antd";
 import {
-  CopyOutlined,
   LeftOutlined,
   LinkOutlined,
   ReloadOutlined,
@@ -271,10 +270,12 @@ function HostedLink({ detail, onReset }: { detail: Detail; onReset: () => void }
         <p className="hero-desc">{t("detail.alwaysLive")}</p>
         <div className="hero-url">{detail.subscription_url}</div>
         <div className="hero-actions">
-          <Button type="primary" icon={<CopyOutlined />} onClick={copyUrl}>
+          <Button type="primary" onClick={copyUrl}>
             {t("detail.copy")}
           </Button>
-          <Button onClick={() => setPreviewOpen(true)}>{t("preview.title")}</Button>
+          <Button type="primary" onClick={() => setPreviewOpen(true)}>
+            {t("preview.title")}
+          </Button>
           <Popconfirm
             title={t("detail.resetTokenConfirm")}
             onConfirm={resetToken}
