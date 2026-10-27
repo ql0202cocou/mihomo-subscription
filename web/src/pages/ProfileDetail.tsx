@@ -291,7 +291,7 @@ function HostedLink({ detail, onReset }: { detail: Detail; onReset: () => void }
       </div>
       <div className="hero-qr">
         <div className="hero-qr-frame">
-          <QRCode value={detail.subscription_url} size={116} bordered={false} />
+          <QRCode value={detail.subscription_url} size={116} bordered={false} color="#000" />
         </div>
         <span className="hero-qr-cap">{t("detail.scan")}</span>
       </div>

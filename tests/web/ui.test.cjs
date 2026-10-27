@@ -543,6 +543,15 @@ const expandHostedLink = (tree) => {
   return el.type(el.props);
 };
 
+test('hosted QR code keeps a dark foreground on its white frame', async () => {
+  const state = hooks();
+  const render = mountDetail(state, detailModule(state, async () => detail(), messageLog()));
+  await tick();
+  const qrCode = find(expandHostedLink(render()), (e) => e.type === 'QRCode');
+  assert.equal(qrCode.props.value, detail().subscription_url);
+  assert.equal(qrCode.props.color, '#000');
+});
+
 test('reset-token confirms once and reports a pending result distinctly', async () => {
   const state = hooks();
   const messages = messageLog();
