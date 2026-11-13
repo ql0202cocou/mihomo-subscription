@@ -36,6 +36,9 @@ async-trait = "0.1"
 # 集成测试经 `tower::util::ServiceExt::oneshot` 直接驱动路由;生产二进制不使用。
 tower = { version = "0.5", features = ["util"] }
 
+[patch.crates-io]
+sqlx-sqlite = { path = "vendor/sqlx-sqlite" }
+
 [profile.release]
 opt-level = 3
 lto = true

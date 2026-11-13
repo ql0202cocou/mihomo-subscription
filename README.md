@@ -94,7 +94,8 @@ https://<host>/<public-path-prefix>/api/sub/<profile-token>
 [.github/workflows/ci.yml](.github/workflows/ci.yml)，发布与变更规则见
 [docs/deploy.md](docs/deploy.md)。
 
-前端本地构建需 Node `>=22.22.0`;CI 与 Docker 镜像构建使用 Node 24。
+项目构建使用 Rust `1.100.0` 与 Node `26.13.1` LTS，CI 和 Docker 使用相同版本。
+本地 Rust 由 `rust-toolchain.toml` 自动选择；Node 版本记录在 `.node-version`，前端最低要求仍为 `>=22.22.0`。
 
 ## 许可证
 

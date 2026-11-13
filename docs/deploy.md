@@ -106,11 +106,13 @@ compose 的 `environment:` 与代码必须一致。
 ### 发布前检查
 
 ```bash
-cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test
+cargo fmt --check && cargo clippy --locked --all-targets -- -D warnings && cargo test --locked
 ( cd web && npm ci && npm run build )
 ```
 
-前端检查需 Node `>=22.22.0`；CI 与 Docker 构建阶段使用 Node 24。
+构建工具链固定为 Rust `1.100.0` 与 Node `26.13.1` LTS，CI 和 Docker 使用相同版本。
+本地 Rust 由 `rust-toolchain.toml` 自动选择；Node 版本记录在 `.node-version`，前端最低要求仍为 `>=22.22.0`。
+升级工具链时同步更新这两个版本文件、Dockerfile，以及 CI 的 Rust toolchain 引用。
 
 人工确认：`changelog.md` 的 `[Unreleased]` 已含本次全部变更；受影响文档已对齐；版本号在各处一致。
 

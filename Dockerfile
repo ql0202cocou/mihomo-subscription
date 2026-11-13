@@ -1,5 +1,5 @@
 # ─── Web Build Stage ────────────────────────────────────────────────────────
-FROM node:24-slim AS web
+FROM node:26.13.1-trixie-slim AS web
 
 WORKDIR /web
 
@@ -11,7 +11,7 @@ COPY web/ ./
 RUN npm run build
 
 # ─── Rust Build Stage ───────────────────────────────────────────────────────
-FROM rust:1.98-slim-trixie AS builder
+FROM rust:1.100.0-slim-trixie AS builder
 
 WORKDIR /app
 
@@ -19,14 +19,15 @@ RUN apt-get update && apt-get install -y pkg-config libssl-dev && rm -rf /var/li
 
 # Cache dependencies with a stub binary.
 COPY Cargo.toml Cargo.lock ./
+COPY vendor ./vendor
 RUN mkdir src && echo "fn main() {}" > src/main.rs
-RUN cargo build --release && rm -rf src
+RUN cargo build --locked --release && rm -rf src
 
 # Build the actual application. migrations/ must be present because
 # sqlx::migrate! embeds them at compile time.
 COPY src ./src
 COPY migrations ./migrations
-RUN touch src/main.rs && cargo build --release
+RUN touch src/main.rs && cargo build --locked --release
 
 # ─── Runtime Stage ────────────────────────────────────────────────────────────
 FROM debian:trixie-slim
