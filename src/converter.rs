@@ -4,6 +4,8 @@
 //! `docs/architecture.md`「API 设计」处理顶层键(rule-providers 与未知键透传,proxy-providers 剥离)。
 //! 校验遵循同一节,返回逐条错误列表供生成弹窗使用。
 
+use std::collections::HashSet;
+
 use serde_yaml::{Mapping, Value};
 use sha2::{Digest, Sha256};
 
@@ -279,10 +281,15 @@ fn validate(
         }
     }
 
+    // 名字集合:机场代理可达数千个,规则与分组成员逐条查名,用集合避免线性扫描。
+    let provider_proxy_set: HashSet<&str> = provider_proxies.iter().map(String::as_str).collect();
+    let custom_node_set: HashSet<&str> = custom_node_names.iter().map(String::as_str).collect();
+    let custom_group_set: HashSet<&str> = custom_group_names.iter().map(String::as_str).collect();
+
     // 自定义节点名不得与机场代理名冲突(代理仍透传 + 追加)。机场分组已不在输出里(被自定义
     // 分组替换),故不存在分组名冲突。
     for name in custom_node_names {
-        if provider_proxies.contains(name) {
+        if provider_proxy_set.contains(name.as_str()) {
             errors.push(format!(
                 "custom node `{name}` conflicts with a provider proxy name"
             ));
@@ -291,17 +298,17 @@ fn validate(
 
     // 代理与分组共用同一命名空间:自定义分组不得与任何代理(机场或自定义节点)重名。
     for name in custom_group_names {
-        if provider_proxies.contains(name) || custom_node_names.contains(name) {
+        if provider_proxy_set.contains(name.as_str()) || custom_node_set.contains(name.as_str()) {
             errors.push(format!("custom group `{name}` conflicts with a proxy name"));
         }
     }
 
     let known_proxy = |name: &str| {
-        provider_proxies.iter().any(|n| n == name)
-            || custom_node_names.iter().any(|n| n == name)
+        provider_proxy_set.contains(name)
+            || custom_node_set.contains(name)
             || BUILTIN_PROXIES.contains(&name)
     };
-    let known_group = |name: &str| custom_group_names.iter().any(|n| n == name);
+    let known_group = |name: &str| custom_group_set.contains(name);
 
     for group in &input.groups {
         if !SUPPORTED_GROUP_TYPES.contains(&group.group_type.as_str()) {
@@ -566,7 +573,7 @@ fn in_cycle(groups: &[CustomGroup], start: &str) -> bool {
             .map_or(&[][..], |g| g.members.as_slice())
     };
     let mut stack: Vec<&str> = members_of(start).iter().map(String::as_str).collect();
-    let mut seen = std::collections::HashSet::new();
+    let mut seen = HashSet::new();
     while let Some(name) = stack.pop() {
         if name == start {
             return true;
@@ -579,7 +586,7 @@ fn in_cycle(groups: &[CustomGroup], start: &str) -> bool {
 }
 
 fn report_duplicate_names(names: &[String], kind: &str, errors: &mut Vec<String>) {
-    let mut seen = std::collections::HashSet::new();
+    let mut seen = HashSet::new();
     for name in names {
         if !seen.insert(name) {
             errors.push(format!("duplicate {kind} name `{name}`"));
