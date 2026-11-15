@@ -46,11 +46,15 @@ const BLOCKED_V4: &[&str] = &[
 
 /// 直接阻止的 IPv6 范围。IPv4 内嵌范围(IPv4 映射、NAT64、6to4)单独通过解包内嵌 IPv4 处理。
 const BLOCKED_V6: &[&str] = &[
-    "::/128",
-    "::1/128",
+    // 未指定地址、环回与已废弃的 IPv4 兼容地址(`::a.b.c.d`)同属 ::/96。
+    "::/96",
     "64:ff9b:1::/48",
+    // Teredo 隧道地址内嵌了 IPv4 端点。
+    "2001::/32",
     "fc00::/7",
     "fe80::/10",
+    // 已废弃的 site-local 段,个别内网仍在路由。
+    "fec0::/10",
     "ff00::/8",
 ];
 
@@ -199,6 +203,13 @@ mod tests {
         assert!(is_blocked_ip(ip("fc00::1")));
         assert!(is_blocked_ip(ip("fe80::1")));
         assert!(is_blocked_ip(ip("ff02::1")));
+        // 已废弃的 site-local、IPv4 兼容地址与 Teredo。
+        assert!(is_blocked_ip(ip("fec0::1")));
+        assert!(is_blocked_ip(ip("::127.0.0.1")));
+        assert!(is_blocked_ip(ip("::8.8.8.8")));
+        assert!(is_blocked_ip(ip("2001::1")));
+        assert!(is_blocked_ip(ip("2001:0:4136:e378:8000:63bf:3fff:fdd2")));
+        assert!(!is_blocked_ip(ip("2001:4860:4860::8888")));
         assert!(!is_blocked_ip(ip("2606:4700:4700::1111")));
     }
 
