@@ -1,6 +1,8 @@
 .env
 target/
 *.db
+*.db-wal
+*.db-shm
 
 # Local-only AI assistant project guides (kept out of version control by request).
 CLAUDE.md
