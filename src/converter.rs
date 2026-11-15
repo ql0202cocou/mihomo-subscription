@@ -4,7 +4,7 @@
 //! `docs/architecture.md`「API 设计」处理顶层键(rule-providers 与未知键透传,proxy-providers 剥离)。
 //! 校验遵循同一节,返回逐条错误列表供生成弹窗使用。
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use serde_yaml::{Mapping, Value};
 use sha2::{Digest, Sha256};
@@ -384,8 +384,13 @@ fn validate(
     }
 
     // 分组之间的引用不得成环(Mihomo 拒绝加载含环的分组)。
+    let group_members: HashMap<&str, &[String]> = input
+        .groups
+        .iter()
+        .map(|g| (g.name.as_str(), g.members.as_slice()))
+        .collect();
     for group in &input.groups {
-        if in_cycle(&input.groups, &group.name) {
+        if in_cycle(&group_members, &group.name) {
             errors.push(format!(
                 "custom group `{}` is part of a reference cycle",
                 group.name
@@ -525,7 +530,6 @@ fn dialer_proxies(provider: Option<&Value>, custom: &[(String, Mapping)]) -> Vec
 /// 前置链成环的代理名。每个代理至多一个 `dialer-proxy`,故每条链只走一遍:走回本次路径上的
 /// 代理即成环,走到之前已走完的代理则不是。
 fn dialer_cycles(dialers: &[(String, String)]) -> Vec<&str> {
-    use std::collections::HashMap;
     let graph: HashMap<&str, &str> = dialers
         .iter()
         .map(|(name, dialer)| (name.as_str(), dialer.as_str()))
@@ -583,13 +587,8 @@ fn tunnel_proxies(value: Option<&Value>) -> Vec<(usize, String)> {
 }
 
 /// 分组 `start` 是否在引用环上:沿「成员是自定义分组」的边从其成员出发能否回到它自身。
-fn in_cycle(groups: &[CustomGroup], start: &str) -> bool {
-    let members_of = |name: &str| {
-        groups
-            .iter()
-            .find(|g| g.name == name)
-            .map_or(&[][..], |g| g.members.as_slice())
-    };
+fn in_cycle(group_members: &HashMap<&str, &[String]>, start: &str) -> bool {
+    let members_of = |name: &str| group_members.get(name).copied().unwrap_or_default();
     let mut stack: Vec<&str> = members_of(start).iter().map(String::as_str).collect();
     let mut seen = HashSet::new();
     while let Some(name) = stack.pop() {
@@ -882,13 +881,14 @@ fn validate_rule_provider_paths(value: Option<&Value>, errors: &mut Vec<String>)
 /// 提取 rules 文本中 `RULE-SET` 规则引用的规则集名(去重、保序),含逻辑规则内嵌套的引用。
 /// 供 generate 决定要把哪些面板托管的规则集注入输出的 `rule-providers:`。
 pub fn ruleset_refs(rules: &str) -> Vec<String> {
+    let mut seen: HashSet<String> = HashSet::new();
     let mut out: Vec<String> = Vec::new();
     for (_, line) in rule_lines(rules) {
         let Ok(parsed) = parse_rule_line(line) else {
             continue;
         };
         for name in parsed.rule_sets {
-            if !out.iter().any(|n| n == &name) {
+            if seen.insert(name.clone()) {
                 out.push(name);
             }
         }
@@ -1028,7 +1028,9 @@ fn next_level_ranges(payload: &str) -> Result<Vec<(usize, usize)>, RuleLineError
         if r.0 == 0 && r.1 == payload.len() - 1 {
             continue;
         }
-        if !top.iter().any(|t| t.0 < r.0 && t.1 > r.1) {
+        // 括号区间两两要么嵌套要么不相交,且已按起点排序:被包含的区间只可能落在最近选中的
+        // 那个区间里。
+        if !top.last().is_some_and(|t| t.0 < r.0 && t.1 > r.1) {
             top.push(r);
         }
     }
@@ -1282,6 +1284,8 @@ rules:
             .unwrap();
         assert_eq!(auto.get("interval").unwrap().as_u64().unwrap(), 300);
         assert_eq!(auto.get("type").unwrap().as_str().unwrap(), "url-test");
+    }
+
     #[test]
     fn tagged_top_level_keys_are_handled_like_plain_keys() {
         // Mihomo 把 `!x proxy-providers` 当作 `proxy-providers` 读取:同样剥离。
@@ -1302,6 +1306,25 @@ rules:
         ));
     }
 
+    #[test]
+    fn only_groups_on_a_reference_cycle_are_reported() {
+        // d 指向环但自身不在环上;并列括号的逻辑规则只下钻顶层区间。
+        let wide = vec!["(DOMAIN,a.example)"; 200].join(",");
+        let rules =
+            format!("OR,({wide},(AND,((RULE-SET,ads),(NETWORK,tcp)))),DIRECT\nMATCH,DIRECT");
+        assert_eq!(ruleset_refs(&rules), vec!["ads"]);
+
+        let mut looped = vec![group("a", &["b"]), group("b", &["c"]), group("c", &["a"])];
+        looped.push(group("d", &["a"]));
+        let errs = validation_errors(input("MATCH,DIRECT", vec![], looped));
+        assert_eq!(
+            errs,
+            vec![
+                "custom group `a` is part of a reference cycle",
+                "custom group `b` is part of a reference cycle",
+                "custom group `c` is part of a reference cycle",
+            ]
+        );
     }
 
     #[test]
