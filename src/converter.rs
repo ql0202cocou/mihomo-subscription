@@ -106,7 +106,8 @@ pub struct ConvertOutput {
 
 /// 把机场 YAML 转换为 Mihomo 配置字符串(见 [`ConvertOutput`])。
 pub fn convert(input: ConvertInput) -> Result<ConvertOutput, ConvertError> {
-    let mut root = yaml::parse_mapping(input.provider_yaml).map_err(ConvertError::ProviderParse)?;
+    let root = yaml::parse_mapping(input.provider_yaml).map_err(ConvertError::ProviderParse)?;
+    let mut root = untag_top_level_keys(root).map_err(ConvertError::ProviderParse)?;
 
     let mut errors: Vec<String> = Vec::new();
     let provider_proxies = provider_proxy_names(root.get("proxies"), &mut errors);
@@ -246,6 +247,23 @@ pub fn convert(input: ConvertInput) -> Result<ConvertOutput, ConvertError> {
         reality_fingerprint_risks,
         group_names,
     })
+}
+
+/// Mihomo 的 YAML 库按标量值匹配顶层键、不看 tag(`!x proxy-providers:` 等同
+/// `proxy-providers:`)。去掉顶层键上的 tag,使逐键处理看到的键与 Mihomo 一致;去掉后与已有键
+/// 重名时 Mihomo 会以重复键拒绝加载,按解析失败处理。
+fn untag_top_level_keys(root: Mapping) -> Result<Mapping, yaml::YamlError> {
+    let mut out = Mapping::new();
+    for (key, value) in root {
+        let key = match key {
+            Value::Tagged(tagged) if tagged.value.is_string() => tagged.value,
+            other => other,
+        };
+        if out.insert(key, value).is_some() {
+            return Err(yaml::YamlError::Parse);
+        }
+    }
+    Ok(out)
 }
 
 fn validate(
@@ -1264,6 +1282,26 @@ rules:
             .unwrap();
         assert_eq!(auto.get("interval").unwrap().as_u64().unwrap(), 300);
         assert_eq!(auto.get("type").unwrap().as_str().unwrap(), "url-test");
+    #[test]
+    fn tagged_top_level_keys_are_handled_like_plain_keys() {
+        // Mihomo 把 `!x proxy-providers` 当作 `proxy-providers` 读取:同样剥离。
+        let mut inp = input("MATCH,DIRECT", vec![], vec![]);
+        inp.provider_yaml = "proxies:\n  - { name: hk-1, type: ss, server: 1.2.3.4, port: 8388 }\n\
+                             !x proxy-providers:\n  remote: { type: http, url: https://example.com/list }\n\
+                             !x dns:\n  enable: true\n";
+        let yaml = convert(inp).expect("conversion succeeds").yaml;
+        assert!(!yaml.contains("proxy-providers"), "{yaml}");
+        assert!(yaml.contains("\ndns:\n"), "{yaml}");
+
+        // 去掉 tag 后与已有键重名:Mihomo 以重复键拒绝加载,按机场内容无法解析处理。
+        let mut dup = input("MATCH,DIRECT", vec![], vec![]);
+        dup.provider_yaml = "proxies: []\n!x proxies: []\n";
+        assert!(matches!(
+            convert(dup),
+            Err(ConvertError::ProviderParse(yaml::YamlError::Parse))
+        ));
+    }
+
     }
 
     #[test]

@@ -273,6 +273,7 @@ PUT /api/profiles/:id/group-order         { order: [分组名] }              # 
 | `rules` | 整体替换为用户规则 |
 | `rule-providers` | 机场原样透传；另把被 `RULE-SET` 规则（含逻辑规则内嵌套）引用、本订阅自有（③）规则集合并在上（同名覆盖，指向按订阅 token 隔离的托管链接）。注入条目的 `path` 为 `./ruleset/<name>-<摘要>.<format>`（摘要取所指向 URL 的 SHA-256 前 8 字节 hex），使不同订阅 token 或不同上游地址的同名规则集不会在客户端共享本地缓存文件 |
 | `proxy-providers` | **剥离**（会让客户端拉取绕过 SSRF/缓存的 URL，可能暴露机场 URL） |
+| 带 tag 的顶层键（`!x proxy-providers`） | 先去掉键上的 tag 再按上表处理（Mihomo 的 YAML 库按键的标量值匹配、不看 tag）；去掉后与已有键重名按内容无法解析处理 |
 | 其余（`port`/`dns`/`tun`/`sniffer`…） | 原样透传（新 Mihomo 选项无需改转换器） |
 
 - 机场 YAML 的 merge key（`<<`）在解析阶段即按预算归一化展开（显式键优先，多源序列取先出现者），
