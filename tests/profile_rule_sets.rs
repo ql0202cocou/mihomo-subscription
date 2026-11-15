@@ -257,8 +257,10 @@ async fn referenced_rule_set_injected_with_token_scoped_link() {
 #[tokio::test]
 async fn logic_nested_rule_set_reference_is_injected() {
     let temp = TempDb::new();
-    let app =
-        build_router(test_state_with_fetcher(&temp, Arc::new(BodyFetcher(PROVIDER_YAML))).await);
+    // SUB-RULE 指向的子规则 `s` 由机场透传。
+    let provider = "proxies:\n  - { name: hk-1, type: ss, server: 1.2.3.4, port: 8388 }\n\
+                    sub-rules:\n  s:\n    - MATCH,DIRECT\nrules:\n  - MATCH,DIRECT\n";
+    let app = build_router(test_state_with_fetcher(&temp, Arc::new(BodyFetcher(provider))).await);
     let cookie = login(&app).await;
     let (p1, token1, sub_path) = create_profile(&app, &cookie, "P1").await;
 

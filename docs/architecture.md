@@ -251,7 +251,11 @@ PUT /api/profiles/:id/group-order         { order: [分组名] }              # 
   启用自定义节点/启用自定义分组，且分组间引用不得成环；节点（含机场透传代理与自定义节点）与自定义
   分组名不得占用 Mihomo 内置保留名——节点侧 `DIRECT`/`REJECT`/`REJECT-DROP`/`PASS`/`PASS-RULE`/
   `COMPATIBLE`/`GLOBAL`，分组侧同列除 `GLOBAL`（自定义 `GLOBAL` 分组是 Mihomo 支持的用法）；输出中
-  所有 `rule-providers` 的 `path` 必须唯一，冲突报校验错误；输出须
+  所有 `rule-providers` 的 `path` 必须唯一，冲突报校验错误；输出内部的其余引用同样须能解析
+  （Mihomo 在加载期逐项校验，任一失败即拒绝整份配置）：代理（机场透传与自定义节点）的
+  `dialer-proxy` 须指向输出中存在的代理/分组/内置名，且前置链不得成环；`SUB-RULE` 的目标须是机场
+  透传 `sub-rules` 中的子规则名；透传 `sub-rules` 的规则行按与 `rules` 相同的规则检查策略、规则集
+  与子规则引用；透传 `tunnels` 条目指定的代理须存在。输出须
   合法 Mihomo YAML。成功响应 `{ subscription_url, generated_at }`。
 
 顶层键处理（转换器逐键显式处理）：

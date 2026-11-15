@@ -137,6 +137,11 @@ pub fn convert(input: ConvertInput) -> Result<ConvertOutput, ConvertError> {
 
     let custom_node_names: Vec<String> = input.nodes.iter().map(|n| n.name.clone()).collect();
     let custom_group_names: Vec<String> = input.groups.iter().map(|g| g.name.clone()).collect();
+    let refs = OutputRefs {
+        sub_rules: provider_sub_rules(root.get("sub-rules")),
+        dialers: dialer_proxies(root.get("proxies"), &parsed_nodes),
+        tunnel_proxies: tunnel_proxies(root.get("tunnels")),
+    };
 
     validate(
         &input,
@@ -144,6 +149,7 @@ pub fn convert(input: ConvertInput) -> Result<ConvertOutput, ConvertError> {
         &provider_rule_providers,
         &custom_node_names,
         &custom_group_names,
+        &refs,
         &mut errors,
     );
 
@@ -247,6 +253,7 @@ fn validate(
     provider_rule_providers: &[String],
     custom_node_names: &[String],
     custom_group_names: &[String],
+    refs: &OutputRefs,
     errors: &mut Vec<String>,
 ) {
     report_duplicate_names(provider_proxies, "provider proxy", errors);
@@ -362,39 +369,193 @@ fn validate(
         }
     }
 
-    // 规则可引用所有代理、自定义分组及默认 GLOBAL;SUB-RULE 的最后一项是子规则名而非策略。
-    // 逻辑规则内嵌套的 RULE-SET 同样会被 Mihomo 解析,一并检查。
-    for (lineno, line) in rule_lines(input.rules) {
-        match parse_rule_line(line) {
-            Ok(parsed) => {
-                if let Some(target) = parsed.target {
-                    if !known_proxy(&target) && !known_group(&target) && target != "GLOBAL" {
-                        errors.push(format!(
-                            "rules line {lineno} references unknown policy `{target}`"
-                        ));
-                    }
-                }
-                for name in parsed.rule_sets {
-                    let injected = input.rule_providers.iter().any(|rp| rp.name == name);
-                    if !injected && !provider_rule_providers.iter().any(|n| n == &name) {
-                        errors.push(format!(
-                            "rules line {lineno} references unknown rule-set `{name}`"
-                        ));
-                    }
+    // 规则、`dialer-proxy` 与 `tunnels` 可引用所有代理、自定义分组及默认 GLOBAL。
+    let known_target = |name: &str| known_proxy(name) || known_group(name) || name == "GLOBAL";
+
+    // SUB-RULE 的最后一项是子规则名而非策略,须指向透传的 `sub-rules`。逻辑规则内嵌套的
+    // RULE-SET 同样会被 Mihomo 解析,一并检查。
+    let check_rule = |label: &str, line: &str, errors: &mut Vec<String>| match parse_rule_line(line)
+    {
+        Ok(parsed) => {
+            if let Some(target) = parsed.target {
+                if !known_target(&target) {
+                    errors.push(format!("{label} references unknown policy `{target}`"));
                 }
             }
-            Err(error) => {
-                let message = match error {
-                    RuleLineError::MissingTarget => "is missing a target",
-                    RuleLineError::MissingPayload => "is missing a rule payload",
-                    RuleLineError::InvalidLogicPayload => "has an invalid logic payload",
-                    RuleLineError::UnbalancedLogicParentheses => "has unbalanced logic parentheses",
-                    RuleLineError::Depth => "exceeds the supported logic nesting depth",
-                };
-                errors.push(format!("rules line {lineno} {message}"));
+            if let Some(name) = parsed.sub_rule {
+                if !refs.sub_rules.iter().any(|(n, _)| n == &name) {
+                    errors.push(format!("{label} references unknown sub-rule `{name}`"));
+                }
+            }
+            for name in parsed.rule_sets {
+                let injected = input.rule_providers.iter().any(|rp| rp.name == name);
+                if !injected && !provider_rule_providers.iter().any(|n| n == &name) {
+                    errors.push(format!("{label} references unknown rule-set `{name}`"));
+                }
+            }
+        }
+        Err(error) => {
+            let message = match error {
+                RuleLineError::MissingTarget => "is missing a target",
+                RuleLineError::MissingPayload => "is missing a rule payload",
+                RuleLineError::InvalidLogicPayload => "has an invalid logic payload",
+                RuleLineError::UnbalancedLogicParentheses => "has unbalanced logic parentheses",
+                RuleLineError::Depth => "exceeds the supported logic nesting depth",
+            };
+            errors.push(format!("{label} {message}"));
+        }
+    };
+    for (lineno, line) in rule_lines(input.rules) {
+        check_rule(&format!("rules line {lineno}"), line, errors);
+    }
+    // 透传的 `sub-rules` 按同一套规则解析:分组已整体替换为自定义分组,机场子规则里指向旧分组
+    // 的策略会让 Mihomo 拒绝加载整个输出。
+    for (name, lines) in &refs.sub_rules {
+        for (index, line) in lines.iter().enumerate() {
+            check_rule(
+                &format!("sub-rules `{name}` line {}", index + 1),
+                line.trim(),
+                errors,
+            );
+        }
+    }
+
+    // `dialer-proxy` 指向的前置代理必须存在,且前置链不得成环(Mihomo 在加载期校验两者)。
+    for (name, dialer) in &refs.dialers {
+        if !known_target(dialer) {
+            errors.push(format!(
+                "proxy `{name}` dialer-proxy `{dialer}` references an unknown proxy or group"
+            ));
+        }
+    }
+    for name in dialer_cycles(&refs.dialers) {
+        errors.push(format!(
+            "proxy `{name}` has a circular dialer-proxy dependency"
+        ));
+    }
+
+    for (index, proxy) in &refs.tunnel_proxies {
+        if !known_target(proxy) {
+            errors.push(format!(
+                "tunnels entry {index} references unknown proxy `{proxy}`"
+            ));
+        }
+    }
+}
+
+/// 校验输出内部引用所需的、从机场 YAML 与自定义节点收集的信息。
+struct OutputRefs {
+    /// 透传的 `sub-rules`:(子规则名, 规则行)。
+    sub_rules: Vec<(String, Vec<String>)>,
+    /// 输出代理的 `dialer-proxy`:(代理名, 前置代理名),含机场代理与自定义节点。
+    dialers: Vec<(String, String)>,
+    /// 透传的 `tunnels` 条目指定的代理:(从 1 起的序号, 代理名)。
+    tunnel_proxies: Vec<(usize, String)>,
+}
+
+/// 收集透传的 `sub-rules`。形状不符的条目由 Mihomo 自行报错,这里只取能解析出的名字与规则行。
+fn provider_sub_rules(value: Option<&Value>) -> Vec<(String, Vec<String>)> {
+    let Some(Value::Mapping(map)) = value else {
+        return Vec::new();
+    };
+    map.iter()
+        .filter_map(|(name, lines)| {
+            let lines = match lines {
+                Value::Sequence(items) => items
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_string)
+                    .collect(),
+                _ => Vec::new(),
+            };
+            Some((name.as_str()?.to_string(), lines))
+        })
+        .collect()
+}
+
+/// 收集输出代理(机场代理与自定义节点)上非空的 `dialer-proxy`。
+fn dialer_proxies(provider: Option<&Value>, custom: &[(String, Mapping)]) -> Vec<(String, String)> {
+    let dialer = |m: &Mapping| {
+        mihomo_get(m, "dialer-proxy")
+            .and_then(Value::as_str)
+            .filter(|d| !d.is_empty())
+            .map(str::to_string)
+    };
+    let mut out = Vec::new();
+    if let Some(Value::Sequence(items)) = provider {
+        for m in items.iter().filter_map(Value::as_mapping) {
+            let name = mihomo_get(m, "name").and_then(Value::as_str);
+            if let (Some(name), Some(dialer)) = (name, dialer(m)) {
+                out.push((name.to_string(), dialer));
             }
         }
     }
+    for (name, m) in custom {
+        if let Some(dialer) = dialer(m) {
+            out.push((name.clone(), dialer));
+        }
+    }
+    out
+}
+
+/// 前置链成环的代理名。每个代理至多一个 `dialer-proxy`,故每条链只走一遍:走回本次路径上的
+/// 代理即成环,走到之前已走完的代理则不是。
+fn dialer_cycles(dialers: &[(String, String)]) -> Vec<&str> {
+    use std::collections::HashMap;
+    let graph: HashMap<&str, &str> = dialers
+        .iter()
+        .map(|(name, dialer)| (name.as_str(), dialer.as_str()))
+        .collect();
+    let mut done: HashMap<&str, bool> = HashMap::new();
+    let mut cyclic = Vec::new();
+    for (start, _) in dialers {
+        let mut path: Vec<&str> = Vec::new();
+        let mut current = Some(start.as_str());
+        let mut looped = false;
+        while let Some(name) = current {
+            match done.get(name) {
+                Some(true) => break,
+                Some(false) => {
+                    looped = true;
+                    break;
+                }
+                None => {}
+            }
+            done.insert(name, false);
+            path.push(name);
+            current = graph.get(name).copied();
+        }
+        if looped {
+            cyclic.push(start.as_str());
+        }
+        for name in path {
+            done.insert(name, true);
+        }
+    }
+    cyclic
+}
+
+/// 收集透传的 `tunnels` 条目指定的代理名。条目可以是映射(`proxy` 键)或
+/// `network,address,target,proxy` 形式的字符串;未指定代理的条目不收集。
+fn tunnel_proxies(value: Option<&Value>) -> Vec<(usize, String)> {
+    let Some(Value::Sequence(items)) = value else {
+        return Vec::new();
+    };
+    items
+        .iter()
+        .enumerate()
+        .filter_map(|(index, item)| {
+            let proxy = match item {
+                Value::String(line) => {
+                    let parts: Vec<&str> = line.split(',').map(str::trim).collect();
+                    (parts.len() == 4).then(|| parts[3])?.to_string()
+                }
+                Value::Mapping(m) => m.get("proxy")?.as_str()?.to_string(),
+                _ => return None,
+            };
+            (!proxy.is_empty()).then_some((index + 1, proxy))
+        })
+        .collect()
 }
 
 /// 分组 `start` 是否在引用环上:沿「成员是自定义分组」的边从其成员出发能否回到它自身。
@@ -727,6 +888,8 @@ enum RuleLineError {
 struct ParsedRuleLine {
     /// 需要按代理策略校验的目标;SUB-RULE 的目标是子规则名,故为 None。
     target: Option<String>,
+    /// SUB-RULE 指向的子规则名;其余规则为 None。
+    sub_rule: Option<String>,
     rule_sets: Vec<String>,
 }
 
@@ -776,8 +939,10 @@ fn parse_rule_line(line: &str) -> Result<ParsedRuleLine, RuleLineError> {
         "SUB-RULE" => collect_logic_payload(&format!("({payload})"), 1, &mut rule_sets)?,
         _ => {}
     }
+    let is_sub_rule = tp == "SUB-RULE";
     Ok(ParsedRuleLine {
-        target: (tp != "SUB-RULE").then_some(target),
+        target: (!is_sub_rule).then(|| target.clone()),
+        sub_rule: is_sub_rule.then_some(target),
         rule_sets,
     })
 }
@@ -1679,9 +1844,147 @@ rules:
                      PROCESS-PATH-REGEX,^foo,bar$,DIRECT\n\
                      AND,((DOMAIN,x.com),(NETWORK,udp)),DIRECT\n\
                      OR,((DOMAIN,x.com),(NETWORK,udp)),DIRECT\n\
-                     NOT,((DOMAIN,x.com)),DIRECT\n\
-                     SUB-RULE,(DOMAIN,x.com,DIRECT),Ghost";
+                     NOT,((DOMAIN,x.com)),DIRECT";
         assert!(convert(input(rules, vec![], vec![])).is_ok());
+    }
+
+    /// PROVIDER 加上透传的 `sub-rules`(子规则 `sub` 与 `other`)。
+    const PROVIDER_WITH_SUB_RULES: &str = r#"
+proxies:
+  - { name: hk-1, type: ss, server: 1.2.3.4, port: 8388 }
+sub-rules:
+  sub:
+    - DOMAIN,x.com,hk-1
+    - SUB-RULE,(NETWORK,tcp),other
+  other:
+    - MATCH,DIRECT
+"#;
+
+    #[test]
+    fn sub_rule_target_must_be_a_provider_sub_rule() {
+        let rules = "SUB-RULE,(DOMAIN,x.com,DIRECT),sub\nMATCH,DIRECT";
+        let mut known = input(rules, vec![], vec![]);
+        known.provider_yaml = PROVIDER_WITH_SUB_RULES;
+        assert!(convert(known).is_ok());
+
+        // 机场没有同名子规则:Mihomo 以 sub-rule not found 拒绝加载。
+        let errs = validation_errors(input(rules, vec![], vec![]));
+        assert_eq!(errs, vec!["rules line 1 references unknown sub-rule `sub`"]);
+    }
+
+    #[test]
+    fn provider_sub_rules_are_checked_like_rules() {
+        let mut inp = input("MATCH,DIRECT", vec![], vec![]);
+        inp.provider_yaml = "proxies:\n  - { name: hk-1, type: ss, server: 1.2.3.4, port: 8388 }\n\
+                             sub-rules:\n  sub:\n    - DOMAIN,x.com,Proxy\n    - RULE-SET,ghost,hk-1\n    \
+                             - SUB-RULE,(NETWORK,tcp),nosuch\n";
+        // 机场分组 Proxy 已被自定义分组整体替换,子规则里对它的引用不再成立。
+        assert_eq!(
+            validation_errors(inp),
+            vec![
+                "sub-rules `sub` line 1 references unknown policy `Proxy`",
+                "sub-rules `sub` line 2 references unknown rule-set `ghost`",
+                "sub-rules `sub` line 3 references unknown sub-rule `nosuch`",
+            ]
+        );
+    }
+
+    fn dialer_node(name: &str, dialer: &str) -> CustomNode {
+        CustomNode {
+            name: name.into(),
+            content: format!(
+                "{{ name: {name}, type: ss, server: 9.9.9.9, port: 1080, dialer-proxy: {dialer} }}"
+            ),
+        }
+    }
+
+    #[test]
+    fn dialer_proxy_must_reference_a_known_proxy_or_group() {
+        // 前置代理可以是机场代理、自定义节点、自定义分组或内置名。
+        for dialer in ["hk-1", "plain", "G", "DIRECT", "GLOBAL"] {
+            let inp = input(
+                "MATCH,DIRECT",
+                vec![node("plain"), dialer_node("landing", dialer)],
+                vec![group("G", &["hk-1"])],
+            );
+            assert!(convert(inp).is_ok(), "{dialer}");
+        }
+
+        let errs = validation_errors(input(
+            "MATCH,DIRECT",
+            vec![dialer_node("landing", "Gone")],
+            vec![],
+        ));
+        assert_eq!(
+            errs,
+            vec!["proxy `landing` dialer-proxy `Gone` references an unknown proxy or group"]
+        );
+
+        // 机场代理自带的 dialer-proxy 指向未导入的机场分组,同样拦截;键名按 mihomo 规则匹配。
+        let mut inp = input("MATCH,DIRECT", vec![], vec![]);
+        inp.provider_yaml =
+            "proxies:\n  - { name: hk-1, type: ss, server: 1.2.3.4, port: 8388, dialer_proxy: Relay }\n";
+        assert_eq!(
+            validation_errors(inp),
+            vec!["proxy `hk-1` dialer-proxy `Relay` references an unknown proxy or group"]
+        );
+    }
+
+    #[test]
+    fn dialer_proxy_chain_must_not_loop() {
+        let errs = validation_errors(input(
+            "MATCH,DIRECT",
+            vec![
+                dialer_node("a", "b"),
+                dialer_node("b", "a"),
+                dialer_node("c", "hk-1"),
+            ],
+            vec![],
+        ));
+        assert_eq!(
+            errs,
+            vec!["proxy `a` has a circular dialer-proxy dependency"]
+        );
+
+        let errs = validation_errors(input(
+            "MATCH,DIRECT",
+            vec![dialer_node("self", "self")],
+            vec![],
+        ));
+        assert_eq!(
+            errs,
+            vec!["proxy `self` has a circular dialer-proxy dependency"]
+        );
+    }
+
+    #[test]
+    fn tunnel_proxy_must_be_known() {
+        let provider = |tunnels: &str| {
+            format!(
+                "proxies:\n  - {{ name: hk-1, type: ss, server: 1.2.3.4, port: 8388 }}\ntunnels:\n{tunnels}"
+            )
+        };
+        let yaml = provider(
+            "  - tcp/udp,127.0.0.1:6553,114.114.114.114:53,hk-1\n  - tcp,127.0.0.1:6666,1.1.1.1:53\n  \
+             - { network: [tcp], address: 127.0.0.1:7777, target: t.example:80, proxy: G }\n",
+        );
+        let mut inp = input("MATCH,DIRECT", vec![], vec![group("G", &["hk-1"])]);
+        inp.provider_yaml = &yaml;
+        assert!(convert(inp).is_ok());
+
+        let yaml = provider(
+            "  - tcp,127.0.0.1:6553,114.114.114.114:53,Proxy\n  \
+             - { network: [tcp], address: 127.0.0.1:7777, target: t.example:80, proxy: Gone }\n",
+        );
+        let mut inp = input("MATCH,DIRECT", vec![], vec![]);
+        inp.provider_yaml = &yaml;
+        assert_eq!(
+            validation_errors(inp),
+            vec![
+                "tunnels entry 1 references unknown proxy `Proxy`",
+                "tunnels entry 2 references unknown proxy `Gone`",
+            ]
+        );
     }
 
     #[test]
