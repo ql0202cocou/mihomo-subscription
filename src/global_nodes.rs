@@ -66,6 +66,12 @@ fn validate_node(body: &NodeBody) -> ApiResult<()> {
             "name and node_type are required".into(),
         ));
     }
+    // 与排序端点对名字的上限一致:超长的名字存得进却排不了序。
+    if body.name.trim().len() > MAX_ORDER_NAME_LEN {
+        return Err(ApiError::BadRequest(format!(
+            "name must be at most {MAX_ORDER_NAME_LEN} bytes"
+        )));
+    }
     // 内置保留名(DIRECT/REJECT/…):占用会让 Mihomo 以 duplicate name 拒绝加载整个输出。
     if crate::converter::is_reserved_node_name(body.name.trim()) {
         return Err(ApiError::BadRequest(format!(

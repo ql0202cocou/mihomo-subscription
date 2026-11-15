@@ -161,6 +161,25 @@ async fn reserved_builtin_names_are_rejected() {
 }
 
 #[tokio::test]
+async fn names_longer_than_the_order_limit_are_rejected() {
+    let temp = TempDb::new();
+    let app = build_router(test_state(&temp).await);
+    let cookie = login(&app).await;
+
+    // 排序端点只接受 256 字节以内的名字:更长的名字存得进却排不了序,写入时即拒绝。
+    for (len, status) in [(256, StatusCode::CREATED), (257, StatusCode::BAD_REQUEST)] {
+        let name = "n".repeat(len);
+        let body = format!(r#"{{"name":"{name}","node_type":"ss","content":"{NODE_CONTENT}"}}"#);
+        let resp = app
+            .clone()
+            .oneshot(authed("POST", "/api/global-nodes", &cookie, &body))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), status, "len={len}");
+    }
+}
+
+#[tokio::test]
 async fn concurrent_create_allocates_contiguous_positions() {
     let temp = TempDb::new();
     let state = test_state(&temp).await;

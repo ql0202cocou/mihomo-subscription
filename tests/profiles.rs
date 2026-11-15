@@ -226,6 +226,36 @@ async fn group_member_and_options_round_trip() {
 }
 
 #[tokio::test]
+async fn group_names_longer_than_the_order_limit_are_rejected() {
+    let temp = TempDb::new();
+    let app = build_router(test_state(&temp).await);
+    let cookie = login(&app).await;
+    let id = create_profile(&app, &cookie, "p").await["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // 排序端点只接受 256 字节以内的名字:更长的名字存得进却排不了序,写入时即拒绝。
+    for (len, status) in [(256, StatusCode::CREATED), (257, StatusCode::BAD_REQUEST)] {
+        let body = format!(
+            r#"{{"name":"{}","group_type":"select","members":["DIRECT"]}}"#,
+            "g".repeat(len)
+        );
+        let resp = send(
+            &app,
+            authed(
+                "POST",
+                &format!("/api/profiles/{id}/groups"),
+                &cookie,
+                &body,
+            ),
+        )
+        .await;
+        assert_eq!(resp.status(), status, "len={len}");
+    }
+}
+
+#[tokio::test]
 async fn group_names_reserved_builtins_are_rejected_but_global_is_allowed() {
     let temp = TempDb::new();
     let app = build_router(test_state(&temp).await);

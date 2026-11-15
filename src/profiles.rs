@@ -798,6 +798,12 @@ fn validate_group(body: &GroupBody) -> ApiResult<()> {
     if body.name.trim().is_empty() {
         return Err(ApiError::BadRequest("name is required".into()));
     }
+    // 与排序端点对名字的上限一致:超长的名字存得进却排不了序。
+    if body.name.trim().len() > MAX_ORDER_NAME_LEN {
+        return Err(ApiError::BadRequest(format!(
+            "name must be at most {MAX_ORDER_NAME_LEN} bytes"
+        )));
+    }
     // 内置保留名(DIRECT/REJECT/…,GLOBAL 分组除外——上游支持自定义 GLOBAL 分组):占用会让
     // Mihomo 以 duplicate name 拒绝加载整个输出。
     if crate::converter::RESERVED_GROUP_NAMES.contains(&body.name.trim()) {
@@ -985,7 +991,7 @@ fn parse_provider_group(
 ) -> Option<(String, String, Vec<String>, Option<JsonValue>)> {
     let m = item.as_mapping()?;
     let name = m.get("name")?.as_str()?.trim().to_string();
-    if name.is_empty() {
+    if name.is_empty() || name.len() > MAX_ORDER_NAME_LEN {
         return None;
     }
     let group_type = m.get("type")?.as_str()?.to_string();
