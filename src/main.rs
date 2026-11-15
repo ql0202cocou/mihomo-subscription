@@ -120,9 +120,35 @@ async fn main() -> AppResult<()> {
         listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),
     )
+    .with_graceful_shutdown(shutdown_signal())
     .await?;
 
     Ok(())
+}
+
+/// 等待 SIGTERM(容器停止)或 Ctrl-C,收到后停止接受新连接并等在途请求结束。进程在容器里是
+/// PID 1,内核不会替它执行信号的默认动作,不显式处理的话 `docker stop` 只能等超时后强杀。
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+    #[cfg(unix)]
+    let terminate = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut signal) => {
+                signal.recv().await;
+            }
+            Err(_) => std::future::pending::<()>().await,
+        }
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {}
+        _ = terminate => {}
+    }
+    tracing::info!("Shutdown signal received; finishing in-flight requests");
 }
 
 /// 解析数值环境变量;未设或非法时回退到 `default`。安全相关的项(如 `TRUSTED_PROXY_HOPS`)
