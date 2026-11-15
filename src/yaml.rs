@@ -11,7 +11,9 @@ use serde_yaml::{
 };
 
 const MAX_DEPTH: usize = 32;
-const MAX_NODES: usize = 10_000;
+/// 物化节点总数上限(映射键、值、tag 名与内部值各计一个)。机场配置里一条规则、一个分组成员
+/// 就是一个节点,几百个节点的订阅加上内联规则就有数万个;真正约束内存的是下面的字节上限。
+const MAX_NODES: usize = 200_000;
 const MAX_INPUT_BYTES: usize = 8 * 1024 * 1024;
 const MAX_GENERATED_BYTES: usize = 16 * 1024 * 1024;
 const MAX_BYTES: usize = MAX_INPUT_BYTES;
@@ -22,6 +24,17 @@ pub enum YamlError {
     Parse,
     TooComplex,
     NotMapping,
+}
+
+impl YamlError {
+    /// 机场 YAML 解析失败时记入 `last_fetch_status` 并随上游错误返回的标签:超出资源上限与
+    /// 「内容不是可解析的 Mihomo YAML」分开,管理员才能区分订阅过大和机场返回了别的格式。
+    pub fn provider_label(&self) -> &'static str {
+        match self {
+            YamlError::TooComplex => "provider_too_complex",
+            YamlError::Parse | YamlError::NotMapping => "provider_parse",
+        }
+    }
 }
 
 struct Budget {

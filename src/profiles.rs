@@ -895,7 +895,7 @@ pub async fn import_provider_groups(
         .await
         .map_err(|e| ApiError::Upstream(e.status_label()))?;
     let root = yaml::parse_limited(&fetched.body)
-        .map_err(|_| ApiError::Upstream("provider_parse".to_string()))?;
+        .map_err(|e| ApiError::Upstream(e.provider_label().to_string()))?;
     let provider_groups = match root.get("proxy-groups") {
         Some(serde_yaml::Value::Sequence(items)) => items.clone(),
         _ => Vec::new(),

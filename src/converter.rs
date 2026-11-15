@@ -81,8 +81,8 @@ pub struct ConvertInput<'a> {
 
 #[derive(Debug)]
 pub enum ConvertError {
-    /// 机场 YAML 无法解析(不是用户配置的校验问题)。
-    ProviderParse,
+    /// 机场 YAML 无法解析或超出资源上限(不是用户配置的校验问题);携带解析层的原因。
+    ProviderParse(yaml::YamlError),
     /// 输出 YAML 序列化失败(内部错误,与机场输入和用户配置均无关)。
     OutputSerialize,
     /// 逐条列举的校验失败,以 `400` 暴露(见 `docs/architecture.md`「API 设计」)。
@@ -104,8 +104,7 @@ pub struct ConvertOutput {
 
 /// 把机场 YAML 转换为 Mihomo 配置字符串(见 [`ConvertOutput`])。
 pub fn convert(input: ConvertInput) -> Result<ConvertOutput, ConvertError> {
-    let mut root =
-        yaml::parse_mapping(input.provider_yaml).map_err(|_| ConvertError::ProviderParse)?;
+    let mut root = yaml::parse_mapping(input.provider_yaml).map_err(ConvertError::ProviderParse)?;
 
     let mut errors: Vec<String> = Vec::new();
     let provider_proxies = provider_proxy_names(root.get("proxies"), &mut errors);
@@ -1273,7 +1272,10 @@ rules:
             rule_providers: Vec::new(),
             reality_mlkem: true,
         };
-        assert!(matches!(convert(bad), Err(ConvertError::ProviderParse)));
+        assert!(matches!(
+            convert(bad),
+            Err(ConvertError::ProviderParse(yaml::YamlError::Parse))
+        ));
     }
 
     #[test]

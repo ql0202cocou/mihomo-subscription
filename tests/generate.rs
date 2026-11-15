@@ -1296,6 +1296,82 @@ async fn unparsable_provider_body_is_recorded_as_provider_parse() {
     assert_eq!(json(resp).await["last_fetch_status"], "provider_parse");
 }
 
+/// 一份中大型机场配置:`proxies` 个节点、12 个列出全部节点的分组、`rules` 条内联规则。
+fn sized_provider(proxies: usize, rules: usize) -> &'static str {
+    let names: Vec<String> = (0..proxies).map(|n| format!("node-{n}")).collect();
+    let mut yaml = String::from("proxies:\n");
+    for name in &names {
+        yaml.push_str(&format!(
+            "  - {{ name: {name}, type: ss, server: 1.2.3.4, port: 8388, cipher: aes-128-gcm, password: p }}\n"
+        ));
+    }
+    yaml.push_str("proxy-groups:\n");
+    for group in 0..12 {
+        yaml.push_str(&format!(
+            "  - {{ name: g{group}, type: select, proxies: [{}] }}\n",
+            names.join(", ")
+        ));
+    }
+    yaml.push_str("rules:\n");
+    for n in 0..rules {
+        yaml.push_str(&format!("  - DOMAIN-SUFFIX,site-{n}.example,g0\n"));
+    }
+    yaml.push_str("  - MATCH,DIRECT\n");
+    Box::leak(yaml.into_boxed_str())
+}
+
+#[tokio::test]
+async fn mid_sized_provider_config_is_accepted() {
+    let temp = TempDb::new();
+    // 300 个节点、12 个全量分组、12,000 条规则:远超一万个 YAML 节点,属于正常规模。
+    let fetcher = Arc::new(BodyFetcher(sized_provider(300, 12_000)));
+    let app = build_router(test_state_with_fetcher(&temp, fetcher).await);
+    let cookie = login(&app).await;
+
+    let profile = create_profile(&app, &cookie).await;
+    assert_eq!(profile["last_fetch_status"], "success");
+    let id = profile["id"].as_str().unwrap();
+    let resp = app
+        .clone()
+        .oneshot(authed(
+            "GET",
+            &format!("/api/profiles/{id}/proxies"),
+            &cookie,
+            "",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(json(resp).await["proxies"].as_array().unwrap().len(), 300);
+}
+
+#[tokio::test]
+async fn oversized_provider_config_is_recorded_as_too_complex() {
+    let temp = TempDb::new();
+    // 超出解析资源上限的配置与「内容不是 YAML」分开记录。
+    let fetcher = Arc::new(BodyFetcher(sized_provider(1, 200_000)));
+    let app = build_router(test_state_with_fetcher(&temp, fetcher).await);
+    let cookie = login(&app).await;
+
+    let profile = create_profile(&app, &cookie).await;
+    assert_eq!(profile["last_fetch_status"], "provider_too_complex");
+    let id = profile["id"].as_str().unwrap();
+    let resp = app
+        .clone()
+        .oneshot(authed(
+            "POST",
+            &format!("/api/profiles/{id}/generate"),
+            &cookie,
+            "",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+    assert_eq!(
+        json(resp).await["error"]["message"],
+        "Provider fetch failed: provider_too_complex"
+    );
+}
+
 #[tokio::test]
 async fn admin_generate_waits_for_the_per_profile_lock() {
     let temp = TempDb::new();

@@ -122,7 +122,8 @@ GET  /api/auth/session -> 200 {username} | 401
 - 详情的 `reality_fingerprint_risks`：当前缓存输出里 ML-KEM 已开启但 `client-fingerprint` 不是
   `chrome` 的 REALITY 节点名（无缓存或无风险为空数组），详情页据此常驻告警。
 - `last_fetch_status`：`success` / `http_error:<code>` / `ssrf_rejected` / `timeout` / `too_large` /
-  `provider_parse`（拉取成功但内容不是可解析的 Mihomo YAML），从未拉取为 `null`。
+  `provider_parse`（拉取成功但内容不是可解析的 Mihomo YAML）/ `provider_too_complex`（内容超出
+  YAML 解析资源上限，见「安全设计 → 不受信任内容」），从未拉取为 `null`。
 
 请求体（节点走全局池，分组按配置）：
 
@@ -690,9 +691,9 @@ https://<PUBLIC_BASE_URL>/<PUBLIC_PATH_PREFIX>/api/sub/<profile_token>
 
 ### 不受信任内容（机场响应即使过 SSRF 也不可信）
 
-- YAML 两道限界。先用 libyaml 事件流预检原文：只接受单文档，事件总数 ≤20,000（集合的结束事件
+- YAML 两道限界。先用 libyaml 事件流预检原文：只接受单文档，事件总数 ≤400,000（集合的结束事件
   也计入），集合嵌套深度 ≤32，原始标量/tag/锚点字节合计 ≤8 MiB——不构建任何值即拒绝畸形与
-  高扇出输入。再由 serde_norway 物化，构建每个值时扣预算：深度 32、节点总数 10,000（包含映射键、
+  高扇出输入。再由 serde_norway 物化，构建每个值时扣预算：深度 32、节点总数 200,000（包含映射键、
   值、tag 名和内部值），展开后的标量总字节最多 8 MiB，且不超过原文的 8 倍（最小预算 1 KiB）。
   小规模锚点/别名与 tag 仍支持；预算在别名物化过程中扣除，拒绝标量复制与嵌套别名放大。外部
   原文最多 8 MiB；自生成输出与内部重解析（如分组顺序快照回写）放宽到 16 MiB。merge key（`<<`）

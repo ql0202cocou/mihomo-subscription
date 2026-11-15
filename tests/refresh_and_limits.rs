@@ -49,7 +49,7 @@ fn scalar_alias_expansion_is_bounded() {
 
 #[test]
 fn tagged_values_obey_node_and_depth_limits() {
-    let many = format!("payload: !opaque [{}]", ["x"; 10_001].join(","));
+    let many = format!("payload: !opaque [{}]", ["x"; 200_001].join(","));
     assert!(yaml::parse_limited(&many).is_err());
     assert!(yaml::parse_limited(&many.replace("!opaque ", "")).is_err());
     let deep = format!("payload: !opaque {}x{}", "[".repeat(40), "]".repeat(40));
@@ -59,7 +59,7 @@ fn tagged_values_obey_node_and_depth_limits() {
 
 #[test]
 fn mapping_keys_obey_node_and_depth_limits() {
-    let key = format!("? [{}]\n: value\n", ["x"; 10_001].join(","));
+    let key = format!("? [{}]\n: value\n", ["x"; 200_001].join(","));
     assert!(yaml::parse_limited(&key).is_err());
     let key = format!("? {}x{}\n: value\n", "[".repeat(40), "]".repeat(40));
     assert!(yaml::parse_limited(&key).is_err());

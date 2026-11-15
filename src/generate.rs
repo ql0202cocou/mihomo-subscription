@@ -218,7 +218,7 @@ pub async fn provider_rules(
         .await
         .map_err(|e| ApiError::Upstream(e.status_label()))?;
     let root = crate::yaml::parse_limited(&fetched.body)
-        .map_err(|_| ApiError::Upstream("provider_parse".to_string()))?;
+        .map_err(|e| ApiError::Upstream(e.provider_label().to_string()))?;
     let rules = match root.get("rules") {
         Some(serde_yaml::Value::Sequence(items)) => items
             .iter()
@@ -446,10 +446,10 @@ async fn fetch_convert_and_record(
     let converted = match converted {
         Ok(converted) => converted,
         Err(ConvertError::Validation(v)) => return Err(BuildError::Validation(v)),
-        // 拉取成功但内容不是可解析的 Mihomo YAML(如机场不认 UA 返回的 base64 节点列表):同样是
-        // 机场侧问题,覆盖上面刚写入的 `success`,使列表/详情如实反映。
-        Err(ConvertError::ProviderParse) => {
-            let label = "provider_parse".to_string();
+        // 拉取成功但内容不是可解析的 Mihomo YAML(如机场不认 UA 返回的 base64 节点列表),或超出
+        // 解析资源上限:同样是机场侧问题,覆盖上面刚写入的 `success`,使列表/详情如实反映。
+        Err(ConvertError::ProviderParse(error)) => {
+            let label = error.provider_label().to_string();
             let _ = update_last_fetch(state, profile, &label, prefix).await;
             return Err(BuildError::Upstream(label));
         }
@@ -650,7 +650,9 @@ fn direct_rule_url(raw: &str) -> Option<String> {
 fn map_convert_err(e: ConvertError) -> ApiError {
     match e {
         ConvertError::Validation(v) => ApiError::Validation(v),
-        ConvertError::ProviderParse => ApiError::Upstream("provider_parse".to_string()),
+        ConvertError::ProviderParse(error) => {
+            ApiError::Upstream(error.provider_label().to_string())
+        }
         ConvertError::OutputSerialize => ApiError::Internal,
     }
 }

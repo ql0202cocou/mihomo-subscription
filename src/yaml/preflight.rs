@@ -2,9 +2,10 @@ use std::{ffi::CStr, marker::PhantomData, mem::MaybeUninit};
 
 use unsafe_libyaml_norway as unsafe_yaml;
 
-use super::{take, YamlError, MAX_BYTES, MAX_DEPTH};
+use super::{take, YamlError, MAX_BYTES, MAX_DEPTH, MAX_NODES};
 
-const MAX_LOADER_EVENTS: usize = 20_000;
+/// 事件总数上限:每个集合有开始与结束两个事件,故取物化节点上限的两倍。
+const MAX_LOADER_EVENTS: usize = 2 * MAX_NODES;
 
 pub(super) fn check(input: &str) -> Result<(), YamlError> {
     let mut parser = Parser::new(input.as_bytes())?;
