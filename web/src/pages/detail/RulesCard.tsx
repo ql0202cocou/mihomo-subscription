@@ -101,6 +101,14 @@ function filterUnlessKnown(isKnown: (input: string) => boolean) {
 const NETWORK_OPTIONS = ["tcp", "udp"];
 const IN_TYPE_OPTIONS = ["HTTP", "HTTPS", "SOCKS", "SOCKS4", "SOCKS5", "MIXED", "REDIR", "TPROXY", "TUN"];
 const LOGICAL_TYPES = new Set(["AND", "OR", "NOT", "SUB-RULE"]);
+// 匹配内容可含逗号、策略固定在最后一项的类型(逻辑规则与三种 REGEX 规则);其余类型的策略固定
+// 在第 3 项,其后是 no-resolve / src 等附加参数。与后端 `parse_rule_payload` 一致。
+const TAIL_POLICY_TYPES = new Set([
+  ...LOGICAL_TYPES,
+  "DOMAIN-REGEX",
+  "PROCESS-NAME-REGEX",
+  "PROCESS-PATH-REGEX",
+]);
 const RULE_EXAMPLES: Record<string, string> = {
   DOMAIN: "example.com",
   "DOMAIN-SUFFIX": "example.com",
@@ -129,6 +137,8 @@ interface RuleModel {
   payload: string;
   policy: string;
   noResolve: boolean;
+  /** 策略之后除 no-resolve 以外的附加参数(如 src),原样保留。 */
+  params: string[];
   // RULE-SET 内联 provider 定义(仅 type=RULE-SET 时有意义;payload 即规则集名)。
   rsBehavior: "domain" | "ipcidr" | "classical";
   rsFormat: "yaml" | "text" | "mrs";
@@ -158,6 +168,7 @@ const DEFAULT_RULE: RuleModel = {
   payload: "",
   policy: "",
   noResolve: false,
+  params: [],
   ...RS_DEFAULTS,
 };
 
@@ -187,29 +198,41 @@ const isComment = (line: string) => line.startsWith("#");
 const isMatchLine = (line: string) =>
   !isComment(line) && parseRule(line).type.trim().toUpperCase() === "MATCH";
 
-// 解析一行 Mihomo 规则文本。payload 本身可含逗号(如逻辑规则 "(A,x),(B,y)"),所以
-// 从尾部取:先剥掉结尾的 no-resolve,再取最后一项为 policy,其余整体作为 payload。
+// 解析一行 Mihomo 规则文本,各项位置与后端一致(见 TAIL_POLICY_TYPES)。
 function parseRule(line: string): RuleModel {
   const parts = line.split(",").map((p) => p.trim());
   const type = parts[0] ?? "";
-  if (type.toUpperCase() === "MATCH") {
-    return { type, payload: "", policy: parts[1] ?? "", noResolve: false, ...RS_DEFAULTS };
+  const upper = type.toUpperCase();
+  const base = { type, noResolve: false, params: [], ...RS_DEFAULTS };
+  if (upper === "MATCH") {
+    return { ...base, payload: "", policy: parts[1] ?? "" };
   }
-  let rest = parts.slice(1);
-  let noResolve = false;
-  if (rest.length > 0 && rest[rest.length - 1] === "no-resolve") {
-    noResolve = true;
-    rest = rest.slice(0, -1);
+  if (TAIL_POLICY_TYPES.has(upper)) {
+    // 匹配内容本身可含逗号(如 "(A,x),(B,y)"):最后一项是策略,其余整体作为匹配内容。
+    const rest = parts.slice(1);
+    return {
+      ...base,
+      payload: rest.slice(0, -1).join(","),
+      policy: rest.length > 0 ? rest[rest.length - 1] : "",
+    };
   }
-  const policy = rest.length > 0 ? rest[rest.length - 1] : "";
-  const payload = rest.slice(0, -1).join(",");
-  return { type, payload, policy, noResolve, ...RS_DEFAULTS };
+  const extra = parts.slice(3).filter((p) => p !== "");
+  return {
+    ...base,
+    payload: parts[1] ?? "",
+    policy: parts[2] ?? "",
+    noResolve: extra.includes("no-resolve"),
+    params: extra.filter((p) => p !== "no-resolve"),
+  };
 }
 
 function serializeRule(r: RuleModel): string {
-  if (r.type.toUpperCase() === "MATCH") return `MATCH,${r.policy}`;
+  const upper = r.type.trim().toUpperCase();
+  if (upper === "MATCH") return `MATCH,${r.policy}`;
   const base = `${r.type},${r.payload},${r.policy}`;
-  return r.noResolve ? `${base},no-resolve` : base;
+  // 策略在末项的类型不接受附加参数:多写一项会被当成策略。
+  if (TAIL_POLICY_TYPES.has(upper)) return base;
+  return [base, ...r.params, ...(r.noResolve ? ["no-resolve"] : [])].join(",");
 }
 
 function splitRules(content: string): { rules: string[]; match: string | null } {
@@ -926,8 +949,8 @@ function RuleComposer({ model, onChange, policyOptions, ruleSets }: ComposerProp
   const isMatch = upperType === "MATCH";
   const isRuleSet = upperType === "RULE-SET";
   const isLogical = LOGICAL_TYPES.has(upperType);
-  // no-resolve 仅 IP 类规则需要;MATCH / RULE-SET 不显示。
-  const showNoResolve = !isMatch && !isRuleSet;
+  // no-resolve 仅 IP 类规则需要;MATCH / RULE-SET 不显示,策略在末项的类型不接受附加参数。
+  const showNoResolve = !isMatch && !isRuleSet && !TAIL_POLICY_TYPES.has(upperType);
 
   const typeOptions = RULE_TYPE_GROUPS.map((g) => ({
     label: t(`rules.typeGroups.${g.key}`),

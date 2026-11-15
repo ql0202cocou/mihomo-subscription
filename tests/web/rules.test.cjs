@@ -727,3 +727,42 @@ test('a failed save closes the open edit dialog along with rolling the list back
   assert.equal(s.calls.error.length, 1);
   assert.deepEqual(rulePuts(s.requests).length, 1);
 });
+
+test('policy and extra parameters keep their positions when a rule is edited', async () => {
+  const s = session(
+    'IP-CIDR,1.2.3.4/32,Proxy,src\nIP-CIDR,10.0.0.0/8,Proxy,no-resolve,src\nAND,((DOMAIN,a.example),(NETWORK,udp)),Proxy\nMATCH,DIRECT',
+  );
+  await s.mount();
+  // 策略固定在第 3 项:其后的附加参数不是策略,改策略时原样保留。
+  s.row(s.render(), 'IP-CIDR,1.2.3.4/32,Proxy,src').props.onEdit();
+  let d = s.drill();
+  assert.equal(d.composer.props.model.policy, 'Proxy');
+  assert.equal(d.composer.props.model.noResolve, false);
+  d.composer.props.onChange({ ...d.composer.props.model, policy: 'DIRECT' });
+  await s.drill().modal.props.onOk();
+  await tick();
+
+  s.row(s.render(), 'IP-CIDR,10.0.0.0/8,Proxy,no-resolve,src').props.onEdit();
+  d = s.drill();
+  assert.equal(d.composer.props.model.noResolve, true);
+  d.composer.props.onChange({ ...d.composer.props.model, noResolve: false });
+  await s.drill().modal.props.onOk();
+  await tick();
+
+  // 逻辑规则的策略在最后一项,不提供 no-resolve 开关。
+  s.row(s.render(), 'AND,((DOMAIN,a.example),(NETWORK,udp)),Proxy').props.onEdit();
+  d = s.drill();
+  assert.equal(d.composer.props.model.payload, '((DOMAIN,a.example),(NETWORK,udp))');
+  assert.equal(d.composer.props.model.policy, 'Proxy');
+  assert.equal(find(d.composerTree, (e) => e.type === 'Switch'), null);
+  d.composer.props.onChange({ ...d.composer.props.model, noResolve: true });
+  await s.drill().modal.props.onOk();
+  await tick();
+
+  assert.deepEqual(rulePuts(s.requests).at(-1).split('\n'), [
+    'IP-CIDR,1.2.3.4/32,DIRECT,src',
+    'IP-CIDR,10.0.0.0/8,Proxy,src',
+    'AND,((DOMAIN,a.example),(NETWORK,udp)),Proxy',
+    'MATCH,DIRECT',
+  ]);
+});
