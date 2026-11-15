@@ -20,16 +20,30 @@ pub struct KeyedLock {
 struct EntryGuard {
     locks: Arc<Mutex<HashMap<String, Arc<AsyncMutex<()>>>>>,
     key: String,
-    lock: Arc<AsyncMutex<()>>,
+    /// 仅在 `drop` 中取走。
+    lock: Option<Arc<AsyncMutex<()>>>,
+}
+
+impl EntryGuard {
+    fn lock(&self) -> &Arc<AsyncMutex<()>> {
+        self.lock.as_ref().expect("lock is held until drop")
+    }
 }
 
 impl Drop for EntryGuard {
     fn drop(&mut self) {
         let mut map = self.locks.lock().unwrap();
-        if Arc::strong_count(&self.lock) <= 2
+        let Some(own) = self.lock.take() else {
+            return;
+        };
+        let is_current = map.get(&self.key).is_some_and(|cur| Arc::ptr_eq(cur, &own));
+        // 引用的克隆(`entry_for`)与归还都在表锁内:先归还自己这份再计数,同一 key 的多个
+        // guard 同时释放时,最后一个一定能看到只剩表里的那一份。
+        drop(own);
+        if is_current
             && map
                 .get(&self.key)
-                .is_some_and(|cur| Arc::ptr_eq(cur, &self.lock))
+                .is_some_and(|cur| Arc::strong_count(cur) == 1)
         {
             map.remove(&self.key);
         }
@@ -47,7 +61,7 @@ impl KeyedLock {
         let entry = self.entry_for(key);
         let result = {
             // 内层作用域保证异步锁 guard 先于 entry 释放，包括 future 被取消时。
-            let _guard = entry.lock.lock().await;
+            let _guard = entry.lock().lock().await;
             fut.await
         };
         drop(entry);
@@ -61,7 +75,7 @@ impl KeyedLock {
         EntryGuard {
             locks: Arc::clone(&self.locks),
             key: key.to_string(),
-            lock,
+            lock: Some(lock),
         }
     }
 }
@@ -87,7 +101,7 @@ mod tests {
         let sf = KeyedLock::new();
         let entry = sf.entry_for("k");
         {
-            let _guard = entry.lock.lock().await;
+            let _guard = entry.lock().lock().await;
         }
         drop(entry);
         assert_eq!(len(&sf), 0, "无等待者的条目在刷新结束后被移除");
@@ -99,7 +113,7 @@ mod tests {
         let entry = sf.entry_for("k");
         let waiter = sf.entry_for("k");
         {
-            let _guard = entry.lock.lock().await;
+            let _guard = entry.lock().lock().await;
         }
         drop(entry);
         assert_eq!(len(&sf), 1, "仍有持有者时条目保留");
@@ -112,9 +126,9 @@ mod tests {
         let sf = KeyedLock::new();
         let a = sf.entry_for("k");
         let b = sf.entry_for("k");
-        assert!(Arc::ptr_eq(&a.lock, &b.lock), "同 key 合并到同一把锁");
-        let guard = a.lock.lock().await;
-        assert!(b.lock.try_lock().is_err(), "锁被持有期间并发合并语义不变");
+        assert!(Arc::ptr_eq(a.lock(), b.lock()), "同 key 合并到同一把锁");
+        let guard = a.lock().lock().await;
+        assert!(b.lock().try_lock().is_err(), "锁被持有期间并发合并语义不变");
         drop(guard);
         drop(a);
         drop(b);

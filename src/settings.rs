@@ -27,7 +27,18 @@ pub async fn get(State(state): State<Arc<AppState>>) -> ApiResult<impl IntoRespo
 /// (规则草稿未通过校验的 profile 回退到最近一份合法规则,仍无法迁移的清空缓存,见
 /// `generate::regenerate_for_rotation`)。
 pub async fn reset_public_path(State(state): State<Arc<AppState>>) -> ApiResult<impl IntoResponse> {
-    let prefix = state
+    // 在独立任务里完成:请求中途被取消(客户端断开)时,已提交的新前缀仍会同步到内存并完成
+    // 缓存迁移,不会停在「库里是新前缀、内存还是旧前缀」的状态。
+    let prefix = tokio::spawn(async move { rotate_public_path(&state).await })
+        .await
+        .map_err(|_| crate::error::ApiError::Internal)??;
+    Ok(Json(SettingsResponse {
+        public_path_prefix: prefix,
+    }))
+}
+
+async fn rotate_public_path(state: &Arc<AppState>) -> ApiResult<String> {
+    state
         .keyed_lock
         .run("settings:public-prefix", async {
             let prefix = random_path_prefix();
@@ -45,11 +56,8 @@ pub async fn reset_public_path(State(state): State<Arc<AppState>>) -> ApiResult<
             tx.commit().await?;
             // 公开端点校验读的是内存中的前缀,落库后必须同步,使新前缀免重启立即生效。
             state.set_prefix(prefix.clone());
-            crate::generate::regenerate_all_for_rotation(&state).await;
-            Ok::<_, crate::error::ApiError>(prefix)
+            crate::generate::regenerate_all_for_rotation(state).await;
+            Ok(prefix)
         })
-        .await?;
-    Ok(Json(SettingsResponse {
-        public_path_prefix: prefix,
-    }))
+        .await
 }

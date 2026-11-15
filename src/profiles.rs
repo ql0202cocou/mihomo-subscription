@@ -436,15 +436,21 @@ pub async fn delete(
     Path(id): Path<String>,
 ) -> ApiResult<impl IntoResponse> {
     // 依赖 `foreign_keys=ON` 的 ON DELETE CASCADE 一并清理 rulesets/custom_groups/
-    // profile_rule_sets/generated_cache 等从表。
-    let result = sqlx::query("DELETE FROM profiles WHERE id = ?")
-        .bind(&id)
-        .execute(&state.db)
-        .await?;
-    if result.rows_affected() == 0 {
-        return Err(ApiError::NotFound);
-    }
-    Ok(StatusCode::NO_CONTENT)
+    // profile_rule_sets/generated_cache 等从表。与该订阅的其它写操作共用 per-profile 锁,
+    // 避免它们在「确认订阅存在」与写入从表之间被删除打断。
+    state
+        .keyed_lock
+        .run(&id, async {
+            let result = sqlx::query("DELETE FROM profiles WHERE id = ?")
+                .bind(&id)
+                .execute(&state.db)
+                .await?;
+            if result.rows_affected() == 0 {
+                return Err(ApiError::NotFound);
+            }
+            Ok(StatusCode::NO_CONTENT)
+        })
+        .await
 }
 
 #[derive(Serialize)]
