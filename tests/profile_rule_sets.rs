@@ -1376,6 +1376,52 @@ async fn import_skips_names_missing_from_the_global_library() {
 }
 
 #[tokio::test]
+async fn import_does_not_reference_a_disabled_local_definition() {
+    let temp = TempDb::new();
+    let (app, _) = cached_app(&temp, Arc::new(BodyFetcher(PROVIDER_YAML))).await;
+    let cookie = login(&app).await;
+    let (p1, _, sub_path) = create_profile(&app, &cookie, "P1").await;
+    let baseline = get_text(&app, &sub_path).await;
+    app.clone()
+        .oneshot(authed(
+            "POST",
+            "/api/rule-sets",
+            &cookie,
+            r#"{"name":"ads","behavior":"domain","format":"yaml","content":"+.ad.example"}"#,
+        ))
+        .await
+        .unwrap();
+    // 本订阅已有同名定义,但处于停用:生成不认它,导入不能再为它追加引用。
+    create_rs(
+        &app,
+        &cookie,
+        &p1,
+        r#"{"name":"ads","behavior":"domain","format":"yaml","content":"+.own.example","enabled":false}"#,
+    )
+    .await;
+
+    let resp = app
+        .clone()
+        .oneshot(authed(
+            "POST",
+            &format!("/api/profiles/{p1}/rule-sets/import"),
+            &cookie,
+            r#"{"names":["ads"],"policy":"DIRECT"}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let result = json(resp).await;
+    assert_eq!(result["imported"], 0);
+    assert!(result["regenerate"].is_null());
+    assert!(!result["rules_content"]
+        .as_str()
+        .unwrap()
+        .contains("RULE-SET,ads"));
+    assert_eq!(get_text(&app, &sub_path).await, baseline);
+}
+
+#[tokio::test]
 async fn import_skips_unsupported_legacy_definitions() {
     let temp = TempDb::new();
     let state = test_state_with_fetcher(&temp, Arc::new(BodyFetcher(PROVIDER_YAML))).await;

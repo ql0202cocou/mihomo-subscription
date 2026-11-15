@@ -485,19 +485,22 @@ pub async fn import(
         let mut tx = state.db.begin_with("BEGIN IMMEDIATE").await?;
 
         // 复制定义:逐个把 ② 行复制进 ③(本订阅已有同名则跳过);rule_count 直接沿用 ② 的值。
-        // `available` 收集复制完成后 ③ 中实际存在的名(保序),只有它们才会得到规则行。
+        // `available` 收集复制完成后 ③ 中实际存在且启用的名(保序),只有它们才会得到规则行——
+        // 生成只认启用的定义,为停用的定义追加引用会让规则无法通过校验。
         let mut imported = 0usize;
         let mut available: Vec<&str> = Vec::new();
         for name in &names {
-            let exists = sqlx::query_scalar::<_, String>(
-                "SELECT id FROM profile_rule_sets WHERE profile_id = ? AND name = ?",
+            let existing_enabled = sqlx::query_scalar::<_, bool>(
+                "SELECT enabled FROM profile_rule_sets WHERE profile_id = ? AND name = ?",
             )
             .bind(&profile_id)
             .bind(name)
             .fetch_optional(&mut *tx)
             .await?;
-            if exists.is_some() {
-                available.push(name.as_str());
+            if let Some(enabled) = existing_enabled {
+                if enabled {
+                    available.push(name.as_str());
+                }
                 continue;
             }
             let Some(g) = sqlx::query_as::<_, GlobalRuleSet>(

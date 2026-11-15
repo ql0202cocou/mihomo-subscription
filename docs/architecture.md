@@ -169,7 +169,7 @@ GET    /api/profiles/:id/rule-sets                     # 列表；每项含 url�
 POST   /api/profiles/:id/rule-sets   { name, behavior, source?, format, ... }   # name 在本订阅内唯一（重名 409）；字段同 ②。新建/更新响应为最新定义，改动影响所服务输出时另带 regenerate 字段
 PUT    /api/profiles/:id/rule-sets/:rsid   { ...同上 }
 DELETE /api/profiles/:id/rule-sets/:rsid
-POST   /api/profiles/:id/rule-sets/import  { names: [②规则集名], policy }   # names 最多 1000 个（逐个 trim、去空、按规则集名同一约束校验、保序去重，超限或含非法名 400）。在 per-profile 锁内以单个 BEGIN IMMEDIATE 事务复制 ② 定义进 ③（含真实远程 URL）+ 为导入后本订阅实际存在定义且尚未引用的名插入 RULE-SET,<name>,<policy> 行（插到最后一条非注释 MATCH 兜底行之前，无 MATCH 则追加末尾；② 中不存在、未能复制的名字不追加；policy 须为单个非空名字，不含逗号/换行，否则 400 且不写入）；规则文本以读取时的旧内容为条件写回（CAS），并发规则编辑导致冲突时整体回滚、返回 409（重试即可）；返回 { imported, regenerate, rules_content }（imported 为实际复制进 ③ 的定义数，已存在同名的不计；复制了定义或新增了规则行都会触发离线重生成，都没有时 regenerate 为 null；rules_content 为导入提交后的完整规则文本，无改动时保留原文，供前端同步编辑状态）
+POST   /api/profiles/:id/rule-sets/import  { names: [②规则集名], policy }   # names 最多 1000 个（逐个 trim、去空、按规则集名同一约束校验、保序去重，超限或含非法名 400）。在 per-profile 锁内以单个 BEGIN IMMEDIATE 事务复制 ② 定义进 ③（含真实远程 URL）+ 为导入后本订阅存在已启用定义且尚未引用的名插入 RULE-SET,<name>,<policy> 行（插到最后一条非注释 MATCH 兜底行之前，无 MATCH 则追加末尾；② 中不存在、未能复制的名字，以及本订阅已有同名但停用的定义不追加；policy 须为单个非空名字，不含逗号/换行，否则 400 且不写入）；规则文本以读取时的旧内容为条件写回（CAS），并发规则编辑导致冲突时整体回滚、返回 409（重试即可）；返回 { imported, regenerate, rules_content }（imported 为实际复制进 ③ 的定义数，已存在同名的不计；复制了定义或新增了规则行都会触发离线重生成，都没有时 regenerate 为 null；rules_content 为导入提交后的完整规则文本，无改动时保留原文，供前端同步编辑状态）
 ```
 
 - manual / remote 行为与 ② 一致（校验/渲染/镜像同一套逻辑）。托管在按订阅 token 隔离的链接
