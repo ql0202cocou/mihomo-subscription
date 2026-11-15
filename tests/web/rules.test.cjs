@@ -599,3 +599,131 @@ test('drag sorting registers a pointer sensor and a keyboard sensor', async () =
   assert.deepEqual(Object.keys(used[1].options), ['coordinateGetter']);
   assert.equal(used[1].options.coordinateGetter, coordinateGetter);
 });
+
+test('switching a rule to RULE-SET for an existing local name loads its definition', async () => {
+  const s = session('DOMAIN,ads,DIRECT\nMATCH,DIRECT', {
+    profileRuleSets: [profileRuleSet({ behavior: 'classical', content: '- one\n- two' })],
+  });
+  await s.mount();
+  s.row(s.render(), 'DOMAIN,ads,DIRECT').props.onEdit();
+  let d = s.drill();
+  find(d.composerTree, (e) => e.props?.placeholder === 'rules.ruleType').props.onChange('RULE-SET');
+  d = s.drill();
+  // 表单基于已有定义,而不是空白默认值。
+  assert.equal(d.composer.props.model.rsLoadedName, 'ads');
+  assert.equal(d.composer.props.model.rsBehavior, 'classical');
+  assert.equal(s.contentArea(d.defTree).props.value, '- one\n- two');
+
+  s.contentArea(d.defTree).props.onChange({ target: { value: '- one\n- two\n- three' } });
+  d = s.drill();
+  await d.modal.props.onOk();
+  await tick();
+  const writes = definitionWrites(s.requests);
+  assert.deepEqual(writes.map((r) => [r.method, r.url]), [['PUT', '/api/profiles/p/rule-sets/rs1']]);
+  assert.equal(writes[0].body.behavior, 'classical');
+  assert.equal(writes[0].body.content, '- one\n- two\n- three');
+});
+
+test('a definition that loads after the dialog opened is filled in, never overwritten blindly', async () => {
+  const library = deferred();
+  const s = session('RULE-SET,ads,DIRECT\nMATCH,DIRECT', {
+    handlers: { 'GET /api/profiles/p/rule-sets': () => library.promise },
+  });
+  await s.mount();
+  s.row(s.render(), 'RULE-SET,ads,DIRECT').props.onEdit();
+  let d = s.drill();
+  assert.equal(d.composer.props.model.rsLoadedName, ''); // ③ 库还没加载到
+  find(d.defTree, (e) => e.type === 'Switch').props.onChange(true);
+  d = s.drill();
+  s.contentArea(d.defTree).props.onChange({ target: { value: '- typed.example' } });
+
+  library.resolve([profileRuleSet({ content: '- keep.example' })]);
+  await tick();
+  s.render();
+  d = s.drill();
+  await d.modal.props.onOk();
+  await tick();
+  // 表单里的修改不是基于已有定义做的:不写回,载入已有定义并提示确认。
+  assert.deepEqual(definitionWrites(s.requests), []);
+  assert.deepEqual(rulePuts(s.requests), []);
+  assert.deepEqual(s.calls.warning, ['rules.ruleSetDefinitionLoaded']);
+  d = s.drill();
+  assert.equal(d.modal.props.open, true);
+  assert.equal(s.contentArea(d.defTree).props.value, '- keep.example');
+
+  // 未改动的表单在 ③ 库加载完成时直接补上预填。
+  const late = deferred();
+  const untouched = session('RULE-SET,ads,DIRECT\nMATCH,DIRECT', {
+    handlers: { 'GET /api/profiles/p/rule-sets': () => late.promise },
+  });
+  await untouched.mount();
+  untouched.row(untouched.render(), 'RULE-SET,ads,DIRECT').props.onEdit();
+  late.resolve([profileRuleSet({ content: '- keep.example' })]);
+  await tick();
+  untouched.render();
+  assert.equal(untouched.drill().composer.props.model.rsContent, '- keep.example');
+});
+
+test('a reload from an earlier save does not undo an edit whose save is still in flight', async () => {
+  const second = deferred();
+  let saves = 0;
+  let reloads = 0;
+  const s = session(
+    'DOMAIN,a.example,DIRECT\nDOMAIN,b.example,DIRECT\nDOMAIN,c.example,DIRECT\nMATCH,DIRECT',
+    {
+      onSaved: () => { reloads += 1; },
+      handlers: {
+        'PUT /api/profiles/p/rules': () =>
+          ++saves === 2 ? second.promise : { regenerate: { status: 'applied' } },
+      },
+    },
+  );
+  await s.mount();
+  s.row(s.render(), 'DOMAIN,a.example,DIRECT').props.onRemove();
+  await tick();
+  assert.equal(reloads, 1);
+
+  // 第二次编辑的保存在途时,第一次保存触发的 reload 才带着旧内容回来。
+  s.row(s.render(), 'DOMAIN,b.example,DIRECT').props.onRemove();
+  await tick();
+  s.setInitial('DOMAIN,b.example,DIRECT\nDOMAIN,c.example,DIRECT\nMATCH,DIRECT');
+  assert.deepEqual(rowLines(s.render()), ['DOMAIN,c.example,DIRECT']);
+
+  // 第三次编辑基于界面上的列表,不会把第二次删掉的规则带回去。
+  s.row(s.render(), 'DOMAIN,c.example,DIRECT').props.onRemove();
+  second.resolve({ regenerate: { status: 'applied' } });
+  await tick();
+  assert.deepEqual(rulePuts(s.requests), [
+    'DOMAIN,b.example,DIRECT\nDOMAIN,c.example,DIRECT\nMATCH,DIRECT',
+    'DOMAIN,c.example,DIRECT\nMATCH,DIRECT',
+    'MATCH,DIRECT',
+  ]);
+  // 全部保存完成后的 reload 照常生效。
+  s.setInitial('MATCH,DIRECT');
+  assert.deepEqual(rowLines(s.render()), []);
+});
+
+test('a failed save closes the open edit dialog along with rolling the list back', async () => {
+  const save = deferred();
+  const s = session(
+    'DOMAIN,a.example,DIRECT\nDOMAIN,b.example,DIRECT\nDOMAIN,c.example,DIRECT\nMATCH,DIRECT',
+    { handlers: { 'PUT /api/profiles/p/rules': () => save.promise } },
+  );
+  await s.mount();
+  s.row(s.render(), 'DOMAIN,a.example,DIRECT').props.onRemove();
+  await tick();
+  // 保存在途时打开另一条规则的编辑弹窗:此时它在列表里的下标是 1。
+  s.row(s.render(), 'DOMAIN,c.example,DIRECT').props.onEdit();
+  assert.equal(editModal(s.render()).props.open, true);
+
+  save.reject(new Error('boom'));
+  await tick();
+  const tree = s.render();
+  assert.deepEqual(rowLines(tree), [
+    'DOMAIN,a.example,DIRECT', 'DOMAIN,b.example,DIRECT', 'DOMAIN,c.example,DIRECT',
+  ]);
+  // 回滚后下标 1 是另一条规则,弹窗随之关闭,不留下指向错位的编辑目标。
+  assert.equal(editModal(tree).props.open, false);
+  assert.equal(s.calls.error.length, 1);
+  assert.deepEqual(rulePuts(s.requests).length, 1);
+});

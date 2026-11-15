@@ -176,6 +176,13 @@ function withRuleSetDefinition(model: RuleModel, rs: ProfileRuleSet): RuleModel 
   };
 }
 
+/** RULE-SET 表单显示的名字在本订阅已有定义、而表单尚未基于它时,载入该定义。已做的修改不覆盖。 */
+function syncRuleSetDefinition(model: RuleModel, ruleSets: ProfileRuleSet[]): RuleModel {
+  if (model.type.trim().toUpperCase() !== "RULE-SET" || model.rsDirty) return model;
+  const rs = ruleSets.find((r) => r.name === model.payload.trim());
+  return rs && rs.name !== model.rsLoadedName ? withRuleSetDefinition(model, rs) : model;
+}
+
 const isComment = (line: string) => line.startsWith("#");
 const isMatchLine = (line: string) =>
   !isComment(line) && parseRule(line).type.trim().toUpperCase() === "MATCH";
@@ -277,7 +284,13 @@ export default function RulesCard({
     matchRef.current = nextMatch;
   }, []);
 
+  // 在途(含排队)的规则保存数。
+  const pendingSaves = useRef(0);
+
   useEffect(() => {
+    // 还有保存在途:这次 reload 带回的是更早一次保存后的内容,写回会冲掉界面上尚未落库的编辑。
+    // 最后一次保存完成后会再触发一次 reload。
+    if (pendingSaves.current > 0) return;
     // 导入完成前后的旧 reload 不得覆盖刚确认的服务端文本;本次导入触发的最新 reload 除外。
     if (
       hostedImportPending.current &&
@@ -336,6 +349,11 @@ export default function RulesCard({
     void loadProfileRuleSets();
   }, [loadPolicies, loadProfileRuleSets, generatedAt]);
 
+  // ③ 库在弹窗打开之后才加载完成时,补上预填。
+  useEffect(() => {
+    setModel((m) => syncRuleSetDefinition(m, profileRuleSets));
+  }, [profileRuleSets]);
+
   // 保存规则 + 钉底的 MATCH(始终在最后)。返回是否成功,供调用方决定后续提示。`appliedText` 为
   // 「已应用到订阅」的成功文案(见 useRegenerateNotice)。
   const persist = useCallback(
@@ -343,12 +361,14 @@ export default function RulesCard({
       if (hostedImportPending.current) return false;
       applyRules(nextRules, nextMatch);
       const content = rulesContent(nextRules, nextMatch);
+      pendingSaves.current += 1;
       const res = await saveInOrder(() =>
         api<{ regenerate: Regenerate }>(`/api/profiles/${profileId}/rules`, {
           method: "PUT",
           body: JSON.stringify({ content }),
         }),
       );
+      pendingSaves.current -= 1;
       // 保存串行生效,成功即服务端当前持有的规则。
       if (res.ok) saved.current = { rules: nextRules, match: nextMatch };
       // 之后又有保存:它提交的是完整规则,界面(提示、回滚、reload)交给最后一次决定。
@@ -358,6 +378,10 @@ export default function RulesCard({
         onSaved();
       } else {
         applyRules(saved.current.rules, saved.current.match);
+        // 列表回滚后,打开着的编辑弹窗所指的下标已不再对应原来那条规则。
+        setModalOpen(false);
+        setEditing(null);
+        setModel(DEFAULT_RULE);
         message.error(errorMessage(res.error, t("common.saveFailed")));
       }
       return res.ok;
@@ -389,12 +413,8 @@ export default function RulesCard({
 
   function openEdit(index: number) {
     if (hostedImportPending.current) return;
-    let m = parseRule(rules[index]);
     // RULE-SET:用本订阅已有的 ③ 定义预填(远程 URL 已脱敏不回显,留空表示保持不变)。
-    if (m.type.trim().toUpperCase() === "RULE-SET") {
-      const rs = profileRuleSets.find((r) => r.name === m.payload.trim());
-      if (rs) m = withRuleSetDefinition(m, rs);
-    }
+    const m = syncRuleSetDefinition(parseRule(rules[index]), profileRuleSets);
     setEditing(index);
     setModel(m);
     setModalOpen(true);
@@ -472,6 +492,13 @@ export default function RulesCard({
         }
         if (isRuleSet) {
           const existing = profileRuleSets.find((r) => r.name === model.payload.trim());
+          if (existing && model.rsManage && model.rsDirty && model.rsLoadedName !== existing.name) {
+            // 表单里的修改不是基于已有定义做的(定义在编辑之后才加载到):整体保存会用表单默认值
+            // 覆盖它。改为载入已有定义,交给用户确认后再保存。
+            setModel(withRuleSetDefinition(model, existing));
+            message.warning(t("rules.ruleSetDefinitionLoaded"));
+            return;
+          }
           const shouldUpsert = model.rsManage && (!existing || model.rsDirty);
           if (shouldUpsert) {
             if (model.rsSource === "remote" && !model.rsUrl.trim() && !existing) {
@@ -998,7 +1025,7 @@ function RuleComposer({ model, onChange, policyOptions, ruleSets }: ComposerProp
                 next.payload = RULE_EXAMPLES[newU] ?? "";
               }
             }
-            onChange(next);
+            onChange(syncRuleSetDefinition(next, ruleSets));
           }}
           placeholder={t("rules.ruleType")}
           filterOption={filterUnlessKnown((v) => ALL_RULE_TYPES.has(v))}
@@ -1096,7 +1123,9 @@ function RuleSetDefBlock({
         <Switch
           size="small"
           checked={model.rsManage}
-          onChange={(rsManage) => onChange({ ...model, rsManage })}
+          onChange={(rsManage) =>
+            onChange(rsManage ? syncRuleSetDefinition({ ...model, rsManage }, ruleSets) : { ...model, rsManage })
+          }
         />
         <Typography.Text type="secondary">{t("rules.ruleSetManage")}</Typography.Text>
       </div>

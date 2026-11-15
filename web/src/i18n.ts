@@ -252,6 +252,7 @@ const zh = {
       ruleSetManage: "维护本订阅的 rule-provider 定义",
       ruleSetReferenceOnly: "仅保存引用，不创建本地定义；可继续引用机场同名 provider。",
       ruleSetKeepExisting: "本次不修改本地定义；已有定义仍会随引用生效。",
+      ruleSetDefinitionLoaded: "该名称已有本地定义，已载入现有内容，请确认后再保存。",
       policy: "策略(节点 / 分组 / 内置)",
       policyGroups: {
         nodes: "机场 / 自定义节点",
