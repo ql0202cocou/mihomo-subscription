@@ -121,24 +121,41 @@ async fn fetch_one(state: &AppState, profile_id: &str, id: &str) -> ApiResult<Ru
 
 // ─── 引用检查 ────────────────────────────────────────────────────────────────────
 
-/// 收集「当前规则草稿 ∪ 产出所服务缓存的规则」引用到的规则集名(含逻辑规则内嵌套,由
-/// `converter::ruleset_refs` 收集)。被引用的规则集改名/停用/删除会让正在下发的配置或下次
-/// 重生成失去定义,必须拦截(409)。升级前的缓存无 `rules_snapshot`,改从 `output_yaml` 的
-/// `rules` 段提取;缓存不存在时不含缓存引用,缓存损坏无法判断时返回 `None`,调用方按
-/// 「被引用」保守处理。
-async fn referenced_names(
-    state: &AppState,
-    profile_id: &str,
-) -> ApiResult<Option<HashSet<String>>> {
-    let mut out: HashSet<String> = HashSet::new();
+/// 规则集引用,按来源分开:当前规则草稿与产出所服务缓存的规则(含逻辑规则内嵌套,由
+/// `converter::ruleset_refs` 收集)。被任一来源引用的规则集改名/停用/删除会让正在下发的配置
+/// 或下次重生成失去定义,必须拦截(409);只有缓存引用的定义才真正注入在所服务的输出里。
+struct RuleSetRefs {
+    draft: HashSet<String>,
+    /// 缓存不存在时为空集;缓存损坏无法判断时为 `None`,按「被引用」保守处理。
+    cache: Option<HashSet<String>>,
+}
+
+impl RuleSetRefs {
+    /// `name` 是否被规则草稿或所服务缓存引用。
+    fn contains(&self, name: &str) -> bool {
+        self.draft.contains(name) || self.in_cache(name)
+    }
+
+    /// `name` 是否被产出所服务缓存的规则引用。
+    fn in_cache(&self, name: &str) -> bool {
+        self.cache.as_ref().is_none_or(|s| s.contains(name))
+    }
+}
+
+/// 收集规则集引用。升级前的缓存无 `rules_snapshot`,改从 `output_yaml` 的 `rules` 段提取。
+async fn referenced_names(state: &AppState, profile_id: &str) -> ApiResult<RuleSetRefs> {
     let current =
         sqlx::query_scalar::<_, String>("SELECT content FROM rulesets WHERE profile_id = ?")
             .bind(profile_id)
             .fetch_optional(&state.db)
             .await?;
-    if let Some(content) = current {
-        out.extend(crate::converter::ruleset_refs(&content));
-    }
+    let draft = current
+        .map(|content| {
+            crate::converter::ruleset_refs(&content)
+                .into_iter()
+                .collect()
+        })
+        .unwrap_or_default();
     // 规则快照缺失(升级前的旧缓存)时才需要整份输出作退路,避免每次读出大块 output_yaml。
     let cache = sqlx::query_as::<_, (Option<String>, Option<String>)>(
         "SELECT rules_snapshot, CASE WHEN rules_snapshot IS NULL THEN output_yaml END \
@@ -147,15 +164,17 @@ async fn referenced_names(
     .bind(profile_id)
     .fetch_optional(&state.db)
     .await?;
-    match cache {
-        None => {}
-        Some((Some(snapshot), _)) => out.extend(crate::converter::ruleset_refs(&snapshot)),
-        Some((None, output)) => match cached_output_rules(output.as_deref().unwrap_or_default()) {
-            Some(rules) => out.extend(crate::converter::ruleset_refs(&rules)),
-            None => return Ok(None),
-        },
-    }
-    Ok(Some(out))
+    let cache = match cache {
+        None => Some(HashSet::new()),
+        Some((Some(snapshot), _)) => Some(
+            crate::converter::ruleset_refs(&snapshot)
+                .into_iter()
+                .collect(),
+        ),
+        Some((None, output)) => cached_output_rules(output.as_deref().unwrap_or_default())
+            .map(|rules| crate::converter::ruleset_refs(&rules).into_iter().collect()),
+    };
+    Ok(RuleSetRefs { draft, cache })
 }
 
 fn referenced_conflict(name: &str, action: &str) -> ApiError {
@@ -177,11 +196,6 @@ fn cached_output_rules(output_yaml: &str) -> Option<String> {
         lines.push(item.as_str()?.to_string());
     }
     Some(lines.join("\n"))
-}
-
-/// `names` 为 `None`(缓存损坏,无法判断)时按「被引用」处理。
-fn is_referenced(names: &Option<HashSet<String>>, name: &str) -> bool {
-    names.as_ref().is_none_or(|s| s.contains(name))
 }
 
 // ─── CRUD ──────────────────────────────────────────────────────────────────────
@@ -255,7 +269,7 @@ pub async fn create(
         let row = fetch_one(&state, &profile_id, &id).await?;
         // 新建只会补上旧缓存里不存在的定义(引用未定义规则集的规则过不了校验),旧缓存的托管
         // 链接都仍有效:重生成未通过时保留它继续下发,不同于 `update` 改动已注入定义时删缓存。
-        let regenerate = if is_referenced(&referenced, name) {
+        let regenerate = if referenced.contains(name) {
             Some(crate::generate::regenerate_from_cache_locked(&state, &profile_id).await)
         } else {
             None
@@ -273,10 +287,12 @@ pub async fn create(
 
 /// `PUT /api/profiles/:id/rule-sets/:rsid` —— 更新。任何更新都清空镜像缓存(下次拉取重新回源)。
 /// 被 `RULE-SET` 规则引用(含逻辑规则嵌套,含产出当前缓存的规则快照)的规则集不可改名/停用 → 409。
-/// 改动已注入输出的字段(托管链接的 behavior/format、注入方式 source/cache、remote 直连 URL、
-/// 启停)时,同一事务先把 `generated_cache.capability_hash` 置 NULL(标脏,崩溃窗口内旧缓存不会被
-/// 当作兼容缓存下发),提交后离线重生成;重生成非 Applied(无机场原文或新配置不合法)时删除缓存,
-/// 下次公开拉取回源重建。纯 manual 内容/镜像间隔不影响输出,不做无谓重生成。
+/// 改动影响输出的字段(托管链接的 behavior/format、注入方式 source/cache、remote 直连 URL、
+/// 启停)时提交后离线重生成。定义已注入所服务的缓存(缓存自己的规则引用它)时,同一事务先把
+/// `generated_cache.capability_hash` 置 NULL(标脏,崩溃窗口内旧缓存不会被当作兼容缓存下发),
+/// 重生成非 Applied(无机场原文或新配置不合法)时删除缓存,下次公开拉取回源重建;定义只被未通过
+/// 校验的规则草稿引用时旧缓存不含它,重生成失败也保留。纯 manual 内容/镜像间隔不影响输出,
+/// 不做无谓重生成。
 pub async fn update(
     State(state): State<Arc<AppState>>,
     Path((profile_id, rsid)): Path<(String, String)>,
@@ -289,7 +305,7 @@ pub async fn update(
         let name = body.name.trim();
         let enabled = body.enabled.unwrap_or(true);
         let referenced = referenced_names(&state, &profile_id).await?;
-        let was_referenced = is_referenced(&referenced, &existing.name);
+        let was_referenced = referenced.contains(&existing.name);
         if was_referenced && name != existing.name {
             return Err(referenced_conflict(&existing.name, "renaming"));
         }
@@ -298,7 +314,7 @@ pub async fn update(
         }
         // 输出中的 rule-providers 条目由「被引用且启用」的定义注入;条目出现(改名/启用补齐引用)、
         // 消失或字段变化都会改变输出,须重生成缓存。
-        let now_referenced = is_referenced(&referenced, name);
+        let now_referenced = referenced.contains(name);
         let had_entry = was_referenced && existing.enabled;
         let has_entry = now_referenced && enabled;
         let entry_changed = had_entry
@@ -309,9 +325,13 @@ pub async fn update(
                 || n.cache != existing.cache
                 || (n.source == "remote" && !n.cache && n.url != existing.url));
         let affects_output = had_entry != has_entry || entry_changed;
+        // 所服务的缓存里确实注入着这条定义(缓存自己的规则引用它,且定义原本启用)。只被未通过
+        // 校验的规则草稿引用的定义不在缓存里,改动它不会让旧缓存失效。
+        let served_entry = existing.enabled && referenced.in_cache(&existing.name);
+        let invalidates_cache = affects_output && served_entry;
 
         let mut tx = state.db.begin_with("BEGIN IMMEDIATE").await?;
-        if affects_output {
+        if invalidates_cache {
             sqlx::query("UPDATE generated_cache SET capability_hash = NULL WHERE profile_id = ?")
                 .bind(&profile_id)
                 .execute(&mut *tx)
@@ -343,10 +363,10 @@ pub async fn update(
         let row = fetch_one(&state, &profile_id, &rsid).await?;
         let regenerate = if affects_output {
             let r = crate::generate::regenerate_from_cache_locked(&state, &profile_id).await;
-            if !matches!(r, Regenerated::Applied) {
+            if invalidates_cache && !matches!(r, Regenerated::Applied) {
                 // 本次改的正是旧缓存已注入的定义,旧缓存里的托管链接/直连地址已失效:无法用当前
-                // 规则重建时删除缓存而不是继续下发,下次公开拉取回源重建。新建与导入只增加定义,
-                // 旧缓存仍有效,故不删。
+                // 规则重建时删除缓存而不是继续下发,下次公开拉取回源重建。旧缓存未注入该定义时
+                // (同新建与导入)它仍然有效,保留继续下发。
                 crate::generate::invalidate_cache(&state, &profile_id).await?;
             }
             Some(r)
@@ -372,7 +392,7 @@ pub async fn delete(
         .run(&profile_id, async {
             let existing = fetch_one(&state, &profile_id, &rsid).await?;
             let referenced = referenced_names(&state, &profile_id).await?;
-            if is_referenced(&referenced, &existing.name) {
+            if referenced.contains(&existing.name) {
                 return Err(referenced_conflict(&existing.name, "deleting"));
             }
             sqlx::query("DELETE FROM profile_rule_sets WHERE id = ? AND profile_id = ?")

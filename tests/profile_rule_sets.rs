@@ -1042,6 +1042,59 @@ async fn create_keeps_last_valid_cache_when_rules_stay_invalid() {
 }
 
 #[tokio::test]
+async fn update_of_draft_only_definition_keeps_last_valid_cache() {
+    let temp = TempDb::new();
+    let (app, db) = cached_app(&temp, Arc::new(BodyFetcher(PROVIDER_YAML))).await;
+    let cookie = login(&app).await;
+    let (p1, _, sub_path) = create_profile(&app, &cookie, "P1").await;
+    let baseline = get_text(&app, &sub_path).await;
+
+    // 草稿引用 ads 与一个没有定义的名字:不合法,缓存仍是不含 ads 的上一份输出。
+    let resp = app
+        .clone()
+        .oneshot(authed(
+            "PUT",
+            &format!("/api/profiles/{p1}/rules"),
+            &cookie,
+            r#"{"content":"RULE-SET,ads,DIRECT\nRULE-SET,missing,DIRECT\nMATCH,DIRECT"}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(json(resp).await["regenerate"]["status"], "invalid");
+    let rs = create_rs(
+        &app,
+        &cookie,
+        &p1,
+        r#"{"name":"ads","behavior":"domain","format":"yaml","content":"+.ad.example"}"#,
+    )
+    .await;
+
+    // 改 ads 的 format:它只被草稿引用,旧缓存里没有它的托管链接,重生成失败后缓存照旧下发。
+    let rsid = rs["id"].as_str().unwrap();
+    let resp = app
+        .clone()
+        .oneshot(authed(
+            "PUT",
+            &format!("/api/profiles/{p1}/rule-sets/{rsid}"),
+            &cookie,
+            r#"{"name":"ads","behavior":"domain","format":"text","content":"+.ad.example"}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(json(resp).await["regenerate"]["status"], "invalid");
+    let cached: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM generated_cache WHERE profile_id = ? AND capability_hash IS NOT NULL",
+    )
+    .bind(&p1)
+    .fetch_one(&db)
+    .await
+    .unwrap();
+    assert_eq!(cached, 1);
+    assert_eq!(get_text(&app, &sub_path).await, baseline);
+}
+
+#[tokio::test]
 async fn update_of_injected_definition_drops_cache_when_rules_are_invalid() {
     let temp = TempDb::new();
     let (app, db) = cached_app(&temp, Arc::new(BodyFetcher(PROVIDER_YAML))).await;
