@@ -11,7 +11,8 @@ import { api, ApiError, setUnauthorizedHandler } from "./api";
 interface AuthContextValue {
   user: string | null;
   loading: boolean;
-  login: (username: string, password: string) => Promise<void>;
+  /** 登录;返回会话是否已建立(登录接口成功但浏览器没带上会话 Cookie 时为 false)。 */
+  login: (username: string, password: string) => Promise<boolean>;
   logout: () => Promise<void>;
 }
 
@@ -24,13 +25,15 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   // 探活当前会话;启动时的失败(未登录、会话过期、网络错误)按未登录处理。
   // strict 模式(登录成功后的会话确认)只容忍 401:其余失败如实抛回调用方,
   // 不能静默清空用户后当作成功。
-  async function refresh(options?: { strict?: boolean }): Promise<void> {
+  async function refresh(options?: { strict?: boolean }): Promise<boolean> {
     try {
       const session = await api<{ username: string }>("/api/auth/session");
       setUser(session.username);
+      return true;
     } catch (e) {
       setUser(null);
       if (options?.strict && !(e instanceof ApiError && e.status === 401)) throw e;
+      return false;
     } finally {
       setLoading(false);
     }
@@ -43,12 +46,12 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     return () => setUnauthorizedHandler(null);
   }, []);
 
-  async function login(username: string, password: string): Promise<void> {
+  async function login(username: string, password: string): Promise<boolean> {
     await api("/api/auth/login", {
       method: "POST",
       body: JSON.stringify({ username, password }),
     });
-    await refresh({ strict: true });
+    return refresh({ strict: true });
   }
 
   async function logout(): Promise<void> {

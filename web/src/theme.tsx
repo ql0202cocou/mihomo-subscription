@@ -8,6 +8,7 @@ import {
 } from "react";
 import { App as AntdApp, ConfigProvider, theme as antdTheme } from "antd";
 import type { ThemeConfig } from "antd";
+import zhCN from "antd/locale/zh_CN";
 
 // 暗色仅手动切换(不跟随系统);选择持久化到 localStorage,默认亮色。
 export type ThemeMode = "light" | "dark";
@@ -100,6 +101,7 @@ export function ThemeProvider({ children }: { children: ReactNode }) {
   return (
     <ThemeContext.Provider value={value}>
       <ConfigProvider
+        locale={zhCN}
         theme={{
           algorithm: mode === "dark" ? antdTheme.darkAlgorithm : antdTheme.defaultAlgorithm,
           token: mode === "dark" ? DARK_TOKEN : LIGHT_TOKEN,

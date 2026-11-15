@@ -169,6 +169,8 @@ interface AdvancedRow {
   /** yaml 行的当前文本草稿:输入中途解析失败时只保留草稿,不写回 value;
    *  切换类型时以草稿为准。未编辑过为 undefined(展示时由 value 序列化)。 */
   draft?: string;
+  /** yaml 行的草稿当前无法解析(value 仍是上一次能解析的值)。 */
+  invalid?: boolean;
 }
 
 function kindOf(v: unknown): AdvancedKind {
@@ -225,12 +227,14 @@ function yamlText(value: unknown): string {
  *  能解析则同时更新值;解析失败只留草稿待用户修正,非法 YAML 不写回父级 fields。 */
 function convertKind(row: AdvancedRow, kind: AdvancedKind): Partial<AdvancedRow> {
   const current = row.kind === "yaml" && row.draft !== undefined ? row.draft : row.value;
-  if (kind !== "yaml") return { kind, value: convertValue(current, kind), draft: undefined };
+  if (kind !== "yaml") {
+    return { kind, value: convertValue(current, kind), draft: undefined, invalid: false };
+  }
   const text = typeof current === "string" ? current : yamlText(current);
   try {
-    return { kind, value: parseYaml(text), draft: text };
+    return { kind, value: parseYaml(text), draft: text, invalid: false };
   } catch {
-    return { kind, draft: text };
+    return { kind, draft: text, invalid: true };
   }
 }
 
@@ -282,7 +286,7 @@ export function AdvancedFields({
     } catch {
       ok = false;
     }
-    patch(id, { draft: text, ...(ok ? { value: parsed } : {}) });
+    patch(id, { draft: text, invalid: !ok, ...(ok ? { value: parsed } : {}) });
   }
 
   const kindOptions = (["text", "number", "bool", "yaml"] as const).map((k) => ({
@@ -320,6 +324,7 @@ export function AdvancedFields({
                 kind={r.kind}
                 value={r.value}
                 draft={r.draft}
+                invalid={r.invalid}
                 onChange={(value) => patch(r.id, { value })}
                 onDraft={(text) => patchYaml(r.id, text)}
               />
@@ -350,6 +355,7 @@ function AdvancedValue({
   kind,
   value,
   draft,
+  invalid,
   onChange,
   onDraft,
 }: {
@@ -357,6 +363,8 @@ function AdvancedValue({
   value: unknown;
   /** 仅 yaml 行:当前文本草稿(见 AdvancedRow.draft)。 */
   draft?: string;
+  /** 仅 yaml 行:草稿当前无法解析。 */
+  invalid?: boolean;
   onChange: (v: unknown) => void;
   onDraft: (text: string) => void;
 }) {
@@ -373,7 +381,7 @@ function AdvancedValue({
         />
       );
     case "yaml":
-      return <ObjectField value={value} draft={draft} onDraft={onDraft} />;
+      return <ObjectField value={value} draft={draft} invalid={invalid} onDraft={onDraft} />;
     default:
       return (
         <Input
@@ -389,21 +397,28 @@ function AdvancedValue({
 function ObjectField({
   value,
   draft,
+  invalid,
   onDraft,
 }: {
   value: unknown;
   draft: string | undefined;
+  invalid: boolean | undefined;
   onDraft: (text: string) => void;
 }) {
+  const { t } = useTranslation();
   // 无草稿时由当前值序列化;有草稿(含解析失败的中途文本)时原样显示,交给用户修正。
   const text = draft ?? yamlText(value);
   return (
-    <Input.TextArea
-      style={{ width: 220, fontFamily: "monospace" }}
-      autoSize={{ minRows: 2, maxRows: 8 }}
-      value={text}
-      onChange={(e) => onDraft(e.target.value)}
-    />
+    <div style={{ width: 220 }}>
+      <Input.TextArea
+        style={{ fontFamily: "monospace" }}
+        autoSize={{ minRows: 2, maxRows: 8 }}
+        value={text}
+        status={invalid ? "error" : undefined}
+        onChange={(e) => onDraft(e.target.value)}
+      />
+      {invalid && <Typography.Text type="danger">{t("fields.yamlInvalid")}</Typography.Text>}
+    </div>
   );
 }
 

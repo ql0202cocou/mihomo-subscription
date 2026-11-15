@@ -376,6 +376,37 @@ for (const [outcome, expected] of [
   });
 }
 
+test('login explains a session that was not kept instead of bouncing back silently', async () => {
+  const state = hooks();
+  const navigations = [];
+  let established = false;
+  const { default: Login } = load('pages/Login.tsx', {
+    react: state.react,
+    'react-router': {
+      useLocation: () => ({ state: null }),
+      useNavigate: () => (...args) => navigations.push(args),
+    },
+    antd: {
+      Button: 'Button',
+      Input: Object.assign(function Input() {}, { Password: function Password() {} }),
+    },
+    '@ant-design/icons': icons,
+    'react-i18next': translation,
+    '../auth': { useAuth: () => ({ login: async () => established }) },
+    '../api': { ApiError: class extends Error {} },
+  });
+  const submit = () => find(state.render(Login), (e) => e.type === 'form').props.onSubmit({ preventDefault() {} });
+  await submit();
+  const banner = find(state.render(Login), (e) => e.props?.className === 'login-error');
+  assert.equal(find(banner, (e) => e.type === 'span').props.children, 'login.sessionNotKept');
+  assert.equal(navigations.length, 0);
+
+  established = true;
+  await submit();
+  // 模块在 vm 里执行,产出的对象与测试字面量原型不同;比较前先 JSON 归一化。
+  assert.deepEqual(JSON.parse(JSON.stringify(navigations)), [['/', { replace: true }]]);
+});
+
 // ─── auth:会话探活与登录后的严格确认 ─────────────────────────────────────────
 
 test('startup session probe tolerates failure and settles as signed out', async () => {
@@ -415,7 +446,8 @@ for (const status of [500, 401]) {
     });
     const value = () => state.render(auth.AuthProvider, { children: null }).props.value;
     if (status === 401) {
-      await value().login('a', 'b');
+      // 登录接口成功但会话没建立:如实返回 false,由登录页提示,而不是当作成功。
+      assert.equal(await value().login('a', 'b'), false);
       assert.equal(value().user, null);
     } else {
       await assert.rejects(value().login('a', 'b'));

@@ -25,6 +25,8 @@ const zh = {
       tooMany: "尝试次数过多，请稍后再试",
       serviceError: "服务暂时不可用，请稍后重试",
       networkError: "网络连接失败，请检查服务是否可达后重试",
+      sessionNotKept:
+        "登录成功，但浏览器没有保存会话。请确认访问协议（HTTP/HTTPS）与 SECURE_COOKIES 设置一致，且浏览器允许 Cookie。",
     },
     profiles: {
       title: "订阅配置",
@@ -47,7 +49,7 @@ const zh = {
       edit: "编辑规则集",
       empty: "还没有规则集,点击「新建规则集」开始。",
       name: "规则集名称",
-      namePlaceholder: "例如:广告拦截 AdBlock",
+      namePlaceholder: "例如:adblock",
       behavior: "行为 behavior",
       format: "格式 format",
       source: "来源",
@@ -148,6 +150,7 @@ const zh = {
       remove: "删除",
       keyConflict: "字段名重复或与上方已有字段相同,该行不会保存。",
       kind: { text: "文本", number: "数字", bool: "开关", yaml: "YAML" },
+      yamlInvalid: "YAML 无法解析，保存时沿用上一次有效的值。",
       tristate: { inherit: "跟随订阅", on: "开启", off: "关闭" },
     },
     nodeFields: {

@@ -313,7 +313,10 @@ export default function RuleSets() {
                     min={1}
                     precision={0}
                     value={form.intervalHours}
-                    onChange={(v) => setForm({ ...form, intervalHours: v ?? 24 })}
+                    // 清空输入框时不改值:允许退格后重新输入,失焦时回到当前值。
+                    onChange={(v) => {
+                      if (v !== null) setForm({ ...form, intervalHours: v });
+                    }}
                   />
                 </div>
                 <div className="rs-cache">

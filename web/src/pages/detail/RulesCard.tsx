@@ -1204,7 +1204,10 @@ function RuleSetDefBlock({
                   precision={0}
                   style={{ width: "100%" }}
                   value={model.rsInterval}
-                  onChange={(v) => changeDefinition({ rsInterval: v ?? 24 })}
+                  // 清空输入框时不改值:允许退格后重新输入,失焦时回到当前值。
+                  onChange={(v) => {
+                    if (v !== null) changeDefinition({ rsInterval: v });
+                  }}
                 />
               </div>
               <span className="composer-hint">{t("rules.ruleSetRemoteHint")}</span>

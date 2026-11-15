@@ -81,7 +81,10 @@ export default function Settings() {
         className="form-modal"
         title={t("settings.resetPublicPath")}
         open={confirming}
-        onCancel={() => setConfirming(false)}
+        onCancel={() => {
+          setConfirming(false);
+          setConfirmText("");
+        }}
         okButtonProps={{ danger: true, disabled: confirmText !== t("settings.confirmWord") }}
         confirmLoading={resetting}
         onOk={onReset}

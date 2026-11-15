@@ -25,7 +25,11 @@ export default function Login() {
     setError(null);
     setSubmitting(true);
     try {
-      await login(username, password);
+      if (!(await login(username, password))) {
+        // 凭据通过了,但随后的请求没带上会话 Cookie:跳转只会被路由守卫送回这里。
+        setError(t("login.sessionNotKept"));
+        return;
+      }
       navigate(from, { replace: true });
     } catch (err) {
       // ApiError 带 status:401 凭据错误、429 限流,其余状态是服务端问题;

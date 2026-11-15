@@ -316,24 +316,28 @@ function BasicInfo({
   const notice = useRegenerateNotice(onRegenerate);
   const [editOpen, setEditOpen] = useState(false);
   const [form] = Form.useForm();
+  // 换源时后端同步重拉机场,保存可能持续十几秒:期间禁止重复提交并显示进行中。
+  const [saving, guardSave] = useSingleFlight();
 
   async function saveBasic(values: { name: string; source_url?: string; reality_mlkem: boolean }) {
     // 机场订阅 URL 为写敏感字段(响应恒脱敏、不回显):留空表示保持不变,填入则整体替换。
     const body: Record<string, unknown> = { name: values.name, reality_mlkem: values.reality_mlkem };
     const nextUrl = values.source_url?.trim();
     if (nextUrl) body.source_url = nextUrl;
-    try {
-      // 切换 ML-KEM 自动开启会离线重生成,带回 `regenerate`;未通过校验时如实提示。
-      const res = await api<{ regenerate?: Regenerate }>(`/api/profiles/${detail.id}`, {
-        method: "PUT",
-        body: JSON.stringify(body),
-      });
-      notice(res.regenerate);
-      setEditOpen(false);
-      onSaved();
-    } catch (e) {
-      message.error(errorMessage(e, t("common.saveFailed")));
-    }
+    await guardSave(async () => {
+      try {
+        // 切换 ML-KEM 自动开启会离线重生成,带回 `regenerate`;未通过校验时如实提示。
+        const res = await api<{ regenerate?: Regenerate }>(`/api/profiles/${detail.id}`, {
+          method: "PUT",
+          body: JSON.stringify(body),
+        });
+        notice(res.regenerate);
+        setEditOpen(false);
+        onSaved();
+      } catch (e) {
+        message.error(errorMessage(e, t("common.saveFailed")));
+      }
+    });
   }
 
   const rows: [string, string, boolean?][] = [
@@ -386,6 +390,7 @@ function BasicInfo({
         open={editOpen}
         onCancel={() => setEditOpen(false)}
         onOk={() => form.submit()}
+        confirmLoading={saving}
         okText={t("common.save")}
         cancelText={t("common.cancel")}
       >

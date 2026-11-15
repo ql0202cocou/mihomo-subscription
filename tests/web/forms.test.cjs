@@ -130,8 +130,18 @@ test('advanced number rows accept any numeric value without bounds', () => {
 function valueEditor(tree) {
   const av = find(tree, (e) => e.props && 'kind' in e.props && 'onDraft' in e.props);
   let el = av.type(av.props);
-  if (el && el.props && !('kind' in el.props) && 'onDraft' in el.props) el = el.type(el.props);
+  // ObjectField 把文本框包在容器里,解析失败时下方多一行提示。
+  if (el && el.props && !('kind' in el.props) && 'onDraft' in el.props) {
+    el = find(el.type(el.props), (e) => typeof e.props?.onChange === 'function');
+  }
   return el;
+}
+
+// YAML 行在草稿无法解析时显示的提示文案(没有则为 undefined)。
+function yamlHint(tree) {
+  const av = find(tree, (e) => e.props && 'kind' in e.props && 'onDraft' in e.props);
+  const field = av.type(av.props);
+  return find(field.type(field.props), (e) => e.props?.type === 'danger')?.props.children;
 }
 
 // 模块在 vm 里执行,产出的数组/对象与测试字面量原型不同;比较前先 JSON 归一化。
@@ -157,12 +167,17 @@ test('yaml rows keep an unparseable draft locally instead of writing it back', (
   assert.equal(writes.length, 1);
   assert.deepEqual(norm(writes[0]), [['extra', { a: 1 }]]);
   assert.equal(valueEditor(tree).props.value, '{broken');
+  // 文本框标红并说明保存的不是当前文本。
+  assert.equal(valueEditor(tree).props.status, 'error');
+  assert.equal(yamlHint(tree), 'fields.yamlInvalid');
 
   // 继续输入直到解析成功,值才写回父级。
   valueEditor(tree).props.onChange({ target: { value: 'a: 2' } });
   tree = state.render(fields.AdvancedFields, props());
   assert.deepEqual(norm(writes[writes.length - 1]), [['extra', { a: 2 }]]);
   assert.equal(valueEditor(tree).props.value, 'a: 2');
+  assert.equal(valueEditor(tree).props.status, undefined);
+  assert.equal(yamlHint(tree), undefined);
 });
 
 test('kind switching converts from the current draft, not a stale parsed value', () => {
@@ -191,6 +206,7 @@ test('kind switching converts from the current draft, not a stale parsed value',
   tree = state.render(fields.AdvancedFields, props());
   assert.deepEqual(norm(writes[writes.length - 1]), [['extra', '{broken']]);
   assert.equal(valueEditor(tree).props.value, '{broken');
+  assert.equal(yamlHint(tree), 'fields.yamlInvalid');
 });
 
 // 真实 GroupsCard,网络、拖拽与保存队列由调用方控制。
