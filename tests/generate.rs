@@ -642,6 +642,22 @@ async fn group_order_reorders_preview_and_survives_regeneration() {
         "preview honors saved order pre-regenerate"
     );
 
+    // 详情与分组列表按同一份已保存顺序返回,而不是创建顺序。
+    for path in [
+        format!("/api/profiles/{id}"),
+        format!("/api/profiles/{id}/groups"),
+    ] {
+        let resp = app
+            .clone()
+            .oneshot(authed("GET", &path, &cookie, ""))
+            .await
+            .unwrap();
+        let body = json(resp).await;
+        let groups = body.get("groups").unwrap_or(&body).as_array().unwrap();
+        let names: Vec<&str> = groups.iter().map(|g| g["name"].as_str().unwrap()).collect();
+        assert_eq!(names, vec!["G2", "G1"], "{path}");
+    }
+
     // Regenerate: the generated `proxy-groups` output carries the same order.
     app.clone()
         .oneshot(authed(

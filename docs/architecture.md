@@ -131,6 +131,9 @@ POST /api/global-nodes { name, node_type, content, enabled? }  # name 全局唯�
 POST /api/profiles/:id/groups { name, group_type, members, options?, enabled? }
 ```
 
+详情的 `groups` 与 `GET /api/profiles/:id/groups` 按已保存的 `group_order` 排列（与输出
+`proxy-groups` 的顺序一致），未列入顺序的分组按创建时间排在末尾。
+
 - 节点 `content` 保存时结构校验，生成时并入**每条配置**输出的 `proxies`，其中 `name` 以库内 `name` 为准
   （覆盖 content 中缺失或不一致的值）；`PUT` 同体整体替换。节点与分组的 `name` 不得占用 Mihomo 内置
   保留名（见「生成与校验」），否则 `400`。

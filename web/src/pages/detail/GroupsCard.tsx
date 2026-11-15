@@ -32,7 +32,7 @@ interface Props {
   profileId: string;
   groups: CustomGroup[];
   nodes: CustomNode[];
-  /** 生成缓存的刷新信号:变化时重新拉取生成预览(成员候选、分组顺序)。 */
+  /** 生成缓存的刷新信号:变化时重新拉取生成预览(成员候选)。 */
   generatedAt: string | null;
   /** 任一分组变更持久化成功后回调(保存/删除/导入),父组件据此重新加载。 */
   onSaved: () => void;
@@ -46,27 +46,6 @@ type Options = Record<string, unknown>;
 interface GroupRow {
   name: string;
   group: CustomGroup;
-}
-
-/** 有序的可编辑行:跟随生成输出的顺序,丢弃失效的名字,追加新增的。 */
-function buildRows(orderNames: string[], groups: CustomGroup[]): GroupRow[] {
-  const byName = new Map(groups.map((g) => [g.name, g]));
-  const seen = new Set<string>();
-  const result: GroupRow[] = [];
-  for (const name of orderNames) {
-    const g = byName.get(name);
-    if (g && !seen.has(name)) {
-      result.push({ name, group: g });
-      seen.add(name);
-    }
-  }
-  for (const g of groups) {
-    if (!seen.has(g.name)) {
-      result.push({ name: g.name, group: g });
-      seen.add(g.name);
-    }
-  }
-  return result;
 }
 
 /** 对仍存在的行保持当前屏幕顺序;追加新增、丢弃已删,避免乐观拖拽被 reload 冲掉。 */
@@ -110,7 +89,6 @@ export default function GroupsCard({
   const [options, setOptions] = useState<Options>({});
 
   const [proxyNames, setProxyNames] = useState<string[]>([]);
-  const [orderNames, setOrderNames] = useState<string[]>([]);
   const [rows, setRows] = useState<GroupRow[]>([]);
   const [importing, guardImport] = useSingleFlight();
   const [saving, guardSave] = useSingleFlight();
@@ -121,7 +99,6 @@ export default function GroupsCard({
     try {
       const res = await api<ProxiesResponse>(`/api/profiles/${profileId}/proxies`);
       setProxyNames(res.proxies.map((p) => p.name));
-      setOrderNames(res.groups.map((g) => g.name));
     } catch {
       // 成员仍可手动输入
     }
@@ -131,7 +108,8 @@ export default function GroupsCard({
     void loadGeneratedPreview();
   }, [loadGeneratedPreview, generatedAt]);
 
-  const derived = useMemo(() => buildRows(orderNames, groups), [orderNames, groups]);
+  // 详情返回的分组已按服务端保存的顺序排列(与输出 proxy-groups 一致)。
+  const derived = useMemo(() => groups.map((g) => ({ name: g.name, group: g })), [groups]);
   // 排序保存失败后置位:下一次 reload 以服务端顺序整体重建,而非保留屏幕上的失败顺序。
   const resync = useRef(false);
   useEffect(() => {
@@ -164,8 +142,8 @@ export default function GroupsCard({
     } else {
       resync.current = true; // 回滚到服务端实际持有的顺序(与 NodesCard 一致)
       message.error(errorMessage(res.error, t("groups.orderSaveFailed")));
+      onSaved();
     }
-    void loadGeneratedPreview();
   }
 
   async function importProviderGroups() {

@@ -292,16 +292,7 @@ async fn detail(state: &AppState, row: ProfileRow) -> ApiResult<ProfileDetail> {
     .map(node_response)
     .collect();
 
-    let groups = sqlx::query_as::<_, GroupRow>(
-        "SELECT id, name, group_type, members, options, enabled, created_at, updated_at
-         FROM custom_groups WHERE profile_id = ? ORDER BY created_at ASC",
-    )
-    .bind(&profile_id)
-    .fetch_all(&state.db)
-    .await?
-    .into_iter()
-    .map(group_response)
-    .collect();
+    let groups = ordered_groups(state, &profile_id).await?;
 
     // 指纹风险名单随缓存保存;与 `list_proxies_and_groups` 同一判定:只有来源版本与公开能力
     // 都和当前一致的缓存才有效,上下文不明/过期的缓存不展示其名单。
@@ -822,21 +813,27 @@ fn validate_group(body: &GroupBody) -> ApiResult<()> {
     Ok(())
 }
 
+/// 读取 profile 的自定义分组,按已保存的 `group_order` 排列(与输出 `proxy-groups` 的顺序一致);
+/// 未列入顺序的(新增、停用)按创建时间排在末尾。
+async fn ordered_groups(state: &AppState, profile_id: &str) -> ApiResult<Vec<GroupResponse>> {
+    let mut rows = sqlx::query_as::<_, GroupRow>(
+        "SELECT id, name, group_type, members, options, enabled, created_at, updated_at
+         FROM custom_groups WHERE profile_id = ? ORDER BY created_at ASC",
+    )
+    .bind(profile_id)
+    .fetch_all(&state.db)
+    .await?;
+    let order = load_order(state, profile_id, OrderKind::Group).await?;
+    crate::converter::reorder_by_name(&mut rows, |row| Some(row.name.as_str()), &order);
+    Ok(rows.into_iter().map(group_response).collect())
+}
+
 pub async fn list_groups(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> ApiResult<impl IntoResponse> {
     let _ = load_profile_row(&state, &id).await?;
-    let groups: Vec<GroupResponse> = sqlx::query_as::<_, GroupRow>(
-        "SELECT id, name, group_type, members, options, enabled, created_at, updated_at
-         FROM custom_groups WHERE profile_id = ? ORDER BY created_at ASC",
-    )
-    .bind(&id)
-    .fetch_all(&state.db)
-    .await?
-    .into_iter()
-    .map(group_response)
-    .collect();
+    let groups = ordered_groups(&state, &id).await?;
     Ok(Json(groups))
 }
 

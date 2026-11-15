@@ -193,20 +193,9 @@ test('kind switching converts from the current draft, not a stale parsed value',
   assert.equal(valueEditor(tree).props.value, '{broken');
 });
 
-test('group form keeps `__proto__` advanced options through save and confirms once', async () => {
-  const state = hooks();
-  const posts = [];
-  const sensors = [];
-  let gate;
-  const api = async (url, options = {}) => {
-    if (url.endsWith('/proxies')) return { proxies: [], groups: [] };
-    if ((options.method ?? 'GET') === 'POST') {
-      posts.push(JSON.parse(options.body));
-      return new Promise((res) => { gate = () => res({}); });
-    }
-    return [];
-  };
-  const { default: GroupsCard } = load('pages/detail/GroupsCard.tsx', {
+// 真实 GroupsCard,网络、拖拽与保存队列由调用方控制。
+function groupsCardModule(state, api, sensors, serialSave) {
+  return load('pages/detail/GroupsCard.tsx', {
     react: state.react,
     antd: {
       App: { useApp: () => ({ message: { success() {}, error() {}, info() {} } }) },
@@ -229,13 +218,29 @@ test('group form keeps `__proto__` advanced options through save and confirms on
     },
     '../../components/regenerate': { useRegenerateNotice: () => () => {} },
     '../../components/useSerialSave': {
-      useSerialSave: () => async (run) => {
+      useSerialSave: () => serialSave ?? (async (run) => {
         try { return { ok: true, value: await run(), latest: true }; }
         catch (error) { return { ok: false, error, latest: true }; }
-      },
+      }),
     },
     './groupSchema': load('pages/detail/groupSchema.ts'),
-  });
+  }).default;
+}
+
+test('group form keeps `__proto__` advanced options through save and confirms once', async () => {
+  const state = hooks();
+  const posts = [];
+  const sensors = [];
+  let gate;
+  const api = async (url, options = {}) => {
+    if (url.endsWith('/proxies')) return { proxies: [], groups: [] };
+    if ((options.method ?? 'GET') === 'POST') {
+      posts.push(JSON.parse(options.body));
+      return new Promise((res) => { gate = () => res({}); });
+    }
+    return [];
+  };
+  const GroupsCard = groupsCardModule(state, api, sensors);
   const props = {
     profileId: 'p', groups: [], nodes: [], generatedAt: null,
     onSaved: () => {}, onRegenerate: () => {},
@@ -269,4 +274,58 @@ test('group form keeps `__proto__` advanced options through save and confirms on
   assert.equal(Object.prototype.hasOwnProperty.call(posts[0].options, '__proto__'), true);
   assert.deepEqual(posts[0].options['__proto__'], { a: 1 });
   assert.equal({}.a, undefined);
+});
+
+test('group rows follow the saved order from the detail and resync after a failed reorder', async () => {
+  const state = hooks();
+  const puts = [];
+  let failNext = false;
+  const api = async (url, options = {}) => {
+    // 生成预览里的分组顺序可能落后于已保存的顺序,行顺序不取自这里。
+    if (url.endsWith('/proxies')) return { proxies: [], groups: [{ name: 'A' }, { name: 'B' }, { name: 'C' }] };
+    if (options.method === 'PUT') {
+      puts.push(JSON.parse(options.body).order);
+      if (failNext) throw new Error('boom');
+      return { regenerate: { status: 'applied' } };
+    }
+    return [];
+  };
+  const GroupsCard = groupsCardModule(state, api, []);
+  const group = (name) => ({ id: name, name, group_type: 'select', members: [], options: null, enabled: true });
+  let reloads = 0;
+  // 详情按已保存顺序返回分组:C 被拖到了最前。
+  let props = {
+    profileId: 'p', groups: [group('C'), group('A'), group('B')], nodes: [], generatedAt: null,
+    onSaved: () => { reloads += 1; }, onRegenerate: () => {},
+  };
+  const render = () => {
+    const tree = state.render(GroupsCard, props);
+    state.effects();
+    return state.render(GroupsCard, props);
+  };
+  const order = (tree) => find(tree, (e) => Array.isArray(e.props?.items)).props.items;
+  const drag = (tree, from, to) =>
+    find(tree, (e) => typeof e.props?.onDragEnd === 'function')
+      .props.onDragEnd({ active: { id: from }, over: { id: to } });
+
+  let tree = render();
+  assert.deepEqual(order(tree), ['C', 'A', 'B']);
+  await tick();
+  tree = render();
+  assert.deepEqual(order(tree), ['C', 'A', 'B'], '预览加载完成后仍是已保存的顺序');
+
+  // 再拖一次:提交的顺序以已保存顺序为基线。
+  await drag(tree, 'B', 'A');
+  assert.deepEqual(puts, [['C', 'B', 'A']]);
+  tree = render();
+  assert.deepEqual(order(tree), ['C', 'B', 'A']);
+  assert.equal(reloads, 0);
+
+  // 保存失败:重新加载详情,并以服务端顺序整体重建。
+  failNext = true;
+  await drag(tree, 'A', 'C');
+  assert.equal(reloads, 1);
+  props = { ...props, groups: [group('C'), group('B'), group('A')] };
+  tree = render();
+  assert.deepEqual(order(tree), ['C', 'B', 'A']);
 });
