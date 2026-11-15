@@ -34,6 +34,7 @@
 | 413 | 请求体超限（`payload_too_large`） |
 | 429 | 限流 |
 | 500 | 内部错误（不含敏感信息） |
+| 502 | 机场拉取失败或内容无法解析（`upstream_error`，消息带 `last_fetch_status` 同款标签） |
 
 ### 认证
 
@@ -121,7 +122,8 @@ GET  /api/auth/session -> 200 {username} | 401
   `regenerate`（见「节点/分组预览与排序」）；换源时随重拉一并生效。
 - 详情的 `reality_fingerprint_risks`：当前缓存输出里 ML-KEM 已开启但 `client-fingerprint` 不是
   `chrome` 的 REALITY 节点名（无缓存或无风险为空数组），详情页据此常驻告警。
-- `last_fetch_status`：`success` / `http_error:<code>` / `ssrf_rejected` / `timeout` / `too_large` /
+- `last_fetch_status`：`success` / `http_error:<code>` / `ssrf_rejected` / `dns_error` / `timeout` /
+  `too_large` / `too_many_redirects` / `bad_content_type` / `network_error` /
   `provider_parse`（拉取成功但内容不是可解析的 Mihomo YAML）/ `provider_too_complex`（内容超出
   YAML 解析资源上限，见「安全设计 → 不受信任内容」），从未拉取为 `null`。
 
@@ -488,7 +490,7 @@ CREATE INDEX idx_rule_sets_position ON rule_sets (position);
 - **remote**：`url` 为上游；`cache=1` 时面板按 `interval_hours` 懒拉取（每拉取检查新鲜度，过期才回源，
   SSRF 安全）、把原始字节存入 `cached_body`（BLOB，故二进制 `mrs` 不损坏）并以稳定链接二次托管，失败
   回退旧缓存；`cache=0` 则不托管，转换时直接注入上游 `url`。`last_fetch_status` 同 profile 拉取标签。
-  更新规则集会清空缓存列（下次拉取重新回源）。
+  以上镜像行为自 ② 降为模板后只在导入到 ③ 之后发生；更新 ② 不触碰遗留的缓存列。
 - `position`：仅「规则托管」页的展示顺序（`ORDER BY position, name`）；新建与排序同全局节点池：
   `BEGIN IMMEDIATE` 事务 + 按不可变 id 回写。
 
@@ -740,8 +742,9 @@ HTTP trace 只记录脱敏 path，公开订阅/规则集路径中的 `PUBLIC_PAT
 - **缓存上下文绑定**：每份缓存记录构建时的 `source_revision` 与 `capability_hash`（token + 公共
   前缀摘要，见「数据模型」）。公开端点只复用两者都与当前库值匹配的缓存——包括节流内的复用与
   失败兜底。仅能力不符（token/前缀轮换后来源未变）时，在 per-profile 锁内离线懒迁移：用缓存的
-  机场原文重跑完整转换换绑托管链接（当前规则文本校验失败回退 `rules_snapshot` 再试）；来源不符
-  或上下文为 NULL（`0017` 前旧缓存、已被标脏）时先使缓存失效，再在线回源重建。无法迁移的缓存
+  机场原文重跑完整转换换绑托管链接（当前规则文本校验失败回退 `rules_snapshot` 再试），能力摘要
+  为 NULL 而来源版本仍匹配的缓存（已被标脏）同样走这条离线迁移；来源不符或来源版本为 NULL
+  （`0017` 前旧缓存）时先使缓存失效，再在线回源重建。无法迁移的缓存
   删除，公开链接按无缓存处理直到下次回源成功。管理端 `preview` 只读、与所有写缓存路径共用同一
   per-profile 锁，且只直接返回兼容且新鲜的缓存。
 - **single-flight**：同配置并发刷新在 per-profile 锁后合并为一次上游获取（后到者等待或拿陈旧
