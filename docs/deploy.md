@@ -66,9 +66,10 @@ compose 的 `environment:` 与代码必须一致。
   `PUBLIC_BASE_URL` 必须与浏览器访问的外部地址一致。反代也应**保留原始 Host**
   （nginx/OpenResty：`proxy_set_header Host $host;`）。若浏览器 origin 与配置不一致，每个
   登录/POST/PUT/DELETE 返回 `403`。1Panel 的网站反代默认即保留 Host。
-- 默认不信任 `X-Forwarded-For`，以避免容器端口被直连时伪造客户端 IP 绕过登录/下载限流。若确认
-  后端端口只能被反代访问，且需要按真实客户端 IP 限流，同时设置 `TRUSTED_PROXY_HOPS=1` 与
-  `TRUSTED_PROXY_CIDRS` 为反代容器/网关所在网段。
+- 默认不信任 `X-Forwarded-For`，以避免容器端口被直连时伪造客户端 IP 绕过登录/下载限流。此时经
+  反代进来的请求在应用看来都来自反代地址，全部访问者共用同一份登录预算（10 次/分）和下载预算
+  （120 次/分）。若确认后端端口只能被反代访问，建议同时设置 `TRUSTED_PROXY_HOPS=1` 与
+  `TRUSTED_PROXY_CIDRS` 为反代容器/网关所在网段，改为按真实客户端 IP 限流。
 - 凭据经 `ADMIN_USERNAME`/`ADMIN_PASSWORD` 仅保护管理 UI/API；公共订阅链接仍靠随机路径前缀 +
   per-profile token。
 - 应用统一返回 `Content-Security-Policy: frame-ancestors 'none'` 与 `X-Frame-Options: DENY`，

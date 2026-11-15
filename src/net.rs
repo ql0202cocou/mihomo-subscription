@@ -5,7 +5,7 @@
 //! `trusted_hops` 个代理时,客户端是从末尾起第 `trusted_hops` 个条目,其右侧条目必须是可信代理。
 //! 头缺失、过短、代理链不符、或 TCP 对端不在可信代理网段时回退到 TCP 对端。
 
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv6Addr};
 
 use ipnet::IpNet;
 
@@ -42,7 +42,7 @@ pub fn client_ip(
     peer
 }
 
-/// 同 [`client_ip`],但返回稳定的字符串 key(无法确定 IP 时为 `"unknown"`),适合做限流 key 与日志。
+/// 同 [`client_ip`],但返回限流用的稳定字符串 key(无法确定 IP 时为 `"unknown"`)。
 pub fn client_ip_string(
     xff: Option<&str>,
     peer: Option<IpAddr>,
@@ -50,8 +50,23 @@ pub fn client_ip_string(
     trusted_proxy_cidrs: &[IpNet],
 ) -> String {
     client_ip(xff, peer, trusted_hops, trusted_proxy_cidrs)
-        .map(|ip| ip.to_string())
+        .map(rate_limit_key)
         .unwrap_or_else(|| "unknown".to_string())
+}
+
+/// 限流 key:IPv4 取完整地址;IPv6 取 /64 前缀——一个 IPv6 终端通常独占整个 /64,按完整地址计
+/// 会让它每换一个地址就拿到一份新预算。IPv4 映射地址按内嵌的 IPv4 计。
+fn rate_limit_key(ip: IpAddr) -> String {
+    match ip {
+        IpAddr::V4(v4) => v4.to_string(),
+        IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+            Some(v4) => v4.to_string(),
+            None => {
+                let prefix = Ipv6Addr::from(u128::from(v6) & !u128::from(u64::MAX));
+                format!("{prefix}/64")
+            }
+        },
+    }
 }
 
 fn peer_is_trusted(peer: Option<IpAddr>, trusted_proxy_cidrs: &[IpNet]) -> bool {
@@ -209,5 +224,16 @@ mod tests {
             client_ip_string(None, None, 1, &[net("10.0.0.0/8")]),
             "unknown"
         );
+    }
+
+    #[test]
+    fn string_form_groups_ipv6_clients_by_64_prefix() {
+        let key = |peer: &str| client_ip_string(None, Some(ip(peer)), 0, &[]);
+        assert_eq!(key("203.0.113.9"), "203.0.113.9");
+        assert_eq!(key("2001:db8:1:2::1"), "2001:db8:1:2::/64");
+        assert_eq!(key("2001:db8:1:2:ffff:ffff:ffff:ffff"), "2001:db8:1:2::/64");
+        assert_ne!(key("2001:db8:1:3::1"), key("2001:db8:1:2::1"));
+        // IPv4 映射地址与对应的 IPv4 共用一个 key。
+        assert_eq!(key("::ffff:203.0.113.9"), "203.0.113.9");
     }
 }
