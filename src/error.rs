@@ -22,7 +22,13 @@ where
         Json::<T>::from_request(req, state)
             .await
             .map(|Json(value)| Self(value))
-            .map_err(|_| ApiError::BadRequest("Invalid JSON request body".into()))
+            .map_err(|rejection| {
+                if rejection.status() == StatusCode::PAYLOAD_TOO_LARGE {
+                    ApiError::PayloadTooLarge
+                } else {
+                    ApiError::BadRequest("Invalid JSON request body".into())
+                }
+            })
     }
 }
 
@@ -35,6 +41,8 @@ pub enum ApiError {
     NotFound,
     /// 与现有资源冲突(如重名)。
     Conflict(String),
+    /// 请求体超过管理 API 的大小上限。
+    PayloadTooLarge,
     /// 上游机场拉取/解析失败;携带一个安全的状态标签。
     Upstream(String),
     /// 未预期的服务端错误;细节只记日志,客户端只见固定文案。
@@ -60,6 +68,12 @@ impl ApiError {
                 None,
             ),
             ApiError::Conflict(msg) => (StatusCode::CONFLICT, "conflict", msg.clone(), None),
+            ApiError::PayloadTooLarge => (
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "payload_too_large",
+                "Request body is too large".to_string(),
+                None,
+            ),
             ApiError::Upstream(label) => (
                 StatusCode::BAD_GATEWAY,
                 "upstream_error",

@@ -269,3 +269,23 @@ async fn malformed_login_json_uses_the_api_error_envelope() {
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     assert_eq!(common::json(resp).await["error"]["code"], "bad_request");
 }
+
+#[tokio::test]
+async fn oversized_request_body_is_413_in_the_api_error_envelope() {
+    let temp = TempDb::new();
+    let app = build_router(test_state(&temp).await);
+
+    let padding = "x".repeat(1024 * 1024);
+    let resp = app
+        .oneshot(same_origin_post(
+            "/api/auth/login",
+            login_body("admin", &padding),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    assert_eq!(
+        common::json(resp).await["error"]["code"],
+        "payload_too_large"
+    );
+}
