@@ -650,7 +650,8 @@ https://<PUBLIC_BASE_URL>/<PUBLIC_PATH_PREFIX>/api/sub/<profile_token>
 - 凭据来自 `ADMIN_USERNAME` / `ADMIN_PASSWORD`（compose 环境变量），未设置拒绝启动；
   恒定时间比较；登录按来源 IP 限流（成功/失败请求均计数）。
 - 会话 Cookie：≥128 位 CSPRNG ID、`HttpOnly` + `SameSite=Lax`、HTTPS 加 `Secure`；存内存
-  （重启失效）、空闲超时默认 7 天。`Secure` 由 `https://` 的 `PUBLIC_BASE_URL` 推断；TLS 终止
+  （重启失效）、空闲超时默认 7 天；每次已认证请求都随响应重发 Cookie，浏览器端有效期与服务端
+  空闲窗口一同顺延。`Secure` 由 `https://` 的 `PUBLIC_BASE_URL` 推断；TLS 终止
   代理后（应用走 HTTP）需显式 `SECURE_COOKIES=true`，否则告警。
 - **不启用 CORS 层**（SPA 同源；宽松 CORS 会破坏 cookie 同源保护）；状态变更请求必须带同源
   `Origin`，生产环境按 `PUBLIC_BASE_URL` 的完整 origin（scheme + host + port）校验（缺失或不匹配

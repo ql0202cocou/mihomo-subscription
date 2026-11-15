@@ -164,14 +164,24 @@ pub async fn session(State(state): State<Arc<AppState>>) -> Response {
 
 // ─── 中间件 ────────────────────────────────────────────────────────────────────
 
-/// 要求有效的会话 cookie;否则 `401`。
+/// 要求有效的会话 cookie;否则 `401`。通过时随响应重发 cookie,使浏览器端的有效期与服务端的
+/// 空闲窗口一同顺延;处理器自己设置了 cookie(登出清除)时不覆盖。
 pub async fn require_session(
     State(state): State<Arc<AppState>>,
     req: Request,
     next: Next,
 ) -> Response {
     match session_cookie(&req) {
-        Some(id) if state.sessions.validate_and_touch(&id) => next.run(req).await,
+        Some(id) if state.sessions.validate_and_touch(&id) => {
+            let mut response = next.run(req).await;
+            if !response.headers().contains_key(header::SET_COOKIE) {
+                let cookie = build_cookie(&id, state.secure_cookies, SESSION_IDLE.as_secs());
+                if let Ok(value) = header::HeaderValue::from_str(&cookie) {
+                    response.headers_mut().insert(header::SET_COOKIE, value);
+                }
+            }
+            response
+        }
         _ => StatusCode::UNAUTHORIZED.into_response(),
     }
 }

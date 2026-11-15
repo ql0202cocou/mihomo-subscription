@@ -111,6 +111,10 @@ async fn login_then_access_session_then_logout() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
+    // 已认证的请求重发同一会话 cookie,浏览器端的有效期随使用顺延。
+    let refreshed = resp.headers()[header::SET_COOKIE].to_str().unwrap();
+    assert!(refreshed.starts_with(&format!("{cookie}; ")));
+    assert!(refreshed.contains("Max-Age=604800"));
     let body = axum::body::to_bytes(resp.into_body(), 64 * 1024)
         .await
         .unwrap();
@@ -130,6 +134,11 @@ async fn login_then_access_session_then_logout() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    // 登出只下发清除 cookie,不被续期覆盖。
+    let cleared: Vec<_> = resp.headers().get_all(header::SET_COOKIE).iter().collect();
+    assert_eq!(cleared.len(), 1);
+    assert!(cleared[0].to_str().unwrap().starts_with("session=; "));
+    assert!(cleared[0].to_str().unwrap().contains("Max-Age=0"));
 
     let resp = app
         .oneshot(
