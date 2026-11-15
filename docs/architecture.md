@@ -708,7 +708,8 @@ https://<PUBLIC_BASE_URL>/<PUBLIC_PATH_PREFIX>/api/sub/<profile_token>
 ### 敏感数据（机场 URL 含秘密）
 
 不写完整 URL 进日志 / 公共输出 / 错误；管理 API 默认脱敏；Web UI 仅持脱敏值。脱敏规则
-（确定性，处处一致）：留 scheme/host/path，每个查询值 → `***`（`?token=abcdef` → `?token=***`）。
+（确定性，处处一致）：留 scheme/host/path，每个查询值 → `***`（`?token=abcdef` → `?token=***`）；
+没有 `=` 的查询段无法区分是参数名还是凭据本身，整段 → `***`（`?abcdef` → `?***`）。
 HTTP trace 只记录脱敏 path，公开订阅/规则集路径中的 `PUBLIC_PATH_PREFIX` 与 profile token 均替换为
 占位值。
 

@@ -22,12 +22,13 @@ pub fn mask_url(raw: &str) -> String {
     out.push_str(url.path());
 
     if let Some(query) = url.query() {
-        // 逐对重建 query:保留参数名便于排查问题,只隐藏值。
+        // 逐对重建 query:保留参数名便于排查问题,只隐藏值。没有 `=` 的一段无法区分是参数名
+        // 还是凭据本身(如 `?<token>`),整段隐藏。
         let masked = query
             .split('&')
-            .map(|pair| {
-                let key = pair.split('=').next().unwrap_or("");
-                format!("{key}=***")
+            .map(|pair| match pair.split_once('=') {
+                Some((key, _)) => format!("{key}=***"),
+                None => "***".to_string(),
             })
             .collect::<Vec<_>>()
             .join("&");
@@ -53,5 +54,17 @@ mod tests {
             "https://example.com:8443/x?a=***&b=***"
         );
         assert_eq!(mask_url("not a url"), "***");
+    }
+
+    #[test]
+    fn masks_query_segments_without_a_key() {
+        assert_eq!(
+            mask_url("https://example.com/sub?abcdef123456"),
+            "https://example.com/sub?***"
+        );
+        assert_eq!(
+            mask_url("https://example.com/sub?abcdef&flag=1&k="),
+            "https://example.com/sub?***&flag=***&k=***"
+        );
     }
 }
