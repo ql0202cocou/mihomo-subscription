@@ -280,6 +280,12 @@ PUT /api/profiles/:id/group-order         { order: [分组名] }              # 
 
 - 机场 YAML 的 merge key（`<<`）在解析阶段即按预算归一化展开（显式键优先，多源序列取先出现者），
   转换器只处理展开后的值（限界见「安全设计 → 不受信任内容」）。
+- 输出由面板自己的发射器写出（`src/yaml/emit.rs`，直接驱动 libyaml）。除通常需要引号的字符串
+  （空串、`true`/`null`、数字样文本、含特殊字符等）外，Mihomo 的 YAML 库还会把三类无引号标量读成
+  数字或时间：数字里带下划线（`1_000`）、大写进制前缀（`0X1F`）、日期时间（`2026-12-31`）。
+  这类字符串一律加单引号——`proxies`/`proxy-groups` 的值在 Mihomo 侧按任意类型解码，节点名、分组名
+  或密码被读成别的类型会导致整份配置拒绝加载或值被改写。其余输出与 serde_norway 的序列化逐字节
+  一致。
 - `import-provider-groups`：实时拉取机场，把 `proxy-groups` 解析为可编辑自定义分组写入
   （`name`/`type`/`proxies`→成员，其余→`options`；跳过同名/不支持类型/占用 Mihomo 内置保留名者），
   返回 `{imported,skipped}`；只改 `custom_groups`，需重新生成才进输出；鉴权 + SSRF 同 `provider-rules`。

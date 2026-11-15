@@ -1,5 +1,6 @@
 //! 在构建 Value 的过程中限制不受信任 YAML,包括别名展开、映射键与 tag 的内部值。
 
+mod emit;
 mod preflight;
 
 use std::fmt;
@@ -311,38 +312,10 @@ pub fn check_value(value: &Value) -> Result<(), YamlError> {
     .map_err(|_| YamlError::TooComplex)
 }
 
-/// 序列化时限制输出字节数,避免转义/格式化把小 Value 放大成巨大字符串。
+/// 序列化为下发给客户端的 YAML 文本,限制输出字节数,避免转义/格式化把小 Value 放大成巨大
+/// 字符串。会被 Mihomo 读成数字或时间的字符串一律加引号(见 [`emit`])。
 pub fn serialize_limited(value: &Value) -> Result<String, YamlError> {
-    use std::io::{self, Write};
-    struct LimitedWriter {
-        bytes: Vec<u8>,
-        exceeded: bool,
-    }
-    impl Write for LimitedWriter {
-        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-            if buf.len() > MAX_GENERATED_BYTES - self.bytes.len() {
-                self.exceeded = true;
-                return Err(io::Error::other("YAML output byte limit exceeded"));
-            }
-            self.bytes.extend_from_slice(buf);
-            Ok(buf.len())
-        }
-        fn flush(&mut self) -> io::Result<()> {
-            Ok(())
-        }
-    }
-    let mut writer = LimitedWriter {
-        bytes: Vec::new(),
-        exceeded: false,
-    };
-    serde_yaml::to_writer(&mut writer, value).map_err(|_| {
-        if writer.exceeded {
-            YamlError::TooComplex
-        } else {
-            YamlError::Parse
-        }
-    })?;
-    String::from_utf8(writer.bytes).map_err(|_| YamlError::Parse)
+    emit::emit(value, MAX_GENERATED_BYTES)
 }
 
 #[cfg(test)]

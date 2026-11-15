@@ -1328,6 +1328,32 @@ rules:
     }
 
     #[test]
+    fn strings_mihomo_would_read_as_numbers_or_dates_stay_quoted() {
+        // 机场用带引号的日期/数字样字符串作节点名与密码,自定义分组也起了日期样的名字:输出必须
+        // 保留引号,否则 Mihomo 把它们读成时间或整数,拒绝加载整份配置。
+        let mut inp = input(
+            "MATCH,2026-12-31",
+            vec![],
+            vec![group("2026-12-31", &["hk-1", "1_000"])],
+        );
+        inp.provider_yaml = "proxies:\n  \
+             - { name: hk-1, type: ss, server: 1.2.3.4, port: 8388, password: '1_000' }\n  \
+             - { name: '1_000', type: ss, server: 1.2.3.5, port: 8388, password: '0X1F' }\n";
+        let yaml = convert(inp).expect("conversion succeeds").yaml;
+        for expected in [
+            "password: '1_000'\n",
+            "- name: '1_000'\n",
+            "password: '0X1F'\n",
+            "- name: '2026-12-31'\n",
+            "  - '1_000'\n",
+            "- MATCH,2026-12-31\n",
+            "server: 1.2.3.4\n",
+        ] {
+            assert!(yaml.contains(expected), "missing {expected:?} in:\n{yaml}");
+        }
+    }
+
+    #[test]
     fn invalid_provider_yaml_is_provider_parse_error() {
         let bad = ConvertInput {
             provider_yaml: "this: is: not: valid",
