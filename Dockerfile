@@ -5,6 +5,7 @@ WORKDIR /web
 
 # Cache npm install on the lockfile.
 COPY web/package.json web/package-lock.json ./
+COPY vendor/picomatch /vendor/picomatch
 RUN npm ci
 
 COPY web/ ./
@@ -19,7 +20,7 @@ RUN apt-get update && apt-get install -y pkg-config libssl-dev && rm -rf /var/li
 
 # Cache dependencies with a stub binary.
 COPY Cargo.toml Cargo.lock ./
-COPY vendor ./vendor
+COPY vendor/sqlx-sqlite ./vendor/sqlx-sqlite
 RUN mkdir src && echo "fn main() {}" > src/main.rs
 RUN cargo build --locked --release && rm -rf src
 

@@ -1,0 +1,12 @@
+{
+  "name": "picomatch",
+  "version": "4.0.7+local.1",
+  "private": true,
+  "license": "MIT",
+  "author": "Jon Schlinkert",
+  "main": "index.js",
+  "sideEffects": false,
+  "engines": {
+    "node": ">=12"
+  }
+}
