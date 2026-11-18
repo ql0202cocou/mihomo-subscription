@@ -16,7 +16,8 @@ use serde_json::Value;
 use tower::util::ServiceExt;
 
 use common::{
-    authed, cached_app, json, login, sub_path, test_state_with_fetcher, text, BodyFetcher, TempDb,
+    authed, cached_app, json, login, rule_api, sub_path, test_state_with_fetcher, text,
+    BodyFetcher, TempDb,
 };
 
 const PROVIDER_YAML: &str =
@@ -436,6 +437,370 @@ async fn get_text(app: &Router, path: &str) -> String {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     text(resp).await
+}
+
+#[tokio::test]
+async fn global_edits_reach_followers_at_their_existing_rule_links() {
+    let temp = TempDb::new();
+    let (app, _) = cached_app(&temp, Arc::new(BodyFetcher(PROVIDER_YAML))).await;
+    let cookie = login(&app).await;
+    let (p1, _, sub1) = create_profile(&app, &cookie, "P1").await;
+    let (p2, _, sub2) = create_profile(&app, &cookie, "P2").await;
+    let initial = r#"{"name":"ads","behavior":"domain","format":"text","content":"old.example"}"#;
+    let global = rule_api(&app, &cookie, "POST", "/api/rule-sets", initial).await;
+    let global_path = format!("/api/rule-sets/{}", global["id"].as_str().unwrap());
+    let import = r#"{"names":["ads"],"policy":"REJECT"}"#;
+    for id in [&p1, &p2] {
+        let result = rule_api(
+            &app,
+            &cookie,
+            "POST",
+            &format!("/api/profiles/{id}/rule-sets/import"),
+            import,
+        )
+        .await;
+        assert_eq!(result["imported"], 1);
+    }
+    let before = get_text(&app, &sub1).await;
+    let updated = r#"{"name":"ads","behavior":"domain","format":"text","content":"new.example\nsecond.example"}"#;
+    rule_api(&app, &cookie, "PUT", &global_path, updated).await;
+    for sub in [&sub1, &sub2] {
+        assert_eq!(
+            get_text(&app, &format!("{sub}/r/ads/domain.text")).await,
+            "new.example\nsecond.example\n"
+        );
+    }
+    assert_eq!(get_text(&app, &sub1).await, before);
+    let local_path = format!("/api/profiles/{p2}/rule-sets");
+    let rows = rule_api(&app, &cookie, "GET", &local_path, "").await;
+    assert_eq!(rows[0]["count"], 2);
+    assert_eq!(rows[0]["global_rule_set_id"], global["id"]);
+    let local = rule_api(
+        &app,
+        &cookie,
+        "PUT",
+        &format!("{local_path}/{}", rows[0]["id"].as_str().unwrap()),
+        initial,
+    )
+    .await;
+    assert!(local["global_rule_set_id"].is_null());
+
+    // 全局改名后继续按 ID 同步，订阅里的引用名和策略各自保留。
+    let renamed =
+        r#"{"name":"renamed","behavior":"domain","format":"yaml","content":"final.example"}"#;
+    rule_api(&app, &cookie, "PUT", &global_path, renamed).await;
+    let config = get_text(&app, &sub1).await;
+    assert!(config.contains(&format!("{sub1}/r/ads/domain.yaml")));
+    assert!(config.contains("RULE-SET,ads,REJECT"));
+    assert!(get_text(&app, &format!("{sub1}/r/ads/domain.yaml"))
+        .await
+        .contains("final.example"));
+    assert_eq!(
+        get_text(&app, &format!("{sub2}/r/ads/domain.text")).await,
+        "old.example\n"
+    );
+
+    let deleted = app
+        .clone()
+        .oneshot(authed("DELETE", &global_path, &cookie, ""))
+        .await
+        .unwrap();
+    assert_eq!(deleted.status(), StatusCode::NO_CONTENT);
+    rule_api(&app, &cookie, "POST", "/api/rule-sets", initial).await;
+    let rows = rule_api(
+        &app,
+        &cookie,
+        "GET",
+        &format!("/api/profiles/{p1}/rule-sets"),
+        "",
+    )
+    .await;
+    assert!(rows[0]["global_rule_set_id"].is_null());
+    assert_eq!(rows[0]["content"], "final.example");
+}
+
+#[tokio::test]
+async fn reimport_after_global_rename_uses_local_alias_even_with_a_name_collision() {
+    let temp = TempDb::new();
+    let (app, _) = cached_app(&temp, Arc::new(BodyFetcher(PROVIDER_YAML))).await;
+    let cookie = login(&app).await;
+    let (profile, _, sub) = create_profile(&app, &cookie, "Alias").await;
+    let base = format!("/api/profiles/{profile}/rule-sets");
+    let import = format!("{base}/import");
+    let definition =
+        r#"{"name":"A","behavior":"domain","format":"text","content":"follow.example"}"#;
+    let global = rule_api(&app, &cookie, "POST", "/api/rule-sets", definition).await;
+    rule_api(
+        &app,
+        &cookie,
+        "POST",
+        &import,
+        r#"{"names":["A"],"policy":"REJECT"}"#,
+    )
+    .await;
+    let rows = rule_api(&app, &cookie, "GET", &base, "").await;
+    rule_api(
+        &app,
+        &cookie,
+        "PUT",
+        &format!("/api/rule-sets/{}", global["id"].as_str().unwrap()),
+        &definition.replace(r#""A""#, r#""B""#),
+    )
+    .await;
+    let legacy_import = r#"{"names":["B"],"policy":"DIRECT"}"#;
+    let result = rule_api(&app, &cookie, "POST", &import, legacy_import).await;
+    assert_eq!(result["imported"], 0);
+    let after_rename = rule_api(&app, &cookie, "GET", &base, "").await;
+    assert_eq!(after_rename.as_array().unwrap().len(), 1);
+    assert_eq!(after_rename[0]["id"], rows[0]["id"]);
+    create_rs(
+        &app,
+        &cookie,
+        &profile,
+        r#"{"name":"B","behavior":"domain","format":"text","content":"own.example"}"#,
+    )
+    .await;
+
+    let nested = "AND,((RULE-SET,A),(DOMAIN,one.example)),REJECT\nMATCH,DIRECT";
+    put_rules(&app, &cookie, &profile, nested).await;
+    let result = rule_api(&app, &cookie, "POST", &import, legacy_import).await;
+    assert_eq!(result["imported"], 0);
+    assert_eq!(result["rules_content"], nested);
+    put_rules(&app, &cookie, &profile, "MATCH,DIRECT").await;
+    let request = serde_json::json!({"names":["B"],"policy":"REJECT",
+        "expected":{"B":{"global_id":global["id"],"local_id":rows[0]["id"]}}});
+    let restored = rule_api(&app, &cookie, "POST", &import, &request.to_string()).await;
+    assert_eq!(restored["rules_content"], "RULE-SET,A,REJECT\nMATCH,DIRECT");
+    let rows_after = rule_api(&app, &cookie, "GET", &base, "").await;
+    assert_eq!(rows_after.as_array().unwrap().len(), 2);
+    assert!(rows_after[1]["global_rule_set_id"].is_null());
+    assert_eq!(
+        get_text(&app, &format!("{sub}/r/A/domain.text")).await,
+        "follow.example\n"
+    );
+}
+
+#[tokio::test]
+async fn stale_import_selection_conflicts_and_rolls_back_the_whole_batch() {
+    let temp = TempDb::new();
+    let (app, _) = cached_app(&temp, Arc::new(BodyFetcher(PROVIDER_YAML))).await;
+    let cookie = login(&app).await;
+    let (profile, _, _) = create_profile(&app, &cookie, "Snapshot").await;
+    let base = format!("/api/profiles/{profile}/rule-sets");
+    let import = format!("{base}/import");
+    let definition = |name: &str| {
+        serde_json::json!({"name":name,"format":"text","behavior":"domain","content":"global.example"}).to_string()
+    };
+    let a = rule_api(&app, &cookie, "POST", "/api/rule-sets", &definition("A")).await;
+    let b = rule_api(&app, &cookie, "POST", "/api/rule-sets", &definition("B")).await;
+    let request = serde_json::json!({"names":["B","A"], "policy":"DIRECT", "expected":{
+        "A":{"global_id":a["id"],"local_id":null}, "B":{"global_id":b["id"],"local_id":null}
+    }});
+    let local = create_rs(
+        &app,
+        &cookie,
+        &profile,
+        &definition("A").replace("global.example", "local.example"),
+    )
+    .await;
+    let post = |body: serde_json::Value| {
+        app.clone()
+            .oneshot(authed("POST", &import, &cookie, &body.to_string()))
+    };
+    assert_eq!(
+        post(request.clone()).await.unwrap().status(),
+        StatusCode::CONFLICT
+    );
+    let rows = rule_api(&app, &cookie, "GET", &base, "").await;
+    assert_eq!(rows.as_array().unwrap().len(), 1);
+    assert_eq!(rows[0], local);
+    let detail = rule_api(
+        &app,
+        &cookie,
+        "GET",
+        &format!("/api/profiles/{profile}"),
+        "",
+    )
+    .await;
+    assert!(!detail["rules"]["content"]
+        .as_str()
+        .unwrap()
+        .contains("RULE-SET"));
+
+    // 即使本地 ID 相同，「原先已关联」也不能悄悄降级成引用独立定义。
+    let mut expected_link = request.clone();
+    expected_link["expected"]["A"]["local_id"] = local["id"].clone();
+    assert_eq!(
+        post(expected_link.clone()).await.unwrap().status(),
+        StatusCode::CONFLICT
+    );
+    expected_link["link_existing"] = serde_json::json!({"A":local["id"]});
+    assert_eq!(post(expected_link).await.unwrap().status(), StatusCode::OK);
+
+    // 全局项在窗口打开后被同名重建，按名字和本地 ID 仍无法识别这种替换。
+    let deleted = app
+        .clone()
+        .oneshot(authed(
+            "DELETE",
+            &format!("/api/rule-sets/{}", a["id"].as_str().unwrap()),
+            &cookie,
+            "",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(deleted.status(), StatusCode::NO_CONTENT);
+    rule_api(&app, &cookie, "POST", "/api/rule-sets", &definition("A")).await;
+    let stale_global = serde_json::json!({"names":["A"],"policy":"DIRECT","expected":{"A":{"global_id":a["id"],"local_id":local["id"]}}});
+    assert_eq!(
+        post(stale_global).await.unwrap().status(),
+        StatusCode::CONFLICT
+    );
+    let partial = serde_json::json!({"names":["A","B"],"policy":"DIRECT","expected":{"B":{"global_id":b["id"]}}});
+    assert_eq!(
+        post(partial).await.unwrap().status(),
+        StatusCode::BAD_REQUEST
+    );
+}
+
+#[tokio::test]
+async fn recreating_a_global_set_restores_followers_and_respects_local_edits() {
+    let temp = TempDb::new();
+    let (app, _) = cached_app(&temp, Arc::new(BodyFetcher(PROVIDER_YAML))).await;
+    let cookie = login(&app).await;
+    let (id, _, sub) = create_profile(&app, &cookie, "Following").await;
+    let (custom_id, _, custom_sub) = create_profile(&app, &cookie, "Customized").await;
+    let original = r#"{"name":"A","behavior":"domain","format":"text","content":"old.example"}"#;
+    let updated = r#"{"name":"A","behavior":"domain","format":"yaml","content":"new.example"}"#;
+    let import = r#"{"names":["A"],"policy":"REJECT"}"#;
+    let global = rule_api(&app, &cookie, "POST", "/api/rule-sets", original).await;
+    let base = format!("/api/profiles/{id}/rule-sets");
+    let custom_base = format!("/api/profiles/{custom_id}/rule-sets");
+    // 历史规则草稿已有引用，只需补齐定义，已有策略优先于导入策略。
+    let draft = "RULE-SET,A,DIRECT\nMATCH,REJECT";
+    put_rules(&app, &cookie, &id, draft).await;
+    for list in [&base, &custom_base] {
+        let result = rule_api(&app, &cookie, "POST", &format!("{list}/import"), import).await;
+        assert_eq!(result["imported"], 1);
+    }
+    let local_id = rule_api(&app, &cookie, "GET", &base, "").await[0]["id"].clone();
+    let deleted = app
+        .clone()
+        .oneshot(authed(
+            "DELETE",
+            &format!("/api/rule-sets/{}", global["id"].as_str().unwrap()),
+            &cookie,
+            "",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(deleted.status(), StatusCode::NO_CONTENT);
+    assert_eq!(
+        get_text(&app, &format!("{sub}/r/A/domain.text")).await,
+        "old.example\n"
+    );
+    let custom = rule_api(&app, &cookie, "GET", &custom_base, "").await;
+    rule_api(
+        &app,
+        &cookie,
+        "PUT",
+        &format!("{custom_base}/{}", custom[0]["id"].as_str().unwrap()),
+        &original.replace("old.example", "mine.example"),
+    )
+    .await;
+
+    let recreated = rule_api(&app, &cookie, "POST", "/api/rule-sets", updated).await;
+    assert_ne!(recreated["id"], global["id"]);
+    let followed = rule_api(&app, &cookie, "GET", &base, "").await;
+    assert_eq!(followed[0]["id"], local_id);
+    assert_eq!(followed[0]["global_rule_set_id"], recreated["id"]);
+    let config = get_text(&app, &sub).await;
+    assert!(config.contains(&format!("{sub}/r/A/domain.yaml")));
+    assert!(get_text(&app, &format!("{sub}/r/A/domain.yaml"))
+        .await
+        .contains("new.example"));
+    let result = rule_api(&app, &cookie, "POST", &format!("{base}/import"), import).await;
+    assert_eq!(result["imported"], 0);
+    assert_eq!(result["rules_content"], draft);
+
+    // 只删规则行时订阅仍跟随，再导入仅补回一条引用。
+    put_rules(&app, &cookie, &id, "MATCH,DIRECT").await;
+    let result = rule_api(&app, &cookie, "POST", &format!("{base}/import"), import).await;
+    assert_eq!(result["rules_content"], "RULE-SET,A,REJECT\nMATCH,DIRECT");
+    rule_api(
+        &app,
+        &cookie,
+        "PUT",
+        &format!("/api/rule-sets/{}", recreated["id"].as_str().unwrap()),
+        &updated.replace("new.example", "next.example"),
+    )
+    .await;
+    assert!(get_text(&app, &format!("{sub}/r/A/domain.yaml"))
+        .await
+        .contains("next.example"));
+    assert_eq!(
+        get_text(&app, &format!("{custom_sub}/r/A/domain.text")).await,
+        "mine.example\n"
+    );
+}
+
+#[tokio::test]
+async fn existing_independent_definition_can_follow_without_changing_its_rule() {
+    let temp = TempDb::new();
+    let (app, _) = cached_app(&temp, Arc::new(BodyFetcher(PROVIDER_YAML))).await;
+    let cookie = login(&app).await;
+    let (p1, _, sub) = create_profile(&app, &cookie, "P1").await;
+    let base = format!("/api/profiles/{p1}/rule-sets");
+    let import_path = format!("{base}/import");
+    let local = create_rs(
+        &app,
+        &cookie,
+        &p1,
+        r#"{"name":"ads","behavior":"domain","format":"yaml","content":"my.example"}"#,
+    )
+    .await;
+    let rules = "DOMAIN,first.example,DIRECT\nRULE-SET,ads,REJECT\nMATCH,DIRECT";
+    put_rules(&app, &cookie, &p1, rules).await;
+    let remote = r#"{"name":"ads","behavior":"domain","format":"text","source":"remote","url":"https://rules.example/first","cache":false}"#;
+    let global = rule_api(&app, &cookie, "POST", "/api/rule-sets", remote).await;
+    let global_path = format!("/api/rule-sets/{}", global["id"].as_str().unwrap());
+    let plain = r#"{"names":["ads"],"policy":"DIRECT"}"#;
+    assert_eq!(
+        rule_api(&app, &cookie, "POST", &import_path, plain).await["imported"],
+        0
+    );
+    assert!(get_text(&app, &format!("{sub}/r/ads/domain.yaml"))
+        .await
+        .contains("my.example"));
+
+    let request =
+        serde_json::json!({"names":["ads"],"policy":"DIRECT","link_existing":{"ads":local["id"]}})
+            .to_string();
+    let result = rule_api(&app, &cookie, "POST", &import_path, &request).await;
+    assert_eq!(result["imported"], 1);
+    assert_eq!(result["rules_content"], rules);
+    assert_eq!(result["regenerate"]["status"], "applied");
+    assert!(get_text(&app, &sub)
+        .await
+        .contains("https://rules.example/first"));
+    assert_eq!(
+        rule_api(&app, &cookie, "POST", &import_path, &request).await["imported"],
+        0
+    );
+
+    rule_api(
+        &app,
+        &cookie,
+        "PUT",
+        &global_path,
+        &remote.replace("/first", "/second"),
+    )
+    .await;
+    let config = get_text(&app, &sub).await;
+    assert!(config.contains("https://rules.example/second"));
+    assert!(!config.contains("https://rules.example/first"));
+    let rows = rule_api(&app, &cookie, "GET", &base, "").await;
+    assert_eq!(rows[0]["id"], local["id"]);
+    assert_eq!(rows[0]["global_rule_set_id"], global["id"]);
 }
 
 #[tokio::test]

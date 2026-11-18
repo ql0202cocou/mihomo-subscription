@@ -67,12 +67,12 @@ GET  /api/auth/session -> 200 {username} | 401
 | GET / POST | `/api/global-nodes` | 是 | 全局自定义节点池（跨订阅共享，自动追加到每条配置） |
 | PUT / DELETE | `/api/global-nodes/:id` | 是 | 单个全局节点 |
 | PUT | `/api/global-nodes/order` | 是 | 全局自定义块顺序；立即重排所有配置缓存 |
-| GET / POST | `/api/rule-sets` | 是 | 全局用户规则库（② 模板 / 导入源；不托管、不参与生成） |
+| GET / POST | `/api/rule-sets` | 是 | 全局用户规则库（②，向已关联订阅同步定义） |
 | PUT / DELETE | `/api/rule-sets/:id` | 是 | 单个全局规则集 |
 | PUT | `/api/rule-sets/order` | 是 | 全局库显示顺序（仅展示序） |
 | GET / POST | `/api/profiles/:id/rule-sets` | 是 | 订阅自有规则库（③）；生成只读此处 |
 | PUT / DELETE | `/api/profiles/:id/rule-sets/:rsid` | 是 | 单个订阅规则集 |
-| POST | `/api/profiles/:id/rule-sets/import` | 是 | 从全局 ② 复制规则集进本订阅 ③ + 追加 `RULE-SET` 规则行 |
+| POST | `/api/profiles/:id/rule-sets/import` | 是 | 从全局 ② 导入规则集并记录来源，补齐本订阅的 `RULE-SET` 规则行 |
 | GET / POST | `/api/profiles/:id/groups` | 是 | 自定义分组 |
 | PUT / DELETE | `/api/profiles/:id/groups/:group_id` | 是 | 单个分组 |
 | POST | `/api/profiles/:id/import-provider-groups` | 是 | 导入机场 `proxy-groups` 为可编辑自定义分组（实时，跳过同名/不支持类型） |
@@ -147,9 +147,9 @@ POST /api/profiles/:id/groups { name, group_type, members, options?, enabled? }
 
 规则下发与订阅**解耦**为三个库：① 机场原始规则（`GET .../provider-rules`，「导入机场规则」）、
 ② 全局用户规则库（`/api/rule-sets`）、③ 每订阅托管规则库（`/api/profiles/:id/rule-sets`）。**下发只读
-③**；①② 仅作导入源。
+③**。从 ② 导入的定义通过全局规则集 ID 跟随更新。
 
-#### ② 全局用户规则库（模板 / 导入源）
+#### ② 全局用户规则库
 
 ```text
 GET    /api/rule-sets                                  # 列表；每项含 count、source、remote_url_masked、cache（无托管链接）
@@ -162,22 +162,46 @@ DELETE /api/rule-sets/:id
 PUT    /api/rule-sets/order { order: [规则集名] }        # 仅展示序，未列出落末尾
 ```
 
-② 不再公开托管、不再参与生成，仅是可复用模板。通过 ③ 的导入端点复制进某订阅后才生效。
+保存全局规则集时，手动内容、行为、格式、来源、远程 URL、镜像间隔和缓存方式一起同步到关联订阅。
+各订阅保留自己的引用名、启停状态和策略，因此全局改名后原有规则行和托管路径仍有效。
+删除全局规则集后，原先跟随它的订阅继续下发最后同步的内容，并记住该来源删除时的全局名称。
+重新创建同名规则集时，服务在创建事务中将这些订阅关联到新 ID 并同步新定义。
+如果在删除期间直接编辑了订阅内的定义，该定义转为独立维护。仅删除订阅中的规则行会移除引用，重新导入时会补回规则行。
+同步按 profile id 顺序取锁，在同一写事务中更新全局定义和关联定义、清除旧镜像并标记受影响的生成缓存，
+提交后按订阅离线重生成。只改手动内容时，原托管链接下次被请求即返回新内容，客户端按其规则集刷新间隔更新。
 
 #### ③ 每订阅托管规则库（下发来源）
 
 ```text
-GET    /api/profiles/:id/rule-sets                     # 列表；每项含 url（按订阅 token 隔离的托管链接）、count、source、remote_url_masked、cache、last_fetch_status
+GET    /api/profiles/:id/rule-sets                     # 列表；每项含 global_rule_set_id（当前关联）、pending_global_name（等待同名来源重建）、url（按订阅 token 隔离的托管链接）、count、source、remote_url_masked、cache、last_fetch_status
 POST   /api/profiles/:id/rule-sets   { name, behavior, source?, format, ... }   # name 在本订阅内唯一（重名 409）；字段同 ②。新建/更新响应为最新定义，改动影响所服务输出时另带 regenerate 字段
 PUT    /api/profiles/:id/rule-sets/:rsid   { ...同上 }
 DELETE /api/profiles/:id/rule-sets/:rsid
-POST   /api/profiles/:id/rule-sets/import  { names: [②规则集名], policy }   # names 最多 1000 个（逐个 trim、去空、按规则集名同一约束校验、保序去重，超限或含非法名 400）。在 per-profile 锁内以单个 BEGIN IMMEDIATE 事务复制 ② 定义进 ③（含真实远程 URL）+ 为导入后本订阅存在已启用定义且尚未引用的名插入 RULE-SET,<name>,<policy> 行（插到最后一条非注释 MATCH 兜底行之前，无 MATCH 则追加末尾；② 中不存在、未能复制的名字，以及本订阅已有同名但停用的定义不追加；policy 须为单个非空名字，不含逗号/换行，否则 400 且不写入）；规则文本以读取时的旧内容为条件写回（CAS），并发规则编辑导致冲突时整体回滚、返回 409（重试即可）；返回 { imported, regenerate, rules_content }（imported 为实际复制进 ③ 的定义数，已存在同名的不计；复制了定义或新增了规则行都会触发离线重生成，都没有时 regenerate 为 null；rules_content 为导入提交后的完整规则文本，无改动时保留原文，供前端同步编辑状态）
+POST   /api/profiles/:id/rule-sets/import  { names, policy, link_existing?, expected? }
+    # names 是最多 1000 个全局规则集名，逐个 trim、去空、校验、保序去重。
+    # policy 是单个非空策略名，不含逗号/控制字符，参数非法返回 400。
+    # link_existing 是可选的 {规则集名: 订阅内定义 ID}，显式替换已有独立定义并关联。
+    # expected 以全局规则集名为键，各项包含 global_id 和 local_id。弹窗中没有本地定义时 local_id 为 null。
+    # 返回 { imported, regenerate, rules_content }。imported 计新导入和新关联的数量。
 ```
 
+- 导入在 per-profile 锁内使用单个 `BEGIN IMMEDIATE` 事务复制定义、记录来源 ID，并在最后一条
+  非注释 MATCH 之前追加缺少的引用（无 MATCH 时追加到末尾）。已有的规则行保留策略和顺序。
+  仅为订阅中实际存在且启用的定义添加引用。规则文本以旧内容
+  做 CAS 写回，冲突时整体回滚并返回 409。响应的 `rules_content` 为提交后的完整文本。
+- 导入优先按全局 ID 找到订阅内已关联的定义，用订阅内名称检查并补齐引用。全局 A 改名为 B 后，
+  即使订阅中另有独立的 B，重新导入也沿用 A。只有引用行、缺少定义时可补回定义，沿用原有规则行。
+- 导入窗口每次打开时读取全局库和订阅库，提交时用 `expected` 覆盖所有选中名称。服务端在写事务内核对
+  全局 ID、本地定义的有无与 ID、启停和关联状态。选择已过期时整批回滚并返回 409，重新打开即可看到最新定义。
+  批量检查引用时，每个订阅的规则草稿和缓存引用按需各读取、解析一次。
+- 旧客户端可省略 `expected`。没有已关联的定义时，默认沿用同名本地定义，仅在显式传入 `link_existing`
+  时替换并关联。待关联定义的 ID 或启停状态变化、已关联其他来源、指定的全局定义不可用时返回 409。
+  旧客户端重复关联同一来源可重试，普通导入遇到缺失或无法复制的全局条目时跳过。订阅内直接 PUT 定义
+  后转为独立维护；仅改规则行的策略或排序会继续跟随。新增定义、规则引用以及影响输出的替换触发
+  离线重生成，其他修改的 `regenerate` 为 null。
 - manual / remote 行为与 ② 一致（校验/渲染/镜像同一套逻辑）。托管在按订阅 token 隔离的链接
   `/<prefix>/api/sub/<token>/r/<name>/<behavior>.<format>`；remote 关缓存则转换时直接注入上游 URL。
-- 被本订阅 `RULE-SET,<name>` 规则引用时注入指向该托管链接的 `rule-providers:` 条目（公共链接每拉取即
-  重生，故定义改动即时生效）；未被引用不注入。
+- 被本订阅 `RULE-SET,<name>` 规则引用时注入指向该托管链接的 `rule-providers:` 条目；未被引用不注入。
 - 注入时若名与机场 `rule-providers` 已有条目**撞名**，用本订阅托管版**覆盖**机场版；生成端点
   （`POST .../generate`）在响应 `ruleset_conflicts` 列出撞名的名字，详情页据此告警，避免静默替换。
 - 引用保护：规则集被本订阅当前规则文本或生成缓存的规则快照（`rules_snapshot`；`0014` 前无快照的
@@ -460,11 +484,9 @@ CREATE INDEX idx_global_nodes_position ON global_nodes (position);
 
 #### rule_sets
 
-**全局用户规则库 / 导入源（② 用户规则库），`0008_rule_sets.sql`。** 管理员在「规则托管」页维护命名
-规则集模板（手动 payload 或远程来源）。**自「订阅自包含规则库」起 ② 仅作导入源：不再公开托管、不再
-参与生成**（对比早期版本曾托管在 `/<prefix>/r/<name>/...` 并按引用注入）。订阅通过「导入托管规则」
-把所选 ② 条目复制进自己的 `profile_rule_sets`（③）；生成只读 ③。表结构不变；`url`（remote 上游）、
-`cached_*` 列保留但 ② 不再镜像（导入到 ③ 后由 ③ 镜像）。
+**全局用户规则库（②），`0008_rule_sets.sql`。** 管理员在「规则托管」页维护手动或远程来源的规则集。
+导入时按全局 ID 建立关联并将定义写入订阅自己的 `profile_rule_sets`（③）。后续保存同步关联定义，
+生成和公开托管均只读 ③。远程镜像按订阅存储在 ③。
 
 ```sql
 CREATE TABLE rule_sets (
@@ -496,7 +518,7 @@ CREATE INDEX idx_rule_sets_position ON rule_sets (position);
 - **remote**：`url` 为上游；`cache=1` 时面板按 `interval_hours` 懒拉取（每拉取检查新鲜度，过期才回源，
   SSRF 安全）、把原始字节存入 `cached_body`（BLOB，故二进制 `mrs` 不损坏）并以稳定链接二次托管，失败
   回退旧缓存；`cache=0` 则不托管，转换时直接注入上游 `url`。`last_fetch_status` 同 profile 拉取标签。
-  以上镜像行为自 ② 降为模板后只在导入到 ③ 之后发生；更新 ② 不触碰遗留的缓存列。
+  镜像请求和缓存写入都在 ③ 进行。
 - `position`：仅「规则托管」页的展示顺序（`ORDER BY position, name`）；新建与排序同全局节点池：
   `BEGIN IMMEDIATE` 事务 + 按不可变 id 回写。
 
@@ -508,11 +530,15 @@ CREATE INDEX idx_rule_sets_position ON rule_sets (position);
 `/<prefix>/api/sub/<token>/r/<name>/<behavior>.<format>`，故不同订阅可复用同名而不冲突。
 
 迁移 `0013` 增加 `last_fetch_at`（成功/失败镜像完成时间）与 `revision`（定义更新版本，默认 0），
-用来合并失败重试并阻止换源前的在途请求回写。
+用来合并失败重试并阻止换源前的在途请求回写。迁移 `0019` 增加可空的 `global_rule_set_id` 外键
+和来源索引。迁移 `0020` 增加 `pending_global_name` 和删除触发器。只对实际关联的行记录来源删除时的名字，
+恢复关联或写入订阅定义时清空。历史数据缺少导入来源或删除记录时，可在「导入托管规则」中按项关联。
 
 ```sql
 CREATE TABLE profile_rule_sets (
     id                TEXT    PRIMARY KEY,
+    global_rule_set_id TEXT REFERENCES rule_sets(id) ON DELETE SET NULL,
+    pending_global_name TEXT CHECK (pending_global_name IS NULL OR global_rule_set_id IS NULL),
     profile_id        TEXT    NOT NULL REFERENCES profiles (id) ON DELETE CASCADE,
     name              TEXT    NOT NULL,
     behavior          TEXT    NOT NULL CHECK (behavior IN ('domain', 'ipcidr', 'classical')),
@@ -533,13 +559,17 @@ CREATE TABLE profile_rule_sets (
 );
 
 CREATE INDEX idx_profile_rule_sets_profile ON profile_rule_sets (profile_id);
+CREATE INDEX idx_profile_rule_sets_global ON profile_rule_sets (global_rule_set_id, profile_id)
+    WHERE global_rule_set_id IS NOT NULL;
+CREATE INDEX idx_profile_rule_sets_pending_global ON profile_rule_sets (pending_global_name, profile_id)
+    WHERE pending_global_name IS NOT NULL;
 ```
 
 - `name` 在**单个订阅内**唯一（`UNIQUE(profile_id, name)`），是 URL 路径段与 `RULE-SET` 引用名，限定
   `[A-Za-z0-9._-]`。
 - **manual / remote** 行为与 `rule_sets` 完全一致（校验/渲染/镜像逻辑由 `src/rulelib.rs` 共用）；唯一
   区别是托管链接含订阅 token、且这是生成时**唯一**的规则集来源。
-- 「导入托管规则」从 ② 复制条目进本表（含真实远程 URL，由后端复制，前端只见脱敏 URL）。
+- 「导入托管规则」从 ② 复制条目进本表并记录来源 ID（含真实远程 URL，由后端复制，前端只见脱敏 URL）。
 
 #### custom_groups
 

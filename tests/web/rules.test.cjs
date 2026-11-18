@@ -3,6 +3,7 @@ const { test } = require('node:test');
 const {
   load, hooks, find, findAll, deferred, tick, translation, icons, passthrough, arrayMove,
 } = require('./helpers.cjs');
+const { ApiError } = load('api.ts');
 
 // 装配与 detail_state.test.cjs 同风格,但 useSerialSave / ruleRefs / groupSchema /
 // ruleSetConstants 不做替身,由 load 加载真实模块;只替身 antd、图标与 dnd-kit。
@@ -93,7 +94,7 @@ function session(initial, options = {}) {
     },
     '@dnd-kit/utilities': { CSS: { Transform: { toString: () => undefined } } },
     'react-i18next': translation,
-    '../../api': { api, errorMessage: () => 'failed' },
+    '../../api': { api, ApiError, errorMessage: () => 'failed' },
     '../../components/regenerate': { useRegenerateNotice: () => () => {} },
     '../../components/fields': { TypeChips: 'TypeChips' },
   });
@@ -154,9 +155,9 @@ function session(initial, options = {}) {
 }
 
 // 打开「导入托管规则」弹窗并勾选指定规则集,返回确认按钮触发的导入 Promise。
-function startHostedImport(s, name) {
+async function startHostedImport(s, name) {
   let tree = s.render();
-  find(tree, (e) => e.type === 'Button' && e.props.children === 'rules.importHosted').props.onClick();
+  await find(tree, (e) => e.type === 'Button' && e.props.children === 'rules.importHosted').props.onClick();
   tree = s.render();
   const checkbox = find(tree, (e) => e.type === 'Checkbox' && e.props['aria-label'] === name);
   assert.ok(checkbox, `checkbox not found: ${name}`);
@@ -396,13 +397,14 @@ test('ruleSetRefs matches the converter for plain, nested, comment and malformed
   }
 });
 
-test('rule sets already referenced inside nested logic rules cannot be picked for import', async () => {
+test('linked rule sets already referenced inside nested logic rules cannot be picked twice', async () => {
   const s = session('AND,((RULE-SET,nested),(DOMAIN,a.example)),DIRECT\nMATCH,DIRECT', {
     ruleSets: [globalRuleSet({ name: 'nested' }), globalRuleSet({ id: 'g2', name: 'free' })],
+    profileRuleSets: [profileRuleSet({ name: 'nested', global_rule_set_id: 'g1' })],
   });
   await s.mount();
   let tree = s.render();
-  find(tree, (e) => e.type === 'Button' && e.props.children === 'rules.importHosted').props.onClick();
+  await find(tree, (e) => e.type === 'Button' && e.props.children === 'rules.importHosted').props.onClick();
   tree = s.render();
   const nested = find(tree, (e) => e.type === 'Checkbox' && e.props['aria-label'] === 'nested');
   const free = find(tree, (e) => e.type === 'Checkbox' && e.props['aria-label'] === 'free');
@@ -417,6 +419,106 @@ test('rule sets already referenced inside nested logic rules cannot be picked fo
   await tick();
   assert.deepEqual(s.calls.info, ['rules.importHostedNone']);
   assert.equal(s.requests.some((r) => r.url.endsWith('/import')), false);
+});
+
+test('a renamed global set uses its linked alias before an independent name match', async () => {
+  const ruleSets = [globalRuleSet({ id: 'source', name: 'B' })];
+  const profileRuleSets = [
+    profileRuleSet({ id: 'alias', name: 'A', global_rule_set_id: 'source' }),
+    profileRuleSet({ id: 'independent', name: 'B', global_rule_set_id: null }),
+  ];
+  const rules = 'AND,((RULE-SET,A),(DOMAIN,a.example)),REJECT\nMATCH,DIRECT';
+  const s = session(rules, { ruleSets, profileRuleSets, handlers: {
+    'POST /api/profiles/p/rule-sets/import': () =>
+      ({ imported: 0, regenerate: null, rules_content: 'RULE-SET,A,DIRECT\nMATCH,DIRECT' }),
+  } });
+  await s.mount();
+  await find(s.render(), (e) => e.type === 'Button' && e.props.children === 'rules.importHosted').props.onClick();
+  const option = () => find(s.render(), (e) => e.type === 'Checkbox' && e.props['aria-label'] === 'B');
+  assert.equal(option().props.disabled, true);
+  assert.equal(option().props.checked, true);
+  s.setInitial('MATCH,DIRECT');
+  assert.equal(option().props.disabled, false);
+  option().props.onChange({ target: { checked: true } });
+  await importModal(s.render()).props.onOk();
+  const request = s.requests.find((r) => r.url.endsWith('/import'));
+  assert.deepEqual(request.body, {
+    names: ['B'], policy: 'DIRECT', expected: { B: { global_id: 'source', local_id: 'alias' } },
+  });
+  assert.deepEqual(rowLines(s.render()), ['RULE-SET,A,DIRECT']);
+});
+
+test('a referenced local copy can be explicitly linked without changing its policy', async () => {
+  const rules = 'RULE-SET,ads,REJECT\nMATCH,DIRECT';
+  const s = session(rules, {
+    ruleSets: [globalRuleSet()],
+    profileRuleSets: [profileRuleSet({ global_rule_set_id: null })],
+    handlers: {
+      'POST /api/profiles/p/rule-sets/import': () =>
+        ({ imported: 1, regenerate: null, rules_content: rules }),
+    },
+  });
+  await s.mount();
+  await find(s.render(), (e) => e.type === 'Button' && e.props.children === 'rules.importHosted').props.onClick();
+  const option = find(s.render(), (e) => e.type === 'Checkbox' && e.props['aria-label'] === 'ads');
+  assert.equal(option.props.disabled, false);
+  assert.equal(option.props.checked, false);
+  option.props.onChange({ target: { checked: true } });
+  await importModal(s.render()).props.onOk();
+  const request = s.requests.find((r) => r.url.endsWith('/import'));
+  assert.deepEqual(request.body, { names: ['ads'], policy: 'DIRECT', expected: { ads: { global_id: 'g1', local_id: 'rs1' } }, link_existing: { ads: 'rs1' } });
+  assert.deepEqual(rowLines(s.render()), ['RULE-SET,ads,REJECT']);
+  assert.deepEqual(rulePuts(s.requests), []);
+});
+
+test('a conflicting hosted import preserves the rules and asks to reopen the dialog', async () => {
+  const s = session('DOMAIN,a.example,DIRECT\nMATCH,DIRECT', {
+    ruleSets: [globalRuleSet()],
+    handlers: {
+      'POST /api/profiles/p/rule-sets/import': () => { throw new ApiError(409); },
+    },
+  });
+  await s.mount();
+  await startHostedImport(s, 'ads');
+  assert.deepEqual(rowLines(s.render()), ['DOMAIN,a.example,DIRECT']);
+  assert.deepEqual(s.calls.error, ['rules.importHostedConflict']);
+  assert.deepEqual(s.calls.success, []);
+});
+
+test('reopening hosted import refreshes both libraries and can fill an existing RULE-SET reference', async () => {
+  const rules = 'AND,((RULE-SET,ads),(DOMAIN,a.example)),REJECT\nMATCH,DIRECT';
+  let global = globalRuleSet({ id: 'original' });
+  let local = [profileRuleSet({ global_rule_set_id: 'original' })];
+  const s = session(rules, { handlers: {
+    'GET /api/rule-sets': () => [global],
+    'GET /api/profiles/p/rule-sets': () => local,
+    'POST /api/profiles/p/rule-sets/import': () =>
+      ({ imported: 1, regenerate: null, rules_content: rules }),
+  } });
+  const open = () => find(s.render(), (e) => e.type === 'Button' && e.props.children === 'rules.importHosted').props.onClick();
+  const checkbox = () => find(s.render(), (e) => e.type === 'Checkbox' && e.props['aria-label'] === 'ads');
+  await s.mount();
+  await open();
+  assert.equal(checkbox().props.disabled, true);
+  importModal(s.render()).props.onCancel();
+
+  global = globalRuleSet({ id: 'recreated' });
+  local = [profileRuleSet({ global_rule_set_id: null })];
+  await open();
+  assert.equal(checkbox().props.disabled, false);
+  assert.equal(checkbox().props.checked, false);
+  assert.ok(find(s.render(), (e) => e.props?.children === 'rules.importHostedLinkExisting'));
+  importModal(s.render()).props.onCancel();
+
+  local = [];
+  await open();
+  assert.ok(find(s.render(), (e) => e.props?.children === 'rules.importHostedUseExistingRule'));
+  assert.equal(checkbox().props.disabled, false);
+  checkbox().props.onChange({ target: { checked: true } });
+  await importModal(s.render()).props.onOk();
+  const request = s.requests.find((r) => r.url.endsWith('/import'));
+  assert.deepEqual(request.body, { names: ['ads'], policy: 'DIRECT', expected: { ads: { global_id: 'recreated', local_id: null } } });
+  assert.deepEqual(rowLines(s.render()), ['AND,((RULE-SET,ads),(DOMAIN,a.example)),REJECT']);
 });
 
 test('hosted import queues behind an in-flight rules save and adopts the response content', async () => {
@@ -438,7 +540,7 @@ test('hosted import queues behind an in-flight rules save and adopts the respons
   await tick();
   assert.deepEqual(rulePuts(s.requests), ['DOMAIN,b.example,DIRECT\nMATCH,DIRECT']);
 
-  find(tree, (e) => e.type === 'Button' && e.props.children === 'rules.importHosted').props.onClick();
+  await find(tree, (e) => e.type === 'Button' && e.props.children === 'rules.importHosted').props.onClick();
   tree = s.render();
   find(tree, (e) => e.type === 'Checkbox' && e.props['aria-label'] === 'ads')
     .props.onChange({ target: { checked: true } });
@@ -463,7 +565,7 @@ test('hosted import queues behind an in-flight rules save and adopts the respons
   await tick();
   await tick();
   const sent = s.requests.find((r) => r.url.endsWith('/import'));
-  assert.deepEqual(sent.body, { names: ['ads'], policy: 'DIRECT' });
+  assert.deepEqual(sent.body, { names: ['ads'], policy: 'DIRECT', expected: { ads: { global_id: 'g1', local_id: null } } });
   // 响应的 rules_content 成为本地与已保存状态;后续保存包含导入行。
   importRequest.resolve({
     imported: 1, regenerate: { status: 'applied' },

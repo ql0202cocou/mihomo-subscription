@@ -77,7 +77,7 @@ export interface ProfileDetail extends ProfileSummary {
   reality_fingerprint_risks: string[];
 }
 
-/** 全局规则集(「规则托管」,② 用户库 / 导入源)。0.4 起 ② 仅作模板:不再公开托管、不参与生成。 */
+/** 全局规则集（「规则托管」）。编辑定义会同步到由此导入并保持关联的订阅。 */
 export interface RuleSet {
   id: string;
   name: string;
@@ -100,6 +100,8 @@ export interface RuleSet {
 /** 订阅自有规则集(③ 托管规则库):随订阅自包含,按订阅 token 隔离托管。 */
 export interface ProfileRuleSet {
   id: string;
+  global_rule_set_id: string | null;
+  pending_global_name: string | null;
   name: string;
   behavior: "domain" | "ipcidr" | "classical";
   format: "yaml" | "text" | "mrs";

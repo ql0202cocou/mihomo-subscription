@@ -184,3 +184,18 @@ pub async fn text(resp: Response<Body>) -> String {
         .unwrap();
     String::from_utf8(bytes.to_vec()).unwrap()
 }
+
+/// Send a management request and read its successful JSON response.
+pub async fn rule_api(app: &Router, cookie: &str, method: &str, path: &str, body: &str) -> Value {
+    let response = app
+        .clone()
+        .oneshot(authed(method, path, cookie, body))
+        .await
+        .unwrap();
+    assert!(
+        response.status().is_success(),
+        "{method} {path}: {}",
+        response.status()
+    );
+    json(response).await
+}

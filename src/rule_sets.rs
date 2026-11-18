@@ -1,8 +1,7 @@
 //! 全局规则集库(「规则托管」,② 用户规则库 / 导入源)。
 //!
-//! 跨订阅复用的命名规则集模板库。**0.4 起 ② 仅作导入源**:它不再参与生成、也不再公开托管;订阅的
-//! 规则集改由各自的 per-profile 库(③,`src/profile_rule_sets.rs`)持有并托管。管理员在此维护模板
-//! (手动 payload 或远程来源),再在订阅的「规则」里用「导入托管规则」把它们复制进 ③。
+//! 管理员在此维护手动或远程规则集。订阅导入时记录全局 ID，修改定义会同步到关联的订阅。
+//! 公开托管与转换仍由各订阅自己的规则库负责。
 //!
 //! 提供增删改 + 库内显示排序。请求体/校验复用 `src/rulelib.rs`。
 
@@ -15,10 +14,11 @@ use axum::{
     Json,
 };
 use serde::{Deserialize, Serialize};
-use sqlx::{AssertSqlSafe, FromRow};
+use sqlx::{AssertSqlSafe, FromRow, Sqlite, SqliteExecutor, Transaction};
 
 use crate::app::AppState;
 use crate::error::{ApiError, ApiJson, ApiResult};
+use crate::keyed_lock::KeyGuard;
 use crate::rulelib::{self, RuleSetBody};
 use crate::util::{MAX_ORDER_ENTRIES, MAX_ORDER_NAME_LEN};
 use crate::{mask, util::now};
@@ -95,12 +95,12 @@ async fn fetch_all(state: &AppState) -> ApiResult<Vec<RuleSetRow>> {
     .await?)
 }
 
-async fn fetch_one(state: &AppState, id: &str) -> ApiResult<RuleSetRow> {
+async fn fetch_one<'e>(db: impl SqliteExecutor<'e>, id: &str) -> ApiResult<RuleSetRow> {
     sqlx::query_as::<_, RuleSetRow>(AssertSqlSafe(format!(
         "SELECT {META_COLS} FROM rule_sets WHERE id = ?"
     )))
     .bind(id)
-    .fetch_optional(&state.db)
+    .fetch_optional(db)
     .await?
     .ok_or(ApiError::NotFound)
 }
@@ -123,7 +123,10 @@ pub async fn create(
     let n = rulelib::normalize(&body, None)?;
     let id = uuid::Uuid::new_v4().to_string();
     let ts = now();
-    let mut tx = state.db.begin_with("BEGIN IMMEDIATE").await?;
+    let name = body.name.trim();
+    let (profiles, _guards, mut tx) = Followers::WaitingForName(name)
+        .lock_for_write(&state)
+        .await?;
     let position =
         sqlx::query_scalar::<_, i64>("SELECT COALESCE(MAX(position), -1) + 1 FROM rule_sets")
             .fetch_one(&mut *tx)
@@ -134,7 +137,7 @@ pub async fn create(
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(&id)
-    .bind(body.name.trim())
+    .bind(name)
     .bind(&body.behavior)
     .bind(&body.format)
     .bind(&n.source)
@@ -149,9 +152,49 @@ pub async fn create(
     .bind(&ts)
     .execute(&mut *tx)
     .await?;
-    tx.commit().await?;
-    let row = fetch_one(&state, &id).await?;
-    Ok((StatusCode::CREATED, Json(rule_set_response(row))))
+    sqlx::query(
+        "UPDATE profile_rule_sets SET pending_global_name = NULL, global_rule_set_id = ? WHERE pending_global_name = ?",
+    )
+    .bind(&id)
+    .bind(name)
+    .execute(&mut *tx)
+    .await?;
+    let saved = sync_and_commit(&state, tx, &profiles, &id, &body, &n).await?;
+    Ok((StatusCode::CREATED, Json(saved)))
+}
+
+enum Followers<'a> {
+    Linked(&'a str),
+    WaitingForName(&'a str),
+}
+
+impl Followers<'_> {
+    async fn profile_ids<'e>(&self, db: impl SqliteExecutor<'e>) -> ApiResult<Vec<String>> {
+        let (sql, key) = match self {
+            Self::Linked(id) => ("SELECT DISTINCT profile_id FROM profile_rule_sets WHERE global_rule_set_id = ? ORDER BY profile_id", id),
+            Self::WaitingForName(name) => ("SELECT DISTINCT profile_id FROM profile_rule_sets WHERE pending_global_name = ? ORDER BY profile_id", name),
+        };
+        Ok(sqlx::query_scalar(sql).bind(*key).fetch_all(db).await?)
+    }
+
+    async fn lock_for_write(
+        &self,
+        state: &AppState,
+    ) -> ApiResult<(Vec<String>, Vec<KeyGuard>, Transaction<'static, Sqlite>)> {
+        // 先按固定顺序取锁；等待期间可能有订阅新加入或改为独立维护，进入写事务后再核对。
+        loop {
+            let ids = self.profile_ids(&state.db).await?;
+            let mut guards = Vec::with_capacity(ids.len());
+            for id in &ids {
+                guards.push(state.keyed_lock.acquire(id).await);
+            }
+            let mut tx = state.db.begin_with("BEGIN IMMEDIATE").await?;
+            if self.profile_ids(&mut *tx).await? == ids {
+                return Ok((ids, guards, tx));
+            }
+            tx.rollback().await?;
+        }
+    }
 }
 
 /// `PUT /api/rule-sets/:id` —— 更新规则集。
@@ -160,7 +203,8 @@ pub async fn update(
     Path(id): Path<String>,
     ApiJson(body): ApiJson<RuleSetBody>,
 ) -> ApiResult<impl IntoResponse> {
-    let existing = fetch_one(&state, &id).await?;
+    let (profiles, _guards, mut tx) = Followers::Linked(&id).lock_for_write(&state).await?;
+    let existing = fetch_one(&mut *tx, &id).await?;
     // 传入已存 URL:remote 编辑时前端拿不到明文 URL(只见过脱敏形式),留空即沿用原值。
     let n = rulelib::normalize(&body, existing.url.as_deref())?;
     sqlx::query(
@@ -180,10 +224,46 @@ pub async fn update(
     .bind(body.enabled.unwrap_or(true))
     .bind(now())
     .bind(&id)
-    .execute(&state.db)
+    .execute(&mut *tx)
     .await?;
-    let row = fetch_one(&state, &id).await?;
-    Ok(Json(rule_set_response(row)))
+    let definition_changed = existing.behavior != body.behavior
+        || existing.format != body.format
+        || existing.source != n.source
+        || existing.content != n.content
+        || existing.url != n.url
+        || existing.interval_hours != n.interval_hours
+        || existing.cache != n.cache;
+    let changed_profiles = if definition_changed {
+        profiles.as_slice()
+    } else {
+        &[]
+    };
+    Ok(Json(
+        sync_and_commit(&state, tx, changed_profiles, &id, &body, &n).await?,
+    ))
+}
+
+async fn sync_and_commit(
+    state: &AppState,
+    mut tx: Transaction<'_, Sqlite>,
+    profiles: &[String],
+    id: &str,
+    body: &RuleSetBody,
+    values: &rulelib::Normalized,
+) -> ApiResult<RuleSetResponse> {
+    let mut impacts = Vec::new();
+    for profile_id in profiles {
+        let impact =
+            crate::profile_rule_sets::sync_from_global(&mut tx, profile_id, id, body, values)
+                .await?;
+        impacts.push((profile_id, impact));
+    }
+    let row = fetch_one(&mut *tx, id).await?;
+    tx.commit().await?;
+    for (profile_id, impact) in impacts {
+        impact.regenerate_locked(state, profile_id).await?;
+    }
+    Ok(rule_set_response(row))
 }
 
 /// `DELETE /api/rule-sets/:id` —— 从库中删除规则集。

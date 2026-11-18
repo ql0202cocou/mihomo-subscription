@@ -107,9 +107,19 @@ async fn create_profile(app: &Router, cookie: &str) -> (String, String) {
     )
 }
 
+const REMOTE_RULE_SET: &str = r#"{"name":"remote-rules","behavior":"domain","format":"text","source":"remote","url":"https://old.example/rules","cache":true}"#;
+
 async fn create_remote(app: &Router, cookie: &str, id: &str) -> Value {
-    let response = app.clone().oneshot(authed("POST", &format!("/api/profiles/{id}/rule-sets"), cookie,
-        r#"{"name":"remote-rules","behavior":"domain","format":"text","source":"remote","url":"https://old.example/rules","cache":true}"#)).await.unwrap();
+    let response = app
+        .clone()
+        .oneshot(authed(
+            "POST",
+            &format!("/api/profiles/{id}/rule-sets"),
+            cookie,
+            REMOTE_RULE_SET,
+        ))
+        .await
+        .unwrap();
     assert_eq!(response.status(), StatusCode::CREATED);
     json(response).await
 }
@@ -217,6 +227,15 @@ impl RemoteFetcher for BlockedFetcher {
 
 #[tokio::test]
 async fn old_inflight_fetch_cannot_repopulate_cache_after_source_update() {
+    check_inflight_mirror_update(false).await;
+}
+
+#[tokio::test]
+async fn global_source_update_replaces_the_followers_inflight_mirror() {
+    check_inflight_mirror_update(true).await;
+}
+
+async fn check_inflight_mirror_update(from_global: bool) {
     let temp = TempDb::new();
     let fetcher = Arc::new(BlockedFetcher {
         started: Semaphore::new(0),
@@ -227,7 +246,40 @@ async fn old_inflight_fetch_cannot_repopulate_cache_after_source_update() {
     let app = build_router(state.clone());
     let cookie = login(&app).await;
     let (id, _) = create_profile(&app, &cookie).await;
-    let ruleset = create_remote(&app, &cookie, &id).await;
+    let base = format!("/api/profiles/{id}/rule-sets");
+    let (ruleset, update_path) = if from_global {
+        let created = app
+            .clone()
+            .oneshot(authed("POST", "/api/rule-sets", &cookie, REMOTE_RULE_SET))
+            .await
+            .unwrap();
+        assert_eq!(created.status(), StatusCode::CREATED);
+        let global = json(created).await;
+        let imported = app
+            .clone()
+            .oneshot(authed(
+                "POST",
+                &format!("{base}/import"),
+                &cookie,
+                r#"{"names":["remote-rules"],"policy":"DIRECT"}"#,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(json(imported).await["imported"], 1);
+        let listed = app
+            .clone()
+            .oneshot(authed("GET", &base, &cookie, ""))
+            .await
+            .unwrap();
+        (
+            json(listed).await[0].clone(),
+            format!("/api/rule-sets/{}", global["id"].as_str().unwrap()),
+        )
+    } else {
+        let local = create_remote(&app, &cookie, &id).await;
+        let path = format!("{base}/{}", local["id"].as_str().unwrap());
+        (local, path)
+    };
     let path = url::Url::parse(ruleset["url"].as_str().unwrap())
         .unwrap()
         .path()
@@ -240,8 +292,16 @@ async fn old_inflight_fetch_cannot_repopulate_cache_after_source_update() {
         .unwrap()
         .unwrap()
         .forget();
-    let update = app.clone().oneshot(authed("PUT", &format!("/api/profiles/{id}/rule-sets/{}", ruleset["id"].as_str().unwrap()), &cookie,
-        r#"{"name":"remote-rules","behavior":"domain","format":"text","source":"remote","url":"https://new.example/rules","cache":true}"#)).await.unwrap();
+    let update = app
+        .clone()
+        .oneshot(authed(
+            "PUT",
+            &update_path,
+            &cookie,
+            &REMOTE_RULE_SET.replace("old.example", "new.example"),
+        ))
+        .await
+        .unwrap();
     assert_eq!(update.status(), StatusCode::OK);
     fetcher.release.add_permits(1);
     assert_eq!(inflight.await.unwrap().status(), StatusCode::NOT_FOUND);

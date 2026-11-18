@@ -30,6 +30,7 @@ pub struct RuleSetBody {
 }
 
 /// 归一化后的可入库字段。
+#[derive(sqlx::FromRow)]
 pub struct Normalized {
     pub source: String,
     pub content: String,

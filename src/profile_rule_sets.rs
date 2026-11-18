@@ -2,8 +2,8 @@
 //!
 //! 每个订阅持有自己的规则集定义;`RULE-SET,<name>,<policy>` 规则按名引用,生成时由
 //! `src/generate.rs` 注入到输出 `rule-providers:`,`url` 指向 **按订阅 token 隔离** 的托管链接
-//! `/<prefix>/api/sub/<token>/r/<name>/<behavior>.<format>`。订阅由此自包含:生成只读本表,不再
-//! 依赖全局 `rule_sets`(② 仅作导入源)。提供 per-profile 增删改 + 从 ② 导入 + 公开托管端点。
+//! `/<prefix>/api/sub/<token>/r/<name>/<behavior>.<format>`。生成只读本表。从全局库导入时
+//! 保留来源 ID，全局编辑同步到关联的订阅。
 //!
 //! 两种来源与全局库一致(见 `src/rulelib.rs`):`manual` 托管录入 payload;`remote` 镜像远程规则集
 //! (`cache=1` 懒刷新二次托管,支持二进制 `mrs`;`cache=0` 转换时直接注入上游 URL)。
@@ -12,7 +12,7 @@
 //! 输出时在锁内离线重生成(`generate::*_locked`,不重入锁)。被 `RULE-SET` 规则引用(含产出当前
 //! 缓存的规则快照)的规则集不可改名/停用/删除(409),避免正在下发的配置失去定义。
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -23,7 +23,7 @@ use axum::{
     Json,
 };
 use serde::{Deserialize, Serialize};
-use sqlx::{AssertSqlSafe, FromRow};
+use sqlx::{AssertSqlSafe, FromRow, SqliteConnection, SqliteExecutor};
 
 use crate::app::AppState;
 use crate::error::{ApiError, ApiJson, ApiResult};
@@ -38,6 +38,8 @@ use crate::util::{completed_since, is_fresh, now};
 #[derive(FromRow)]
 struct RuleSetRow {
     id: String,
+    global_rule_set_id: Option<String>,
+    pending_global_name: Option<String>,
     name: String,
     behavior: String,
     format: String,
@@ -54,12 +56,15 @@ struct RuleSetRow {
 }
 
 // 列名常量,仅经 `AssertSqlSafe(format!(..))` 拼入 SQL,不含外部输入。
-const META_COLS: &str = "id, name, behavior, format, source, content, rule_count, url, \
+const META_COLS: &str =
+    "id, global_rule_set_id, pending_global_name, name, behavior, format, source, content, rule_count, url, \
      interval_hours, cache, last_fetch_status, enabled, created_at, updated_at";
 
 #[derive(Serialize)]
 pub struct ProfileRuleSetResponse {
     id: String,
+    global_rule_set_id: Option<String>,
+    pending_global_name: Option<String>,
     name: String,
     behavior: String,
     format: String,
@@ -85,6 +90,8 @@ fn to_response(state: &AppState, token: &str, row: RuleSetRow) -> ProfileRuleSet
         remote_url_masked: row.url.as_deref().map(mask::mask_url),
         count: row.rule_count,
         id: row.id,
+        global_rule_set_id: row.global_rule_set_id,
+        pending_global_name: row.pending_global_name,
         name: row.name,
         behavior: row.behavior,
         format: row.format,
@@ -108,13 +115,17 @@ async fn profile_token(state: &AppState, profile_id: &str) -> ApiResult<String> 
         .ok_or(ApiError::NotFound)
 }
 
-async fn fetch_one(state: &AppState, profile_id: &str, id: &str) -> ApiResult<RuleSetRow> {
+async fn fetch_one<'e>(
+    db: impl SqliteExecutor<'e>,
+    profile_id: &str,
+    id: &str,
+) -> ApiResult<RuleSetRow> {
     sqlx::query_as::<_, RuleSetRow>(AssertSqlSafe(format!(
         "SELECT {META_COLS} FROM profile_rule_sets WHERE id = ? AND profile_id = ?"
     )))
     .bind(id)
     .bind(profile_id)
-    .fetch_optional(&state.db)
+    .fetch_optional(db)
     .await?
     .ok_or(ApiError::NotFound)
 }
@@ -125,7 +136,7 @@ async fn fetch_one(state: &AppState, profile_id: &str, id: &str) -> ApiResult<Ru
 /// `converter::ruleset_refs` 收集)。被任一来源引用的规则集改名/停用/删除会让正在下发的配置
 /// 或下次重生成失去定义,必须拦截(409);只有缓存引用的定义才真正注入在所服务的输出里。
 struct RuleSetRefs {
-    draft: HashSet<String>,
+    draft: RuleDraft,
     /// 缓存不存在时为空集;缓存损坏无法判断时为 `None`,按「被引用」保守处理。
     cache: Option<HashSet<String>>,
 }
@@ -133,7 +144,7 @@ struct RuleSetRefs {
 impl RuleSetRefs {
     /// `name` 是否被规则草稿或所服务缓存引用。
     fn contains(&self, name: &str) -> bool {
-        self.draft.contains(name) || self.in_cache(name)
+        self.draft.names.contains(name) || self.in_cache(name)
     }
 
     /// `name` 是否被产出所服务缓存的规则引用。
@@ -142,27 +153,34 @@ impl RuleSetRefs {
     }
 }
 
-/// 收集规则集引用。升级前的缓存无 `rules_snapshot`,改从 `output_yaml` 的 `rules` 段提取。
-async fn referenced_names(state: &AppState, profile_id: &str) -> ApiResult<RuleSetRefs> {
-    let current =
+struct RuleDraft {
+    content: String,
+    names: HashSet<String>,
+}
+
+async fn load_rule_draft(conn: &mut SqliteConnection, profile_id: &str) -> ApiResult<RuleDraft> {
+    let content =
         sqlx::query_scalar::<_, String>("SELECT content FROM rulesets WHERE profile_id = ?")
             .bind(profile_id)
-            .fetch_optional(&state.db)
-            .await?;
-    let draft = current
-        .map(|content| {
-            crate::converter::ruleset_refs(&content)
-                .into_iter()
-                .collect()
-        })
-        .unwrap_or_default();
+            .fetch_optional(conn)
+            .await?
+            .unwrap_or_default();
+    let names = crate::converter::ruleset_refs(&content)
+        .into_iter()
+        .collect();
+    Ok(RuleDraft { content, names })
+}
+
+/// 收集规则集引用。升级前的缓存无 `rules_snapshot`,改从 `output_yaml` 的 `rules` 段提取。
+async fn referenced_names(conn: &mut SqliteConnection, profile_id: &str) -> ApiResult<RuleSetRefs> {
+    let draft = load_rule_draft(conn, profile_id).await?;
     // 规则快照缺失(升级前的旧缓存)时才需要整份输出作退路,避免每次读出大块 output_yaml。
     let cache = sqlx::query_as::<_, (Option<String>, Option<String>)>(
         "SELECT rules_snapshot, CASE WHEN rules_snapshot IS NULL THEN output_yaml END \
          FROM generated_cache WHERE profile_id = ?",
     )
     .bind(profile_id)
-    .fetch_optional(&state.db)
+    .fetch_optional(&mut *conn)
     .await?;
     let cache = match cache {
         None => Some(HashSet::new()),
@@ -242,7 +260,7 @@ pub async fn create(
         let token = profile_token(&state, &profile_id).await?;
         let n = rulelib::normalize(&body, None)?;
         let name = body.name.trim();
-        let referenced = referenced_names(&state, &profile_id).await?;
+        let referenced = referenced_names(&mut *state.db.acquire().await?, &profile_id).await?;
         let id = uuid::Uuid::new_v4().to_string();
         let ts = now();
         sqlx::query(
@@ -266,7 +284,7 @@ pub async fn create(
         .bind(&ts)
         .execute(&state.db)
         .await?;
-        let row = fetch_one(&state, &profile_id, &id).await?;
+        let row = fetch_one(&state.db, &profile_id, &id).await?;
         // 新建只会补上旧缓存里不存在的定义(引用未定义规则集的规则过不了校验),旧缓存的托管
         // 链接都仍有效:重生成未通过时保留它继续下发,不同于 `update` 改动已注入定义时删缓存。
         let regenerate = if referenced.contains(name) {
@@ -298,87 +316,164 @@ pub async fn update(
     Path((profile_id, rsid)): Path<(String, String)>,
     ApiJson(body): ApiJson<RuleSetBody>,
 ) -> ApiResult<impl IntoResponse> {
-    state.keyed_lock.run(&profile_id, async {
-        let token = profile_token(&state, &profile_id).await?;
-        let existing = fetch_one(&state, &profile_id, &rsid).await?;
-        let n = rulelib::normalize(&body, existing.url.as_deref())?;
-        let name = body.name.trim();
-        let enabled = body.enabled.unwrap_or(true);
-        let referenced = referenced_names(&state, &profile_id).await?;
-        let was_referenced = referenced.contains(&existing.name);
-        if was_referenced && name != existing.name {
-            return Err(referenced_conflict(&existing.name, "renaming"));
-        }
-        if was_referenced && existing.enabled && !enabled {
-            return Err(referenced_conflict(&existing.name, "disabling"));
-        }
-        // 输出中的 rule-providers 条目由「被引用且启用」的定义注入;条目出现(改名/启用补齐引用)、
-        // 消失或字段变化都会改变输出,须重生成缓存。
-        let now_referenced = referenced.contains(name);
-        let had_entry = was_referenced && existing.enabled;
-        let has_entry = now_referenced && enabled;
-        let entry_changed = had_entry
-            && has_entry
-            && (body.behavior != existing.behavior
-                || body.format != existing.format
-                || n.source != existing.source
-                || n.cache != existing.cache
-                || (n.source == "remote" && !n.cache && n.url != existing.url));
-        let affects_output = had_entry != has_entry || entry_changed;
-        // 所服务的缓存里确实注入着这条定义(缓存自己的规则引用它,且定义原本启用)。只被未通过
-        // 校验的规则草稿引用的定义不在缓存里,改动它不会让旧缓存失效。
-        let served_entry = existing.enabled && referenced.in_cache(&existing.name);
-        let invalidates_cache = affects_output && served_entry;
+    state
+        .keyed_lock
+        .run(&profile_id, async {
+            let token = profile_token(&state, &profile_id).await?;
+            let mut tx = state.db.begin_with("BEGIN IMMEDIATE").await?;
+            let existing = fetch_one(&mut *tx, &profile_id, &rsid).await?;
+            let normalized = rulelib::normalize(&body, existing.url.as_deref())?;
+            let impact = DefinitionEdit {
+                name: body.name.trim(),
+                enabled: body.enabled.unwrap_or(true),
+                behavior: &body.behavior,
+                format: &body.format,
+                values: &normalized,
+                global_id: None,
+            }
+            .apply(&mut tx, &profile_id, &existing, &mut None)
+            .await?;
+            tx.commit().await?;
+            let row = fetch_one(&state.db, &profile_id, &rsid).await?;
+            let regenerate = impact.regenerate_locked(&state, &profile_id).await?;
+            Ok(Json(RuleSetSavedResponse {
+                rule_set: to_response(&state, &token, row),
+                regenerate,
+            }))
+        })
+        .await
+}
 
-        let mut tx = state.db.begin_with("BEGIN IMMEDIATE").await?;
-        if invalidates_cache {
+#[derive(Default)]
+pub(crate) struct CacheImpact {
+    regenerate: bool,
+    invalidate: bool,
+}
+
+impl CacheImpact {
+    fn merge(&mut self, other: Self) {
+        self.regenerate |= other.regenerate;
+        self.invalidate |= other.invalidate;
+    }
+
+    pub(crate) async fn regenerate_locked(
+        &self,
+        state: &AppState,
+        profile_id: &str,
+    ) -> ApiResult<Option<Regenerated>> {
+        if !self.regenerate {
+            return Ok(None);
+        }
+        let result = crate::generate::regenerate_from_cache_locked(state, profile_id).await;
+        if self.invalidate && !matches!(result, Regenerated::Applied) {
+            crate::generate::invalidate_cache(state, profile_id).await?;
+        }
+        Ok(Some(result))
+    }
+}
+
+struct DefinitionEdit<'a> {
+    name: &'a str,
+    enabled: bool,
+    behavior: &'a str,
+    format: &'a str,
+    values: &'a rulelib::Normalized,
+    global_id: Option<&'a str>,
+}
+
+impl DefinitionEdit<'_> {
+    async fn apply(
+        &self,
+        conn: &mut SqliteConnection,
+        profile_id: &str,
+        old: &RuleSetRow,
+        batch_refs: &mut Option<RuleSetRefs>,
+    ) -> ApiResult<CacheImpact> {
+        let n = self.values;
+        let mut impact = CacheImpact::default();
+        let entry_changed = self.behavior != old.behavior
+            || self.format != old.format
+            || n.source != old.source
+            || n.cache != old.cache
+            || (n.source == "remote" && !n.cache && n.url != old.url);
+        if self.name != old.name || self.enabled != old.enabled || entry_changed {
+            let refs = match batch_refs {
+                Some(refs) => refs,
+                None => batch_refs.insert(referenced_names(conn, profile_id).await?),
+            };
+            let was_referenced = refs.contains(&old.name);
+            if was_referenced && self.name != old.name {
+                return Err(referenced_conflict(&old.name, "renaming"));
+            }
+            if was_referenced && old.enabled && !self.enabled {
+                return Err(referenced_conflict(&old.name, "disabling"));
+            }
+            let had_entry = was_referenced && old.enabled;
+            let has_entry = refs.contains(self.name) && self.enabled;
+            impact.regenerate = had_entry != has_entry || (had_entry && has_entry && entry_changed);
+            impact.invalidate = impact.regenerate && old.enabled && refs.in_cache(&old.name);
+        }
+        if impact.invalidate {
             sqlx::query("UPDATE generated_cache SET capability_hash = NULL WHERE profile_id = ?")
-                .bind(&profile_id)
-                .execute(&mut *tx)
+                .bind(profile_id)
+                .execute(&mut *conn)
                 .await?;
         }
         sqlx::query(
-            "UPDATE profile_rule_sets SET name = ?, behavior = ?, format = ?, source = ?, content = ?, \
-             rule_count = ?, url = ?, interval_hours = ?, cache = ?, enabled = ?, \
-             cached_body = NULL, cached_at = NULL, last_fetch_at = NULL, last_fetch_status = NULL, revision = revision + 1, updated_at = ?
-             WHERE id = ? AND profile_id = ?",
+            "UPDATE profile_rule_sets SET name = ?, behavior = ?, format = ?, source = ?, content = ?,
+             rule_count = ?, url = ?, interval_hours = ?, cache = ?, enabled = ?, global_rule_set_id = ?, pending_global_name = NULL,
+             cached_body = NULL, cached_at = NULL, last_fetch_at = NULL, last_fetch_status = NULL,
+             revision = revision + 1, updated_at = ? WHERE id = ? AND profile_id = ?",
         )
-        .bind(name)
-        .bind(&body.behavior)
-        .bind(&body.format)
+        .bind(self.name)
+        .bind(self.behavior)
+        .bind(self.format)
         .bind(&n.source)
         .bind(&n.content)
         .bind(n.rule_count)
         .bind(&n.url)
         .bind(n.interval_hours)
         .bind(n.cache)
-        .bind(enabled)
+        .bind(self.enabled)
+        .bind(self.global_id)
         .bind(now())
-        .bind(&rsid)
-        .bind(&profile_id)
-        .execute(&mut *tx)
+        .bind(&old.id)
+        .bind(profile_id)
+        .execute(conn)
         .await?;
-        tx.commit().await?;
+        Ok(impact)
+    }
+}
 
-        let row = fetch_one(&state, &profile_id, &rsid).await?;
-        let regenerate = if affects_output {
-            let r = crate::generate::regenerate_from_cache_locked(&state, &profile_id).await;
-            if invalidates_cache && !matches!(r, Regenerated::Applied) {
-                // 本次改的正是旧缓存已注入的定义,旧缓存里的托管链接/直连地址已失效:无法用当前
-                // 规则重建时删除缓存而不是继续下发,下次公开拉取回源重建。旧缓存未注入该定义时
-                // (同新建与导入)它仍然有效,保留继续下发。
-                crate::generate::invalidate_cache(&state, &profile_id).await?;
-            }
-            Some(r)
-        } else {
-            None
+/// 在全局定义的写事务及本订阅锁内同步。订阅内名字和启停状态由订阅自己持有。
+pub(crate) async fn sync_from_global(
+    conn: &mut SqliteConnection,
+    profile_id: &str,
+    global_id: &str,
+    body: &RuleSetBody,
+    values: &rulelib::Normalized,
+) -> ApiResult<CacheImpact> {
+    let rows = sqlx::query_as::<_, RuleSetRow>(AssertSqlSafe(format!(
+        "SELECT {META_COLS} FROM profile_rule_sets WHERE profile_id = ? AND global_rule_set_id = ?"
+    )))
+    .bind(profile_id)
+    .bind(global_id)
+    .fetch_all(&mut *conn)
+    .await?;
+    let mut impact = CacheImpact::default();
+    let mut batch_refs = None;
+    for row in rows {
+        let edit = DefinitionEdit {
+            name: &row.name,
+            enabled: row.enabled,
+            behavior: &body.behavior,
+            format: &body.format,
+            values,
+            global_id: Some(global_id),
         };
-        Ok(Json(RuleSetSavedResponse {
-            rule_set: to_response(&state, &token, row),
-            regenerate,
-        }))
-    })
-    .await
+        impact.merge(edit.apply(conn, profile_id, &row, &mut batch_refs).await?);
+    }
+    Ok(impact)
 }
 
 /// `DELETE /api/profiles/:id/rule-sets/:rsid` —— 删除。被 `RULE-SET` 规则引用(同上,含快照)
@@ -390,8 +485,8 @@ pub async fn delete(
     state
         .keyed_lock
         .run(&profile_id, async {
-            let existing = fetch_one(&state, &profile_id, &rsid).await?;
-            let referenced = referenced_names(&state, &profile_id).await?;
+            let existing = fetch_one(&state.db, &profile_id, &rsid).await?;
+            let referenced = referenced_names(&mut *state.db.acquire().await?, &profile_id).await?;
             if referenced.contains(&existing.name) {
                 return Err(referenced_conflict(&existing.name, "deleting"));
             }
@@ -411,15 +506,81 @@ pub async fn delete(
 pub struct ImportBody {
     /// 要从全局「规则托管」库复制进本订阅的规则集名。
     names: Vec<String>,
+    /// 对已有独立定义，仅在显式指定名称及订阅内 ID 时替换并关联。
+    #[serde(default)]
+    link_existing: HashMap<String, String>,
+    /// 新客户端为每个勾选项提供弹窗中看到的来源与本地定义身份。
+    expected: Option<HashMap<String, ExpectedImport>>,
     /// 复制后追加的 `RULE-SET` 规则统一指向的策略。
     policy: String,
 }
 
+#[derive(Deserialize)]
+struct ExpectedImport {
+    global_id: String,
+    local_id: Option<String>,
+}
+
+#[derive(FromRow)]
+struct ImportLocal {
+    id: String,
+    name: String,
+    enabled: bool,
+    global_rule_set_id: Option<String>,
+}
+
+impl ExpectedImport {
+    fn verify(
+        &self,
+        global_id: Option<&str>,
+        local: Option<&ImportLocal>,
+        replace_independent: bool,
+    ) -> ApiResult<()> {
+        let expected_source = if replace_independent {
+            None
+        } else {
+            Some(self.global_id.as_str())
+        };
+        if global_id != Some(&self.global_id)
+            || self.local_id.as_deref() != local.map(|row| row.id.as_str())
+            || local.is_some_and(|row| {
+                !row.enabled || row.global_rule_set_id.as_deref() != expected_source
+            })
+        {
+            return Err(ApiError::Conflict(
+                "rule-set selection changed; reopen the import dialog and retry".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+async fn import_local(
+    conn: &mut SqliteConnection,
+    profile_id: &str,
+    global_id: Option<&str>,
+    name: &str,
+) -> ApiResult<Option<ImportLocal>> {
+    // 已关联的订阅别名优先。历史库若有多个别名，优先同源同名，否则取按名称排序的第一项。
+    Ok(sqlx::query_as(
+        "SELECT id, name, enabled, global_rule_set_id FROM profile_rule_sets
+         WHERE profile_id = ?1 AND name = COALESCE((
+             SELECT name FROM profile_rule_sets WHERE profile_id = ?1 AND global_rule_set_id = ?2
+             ORDER BY (name = ?3) DESC, name LIMIT 1
+         ), ?3)",
+    )
+    .bind(profile_id)
+    .bind(global_id)
+    .bind(name)
+    .fetch_optional(conn)
+    .await?)
+}
+
 #[derive(Serialize)]
 pub struct ImportResult {
-    /// 实际复制进本订阅(③)的规则集定义数(已存在同名定义的不计)。
+    /// 本次新导入或显式建立关联的规则集数。
     imported: usize,
-    /// 离线重生成结果;复制了定义或新增了规则行时触发,两者都未发生(无实际改动)时为 `null`。
+    /// 新导入定义、补规则行或替换影响输出的字段时的离线重生成结果。
     regenerate: Option<Regenerated>,
     /// 导入提交后的完整规则文本,供前端同步本地编辑状态。
     rules_content: String,
@@ -428,15 +589,12 @@ pub struct ImportResult {
 /// 从全局 ② 库复制一行所需的字段(含 `rule_count`,直接沿用,免重算)。
 #[derive(FromRow)]
 struct GlobalRuleSet {
+    id: String,
     name: String,
     behavior: String,
     format: String,
-    source: String,
-    content: String,
-    url: Option<String>,
-    interval_hours: i64,
-    cache: bool,
-    rule_count: i64,
+    #[sqlx(flatten)]
+    values: rulelib::Normalized,
 }
 
 /// 旧全局库可能含有新表单不再接受的定义,导入前按当前 Mihomo 组合与 URL 语法复核。
@@ -444,9 +602,10 @@ fn importable(rule_set: &GlobalRuleSet) -> bool {
     if rule_set.behavior == "classical" && rule_set.format == "mrs" {
         return false;
     }
-    match rule_set.source.as_str() {
+    match rule_set.values.source.as_str() {
         "manual" => rulelib::MANUAL_FORMATS.contains(&rule_set.format.as_str()),
         "remote" => rule_set
+            .values
             .url
             .as_deref()
             .and_then(rulelib::parse_http_url)
@@ -458,12 +617,8 @@ fn importable(rule_set: &GlobalRuleSet) -> bool {
 /// 单次导入的名字数上限:防止超大请求放大为逐名查询。
 const MAX_IMPORT_NAMES: usize = 1000;
 
-/// `POST /api/profiles/:id/rule-sets/import` —— 从全局 ② 复制选中规则集进本订阅 ③(含真实远程 URL,
-/// 前端拿不到脱敏后的 URL,故由后端复制),并为尚未引用的名追加 `RULE-SET,<name>,<policy>` 规则行,
-/// 随后离线重生成缓存使其立即生效。定义复制与规则更新在同一个 `BEGIN IMMEDIATE` 事务内完成
-/// (规则 UPDATE 带旧内容 CAS,并发修改则整体回滚 → 409,重试即可)。只复制 ② 中实际存在的名,
-/// 也只给复制后 ③ 中实际存在的名追加规则行;已存在同名定义的不重复复制、不计入 `imported`;
-/// 复制了定义或新增了规则行都会触发离线重生成。
+/// 导入全局定义并关联来源，补齐尚未引用的规则行。同名定义默认沿用；显式指定本订阅的
+/// 独立定义 ID 时才替换其内容并关联。定义和规则行在一个事务中提交。
 pub async fn import(
     State(state): State<Arc<AppState>>,
     Path(profile_id): Path<String>,
@@ -478,82 +633,113 @@ pub async fn import(
         ));
     }
     let names = normalize_names(&body.names)?;
+    if let Some(expected) = &body.expected {
+        if expected.len() != names.len() || !names.iter().all(|name| expected.contains_key(name)) {
+            return Err(ApiError::BadRequest(
+                "expected must cover exactly the selected names".into(),
+            ));
+        }
+    }
 
     // 与生成/公开刷新共用 per-profile 锁;锁内只能调 `_locked` 变体,不得重入锁。
     state.keyed_lock.run(&profile_id, async {
         let _ = profile_token(&state, &profile_id).await?;
         let mut tx = state.db.begin_with("BEGIN IMMEDIATE").await?;
 
-        // 复制定义:逐个把 ② 行复制进 ③(本订阅已有同名则跳过);rule_count 直接沿用 ② 的值。
         // `available` 收集复制完成后 ③ 中实际存在且启用的名(保序),只有它们才会得到规则行——
         // 生成只认启用的定义,为停用的定义追加引用会让规则无法通过校验。
         let mut imported = 0usize;
-        let mut available: Vec<&str> = Vec::new();
+        let mut available = Vec::new();
+        let mut impact = CacheImpact::default();
+        let mut batch_refs = None;
         for name in &names {
-            let existing_enabled = sqlx::query_scalar::<_, bool>(
-                "SELECT enabled FROM profile_rule_sets WHERE profile_id = ? AND name = ?",
-            )
-            .bind(&profile_id)
-            .bind(name)
-            .fetch_optional(&mut *tx)
-            .await?;
-            if let Some(enabled) = existing_enabled {
-                if enabled {
-                    available.push(name.as_str());
+            let global_id = sqlx::query_scalar::<_, String>("SELECT id FROM rule_sets WHERE name = ?")
+                .bind(name).fetch_optional(&mut *tx).await?;
+            let local = import_local(&mut tx, &profile_id, global_id.as_deref(), name).await?;
+            let link_id = body.link_existing.get(name);
+            if let Some(expected) = &body.expected {
+                expected[name].verify(global_id.as_deref(), local.as_ref(), link_id.is_some())?;
+            }
+            if let Some(id) = link_id {
+                if local.as_ref().is_none_or(|row| row.id != *id || !row.enabled) {
+                    return Err(ApiError::Conflict("local rule-set changed; reload and retry".into()));
+                }
+            } else if let Some(row) = local {
+                if row.enabled {
+                    available.push(row.name);
                 }
                 continue;
             }
-            let Some(g) = sqlx::query_as::<_, GlobalRuleSet>(
-                "SELECT name, behavior, format, source, content, url, interval_hours, cache, rule_count \
-                 FROM rule_sets WHERE name = ?",
+            let global = sqlx::query_as::<_, GlobalRuleSet>(
+                "SELECT id, name, behavior, format, source, content, url, interval_hours, cache, rule_count
+                 FROM rule_sets WHERE id = ?",
             )
-            .bind(name)
+            .bind(global_id)
             .fetch_optional(&mut *tx)
-            .await?
-            else {
+            .await?;
+            let Some(g) = global.filter(importable) else {
+                if link_id.is_some() || body.expected.is_some() {
+                    return Err(ApiError::Conflict("global rule-set is no longer available".into()));
+                }
                 continue;
             };
-            if !importable(&g) {
+            if let Some(local) = local {
+                available.push(local.name);
+                if local.global_rule_set_id.as_ref() == Some(&g.id) {
+                    continue;
+                }
+                if local.global_rule_set_id.is_some() {
+                    return Err(ApiError::Conflict("local rule-set already follows another definition".into()));
+                }
+                let row = fetch_one(&mut *tx, &profile_id, &local.id).await?;
+                let edit = DefinitionEdit {
+                    name: &row.name,
+                    enabled: row.enabled,
+                    behavior: &g.behavior,
+                    format: &g.format,
+                    values: &g.values,
+                    global_id: Some(&g.id),
+                };
+                impact.merge(edit.apply(&mut tx, &profile_id, &row, &mut batch_refs).await?);
+                imported += 1;
                 continue;
             }
             let id = uuid::Uuid::new_v4().to_string();
             let ts = now();
             sqlx::query(
                 "INSERT INTO profile_rule_sets (id, profile_id, name, behavior, format, source, content, \
-                 rule_count, url, interval_hours, cache, enabled, created_at, updated_at)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)",
+                 rule_count, url, interval_hours, cache, enabled, global_rule_set_id, created_at, updated_at)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)",
             )
             .bind(&id)
             .bind(&profile_id)
             .bind(&g.name)
             .bind(&g.behavior)
             .bind(&g.format)
-            .bind(&g.source)
-            .bind(&g.content)
-            .bind(g.rule_count)
-            .bind(&g.url)
-            .bind(g.interval_hours)
-            .bind(g.cache)
+            .bind(&g.values.source)
+            .bind(&g.values.content)
+            .bind(g.values.rule_count)
+            .bind(&g.values.url)
+            .bind(g.values.interval_hours)
+            .bind(g.values.cache)
+            .bind(&g.id)
             .bind(&ts)
             .bind(&ts)
             .execute(&mut *tx)
             .await?;
             imported += 1;
-            available.push(name.as_str());
+            impact.regenerate = true;
+            available.push(g.name);
         }
 
         // 追加规则行:仅为复制后实际存在且尚未被 RULE-SET 引用的名追加,统一指向 `policy`。
-        let old_content =
-            sqlx::query_scalar::<_, String>("SELECT content FROM rulesets WHERE profile_id = ?")
-                .bind(&profile_id)
-                .fetch_optional(&mut *tx)
-                .await?
-                .unwrap_or_default();
-        let referenced = crate::converter::ruleset_refs(&old_content);
-        let lines: Vec<String> = available
-            .iter()
-            .filter(|n| !referenced.iter().any(|r| r.as_str() == **n))
-            .map(|n| format!("RULE-SET,{n},{policy}"))
+        let RuleDraft { content: old_content, mut names } = match batch_refs {
+            Some(refs) => refs.draft,
+            None => load_rule_draft(&mut tx, &profile_id).await?,
+        };
+        let lines: Vec<String> = available.into_iter()
+            .filter(|name| names.insert(name.clone()))
+            .map(|name| format!("RULE-SET,{name},{policy}"))
             .collect();
         let rules_changed = !lines.is_empty();
         let content = if rules_changed {
@@ -582,14 +768,8 @@ pub async fn import(
         }
         tx.commit().await?;
 
-        // 用缓存的机场原文离线重生成(含 rule-providers 注入),使导入立即反映到所服务的订阅:
-        // 复制来的定义可能补齐了已有引用,新增的规则行也需要注入对应 rule-providers 条目。
-        // 导入不覆盖已有定义,旧缓存不依赖新复制的定义:重生成未通过时保留它继续下发。
-        let regenerate = if imported > 0 || rules_changed {
-            Some(crate::generate::regenerate_from_cache_locked(&state, &profile_id).await)
-        } else {
-            None
-        };
+        impact.regenerate |= rules_changed;
+        let regenerate = impact.regenerate_locked(&state, &profile_id).await?;
         Ok(Json(ImportResult {
             imported,
             regenerate,

@@ -24,6 +24,12 @@ struct EntryGuard {
     lock: Option<Arc<AsyncMutex<()>>>,
 }
 
+pub(crate) struct KeyGuard {
+    // 按声明顺序释放：先解锁并归还 Arc，再清理锁表。
+    _guard: tokio::sync::OwnedMutexGuard<()>,
+    _entry: EntryGuard,
+}
+
 impl EntryGuard {
     fn lock(&self) -> &Arc<AsyncMutex<()>> {
         self.lock.as_ref().expect("lock is held until drop")
@@ -58,14 +64,18 @@ impl KeyedLock {
     /// 在 `key` 的锁内运行 `fut`,使同一 key 同一时刻只有一个刷新在跑。
     /// 取锁 → 执行 → 归还的次序由本方法保证,调用方无需关心锁表回收。
     pub async fn run<T>(&self, key: &str, fut: impl Future<Output = T>) -> T {
+        let _guard = self.acquire(key).await;
+        fut.await
+    }
+
+    /// 同时修改多个订阅的调用方按 profile id 排序后依次取锁。
+    pub(crate) async fn acquire(&self, key: &str) -> KeyGuard {
         let entry = self.entry_for(key);
-        let result = {
-            // 内层作用域保证异步锁 guard 先于 entry 释放，包括 future 被取消时。
-            let _guard = entry.lock().lock().await;
-            fut.await
-        };
-        drop(entry);
-        result
+        let guard = entry.lock().clone().lock_owned().await;
+        KeyGuard {
+            _guard: guard,
+            _entry: entry,
+        }
     }
 
     /// 取 `key` 对应的异步锁,首次使用时创建。

@@ -35,7 +35,7 @@ import {
 } from "@dnd-kit/sortable";
 import { CSS } from "@dnd-kit/utilities";
 import { useTranslation } from "react-i18next";
-import { api, errorMessage } from "../../api";
+import { api, ApiError, errorMessage } from "../../api";
 import type {
   CustomGroup,
   CustomNode,
@@ -279,12 +279,13 @@ export default function RulesCard({
   // 以便在编辑弹窗按设计稿分组展示。
   const [proxyNames, setProxyNames] = useState<string[]>([]);
   const [outputGroupNames, setOutputGroupNames] = useState<string[]>([]);
-  const [ruleSets, setRuleSets] = useState<RuleSet[]>([]);
   // 本订阅自有规则集(③):RULE-SET 编辑器据此预填,仅显式编辑时 upsert。
   const [profileRuleSets, setProfileRuleSets] = useState<ProfileRuleSet[]>([]);
+  const profileLibraryRequest = useRef(0);
   const [importing, setImporting] = useState(false);
   // 「导入托管规则」弹窗:勾选全局规则集 → 以 RULE-SET 引用进本订阅。
-  const [importHostedOpen, setImportHostedOpen] = useState(false);
+  const [importLibrary, setImportLibrary] = useState<{ global: RuleSet[]; local: ProfileRuleSet[] } | null>(null);
+  const [loadingImportLibrary, loadImportLibrary] = useSingleFlight();
   const [hostedImporting, setHostedImporting] = useState(false);
   const hostedImportPending = useRef(false);
   const [picked, setPicked] = useState<Set<string>>(new Set());
@@ -343,28 +344,17 @@ export default function RulesCard({
     }
   }, [profileId]);
 
-  // 全局 ② 库(供「导入托管规则」勾选)。
-  const loadRuleSets = useCallback(async () => {
-    try {
-      setRuleSets(await api<RuleSet[]>("/api/rule-sets"));
-    } catch {
-      // 取不到全局库不影响其它操作
-    }
-  }, []);
-
   // 本订阅 ③ 库(供 RULE-SET 编辑器预填)。
   const loadProfileRuleSets = useCallback(async () => {
+    const request = ++profileLibraryRequest.current;
     try {
-      setProfileRuleSets(await api<ProfileRuleSet[]>(`/api/profiles/${profileId}/rule-sets`));
+      const rows = await api<ProfileRuleSet[]>(`/api/profiles/${profileId}/rule-sets`);
+      if (request === profileLibraryRequest.current) setProfileRuleSets(rows);
+      return rows;
     } catch {
-      // 取不到不影响:保存时按是否存在决定 POST/PUT
+      return null;
     }
   }, [profileId]);
-
-  // 全局 ② 库与 generatedAt 无关,单独加载,避免每次生成都重拉。
-  useEffect(() => {
-    void loadRuleSets();
-  }, [loadRuleSets]);
 
   // 策略候选(机场代理随生成变化)与 ③ 库随 generatedAt 刷新。
   useEffect(() => {
@@ -634,28 +624,84 @@ export default function RulesCard({
     return set;
   }, [rules]);
 
-  function openImportHosted() {
+  const importChoices = useMemo(() => {
+    if (!importLibrary) return [];
+    const locals = new Map(importLibrary.local.map((rs) => [rs.name, rs]));
+    // 服务端列表按本地名称升序；同源多别名的旧数据优先同名，否则取第一项。
+    const bySource = new Map<string, ProfileRuleSet>();
+    for (const row of importLibrary.local) {
+      if (row.global_rule_set_id && !bySource.has(row.global_rule_set_id)) {
+        bySource.set(row.global_rule_set_id, row);
+      }
+    }
+    return importLibrary.global.map((rs) => {
+      const sameName = locals.get(rs.name);
+      const local = sameName?.global_rule_set_id === rs.id ? sameName : bySource.get(rs.id) ?? sameName;
+      const already = referenced.has(local?.name ?? rs.name);
+      const followedId = local?.global_rule_set_id;
+      const linkId = local?.enabled && !followedId ? local.id : null;
+      const linkedAndReferenced = already && followedId === rs.id;
+      let disabled = linkedAndReferenced;
+      let label = already ? "rules.importHostedUseExistingRule" : "";
+      if (local && !local.enabled) {
+        disabled = true;
+        label = "rules.importHostedDisabled";
+      } else if (followedId && followedId !== rs.id) {
+        disabled = true;
+        label = "rules.importHostedOtherSource";
+      } else if (linkId) {
+        label = "rules.importHostedLinkExisting";
+      } else if (followedId) {
+        label = "rules.importHostedFollowing";
+      }
+      return { rs, local, linkedAndReferenced, linkId, label, disabled };
+    });
+  }, [importLibrary, referenced]);
+
+  async function openImportHosted() {
     if (hostedImportPending.current) return;
-    setPicked(new Set());
-    setImportPolicy("DIRECT");
-    setImportHostedOpen(true);
+    await loadImportLibrary(async () => {
+      try {
+        const [global, local] = await Promise.all([
+          api<RuleSet[]>("/api/rule-sets"),
+          loadProfileRuleSets(),
+        ]);
+        if (!local) {
+          message.error(t("rules.importHostedLoadFailed"));
+          return;
+        }
+        setPicked(new Set());
+        setImportPolicy("DIRECT");
+        setImportLibrary({ global, local });
+      } catch (e) {
+        message.error(errorMessage(e, t("rules.importHostedLoadFailed")));
+      }
+    });
   }
 
-  function togglePick(name: string, checked: boolean) {
+  function togglePick(id: string, checked: boolean) {
     setPicked((prev) => {
       const next = new Set(prev);
-      if (checked) next.add(name);
-      else next.delete(name);
+      if (checked) next.add(id);
+      else next.delete(id);
       return next;
     });
   }
 
   async function doImportHosted() {
     if (hostedImportPending.current) return;
-    const names = ruleSets
-      .map((r) => r.name)
-      .filter((n) => picked.has(n) && !referenced.has(n));
-    setImportHostedOpen(false);
+    const selected = importChoices.filter(({ rs, disabled }) => !disabled && picked.has(rs.id));
+    const names = selected.map(({ rs }) => rs.name);
+    const links = selected.filter(({ linkId }) => linkId !== null);
+    const body = {
+      names,
+      policy: importPolicy,
+      expected: Object.fromEntries(selected.map(({ rs, local }) => [
+        rs.name, { global_id: rs.id, local_id: local?.id ?? null },
+      ])),
+      link_existing: links.length ? Object.fromEntries(links.map(({ rs, linkId }) => [rs.name, linkId])) : undefined,
+    };
+    setImportLibrary(null);
     if (names.length === 0) {
       message.info(t("rules.importHostedNone"));
       return;
@@ -668,11 +714,13 @@ export default function RulesCard({
       const res = await saveInOrder(() =>
         api<{ imported: number; regenerate: Regenerate | null; rules_content: string }>(
           `/api/profiles/${profileId}/rule-sets/import`,
-          { method: "POST", body: JSON.stringify({ names, policy: importPolicy }) },
+          { method: "POST", body: JSON.stringify(body) },
         ),
       );
       if (!res.ok) {
-        message.error(errorMessage(res.error, t("rules.importFailed")));
+        message.error(res.error instanceof ApiError && res.error.status === 409
+          ? t("rules.importHostedConflict")
+          : errorMessage(res.error, t("rules.importFailed")));
         return;
       }
       const result = res.value;
@@ -709,7 +757,7 @@ export default function RulesCard({
           {t("rules.title")} <span className="row-sub">{t("rules.count", { count: total })}</span>
         </span>
         <div className="dcard-actions">
-          <Button onClick={openImportHosted} loading={hostedImporting}>
+          <Button onClick={openImportHosted} loading={loadingImportLibrary || hostedImporting}>
             {t("rules.importHosted")}
           </Button>
           <Popconfirm title={t("rules.importConfirm")} onConfirm={importProviderRules}>
@@ -778,35 +826,35 @@ export default function RulesCard({
 
       <Modal
         className="form-modal"
-        open={importHostedOpen}
+        open={importLibrary !== null}
         title={t("rules.importHosted")}
         onOk={doImportHosted}
-        onCancel={() => setImportHostedOpen(false)}
+        onCancel={() => setImportLibrary(null)}
         okText={t("common.save")}
         cancelText={t("common.cancel")}
         width={520}
         destroyOnHidden
       >
         <p className="rules-import-desc">{t("rules.importHostedDesc")}</p>
-        {ruleSets.length === 0 ? (
+        {importChoices.length === 0 ? (
           <div className="empty-line">{t("rules.importHostedEmpty")}</div>
         ) : (
           <div className="rules-import-list">
-            {ruleSets.map((rs) => {
-              const already = referenced.has(rs.name);
+            {importChoices.map(({ rs, local, linkedAndReferenced, label, disabled }) => {
               return (
                 <div key={rs.name} className="rules-import-item">
                   <Checkbox
-                    checked={already || picked.has(rs.name)}
-                    disabled={already}
-                    onChange={(e) => togglePick(rs.name, e.target.checked)}
+                    checked={linkedAndReferenced || picked.has(rs.id)}
+                    disabled={disabled}
+                    onChange={(e) => togglePick(rs.id, e.target.checked)}
                     aria-label={rs.name}
                   />
                   <div className="rules-import-main">
                     <div className="rules-import-name">
-                      {rs.name}
-                      {already && (
-                        <span className="rules-import-tag">{t("rules.importHostedAlready")}</span>
+                      <span className="rules-import-title" title={rs.name}>{rs.name}</span>
+                      {label && <span className="rules-import-tag">{t(label)}</span>}
+                      {local && local.name !== rs.name && (
+                        <span className="rules-import-tag">{t("rules.importHostedAlias", { name: local.name })}</span>
                       )}
                     </div>
                     <div className="rules-import-url">
@@ -1152,6 +1200,10 @@ function RuleSetDefBlock({
         />
         <Typography.Text type="secondary">{t("rules.ruleSetManage")}</Typography.Text>
       </div>
+      {existing?.global_rule_set_id && <p className="composer-hint">{t("rules.ruleSetFollowing")}</p>}
+      {existing?.pending_global_name && (
+        <p className="composer-hint">{t("rules.ruleSetWaiting", { name: existing.pending_global_name })}</p>
+      )}
       {!model.rsManage ? (
         <span className="composer-hint">
           {t(existing ? "rules.ruleSetKeepExisting" : "rules.ruleSetReferenceOnly")}
